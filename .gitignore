@@ -1,0 +1,19 @@
+# Uebersetzte Python-Zwischenstaende
+__pycache__/
+*.pyc
+*.pyo
+
+# Protokolle und Zwischenstaende der Skripte
+*.log
+*.tmp
+_Logs/
+_logs/
+
+# Aus PowerShell erzeugte Programme (PS2EXE)
+*.exe
+
+# Betriebssystem- und Editorreste
+.DS_Store
+Thumbs.db
+*~
+*.swp
