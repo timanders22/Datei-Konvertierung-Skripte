@@ -17,3 +17,9 @@ _logs/
 Thumbs.db
 *~
 *.swp
+
+# Gemeinsames Laufprotokoll
+migration.jsonl
+
+# Woerterbuecher und Pruefsummen (11)
+hunspell/

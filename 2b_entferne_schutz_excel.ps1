@@ -59,7 +59,7 @@
       Frisch in den Temp-Ordner geschriebene Dateien werden von Defender oder
       anderen AV-Engines oft noch exklusiv gehalten, wenn ZipFile.Open(Update)
       oder File.Copy darauf zugreifen will. Das Skript wartet nach jeder
-      Schreiboperation aktiv mit Wait-FileReady (FileShare.None-Probe) auf
+      Schreiboperation aktiv mit Wait-FileAvailable (FileShare.None-Probe) auf
       Freigabe und wrapped zusaetzlich kritische I/O-Aufrufe mit einem
       Retry-Wrapper (bis zu 5 Versuche, exponentielles Backoff
       200 ms -> 2 s). Nur Sharing-Violations und IOException werden retried;
@@ -115,9 +115,86 @@ param(
 )
 
 # ==================================================================
+# Ausfuehrungsumgebung pruefen
+# ==================================================================
+# Dieses Skript setzt Windows PowerShell 5.1 voraus. Unter PowerShell 7
+# (Edition 'Core') fehlen die Methoden FileInfo.GetAccessControl und
+# .SetAccessControl - sie existieren nur im .NET Framework und wurden in
+# .NET Core entfernt. Nachgestellt auf diesem Rechner: unter 5.1.26100.9168
+# vorhanden, unter 7.6.4 nicht. Die Uebernahme von Rechten und Eigentuemer
+# bei der Dateiersetzung faellt dort still aus (der Fehler landete nur als
+# DEBUG im Detail-Log), und auf einer Ablage mit Owner-Mapping kann der
+# Fachnutzer damit den Zugriff auf seine eigene Datei verlieren.
+# Ein stiller Rechteverlust ist schlimmer als ein klarer Abbruch.
+if ($PSVersionTable.PSEdition -eq 'Core') {
+    Write-Host ""
+    Write-Host ("=" * 70) -ForegroundColor Red
+    Write-Host "  FALSCHE POWERSHELL-EDITION" -ForegroundColor Red
+    Write-Host ("=" * 70) -ForegroundColor Red
+    Write-Host "  Laeuft unter: PowerShell $($PSVersionTable.PSVersion) (Edition Core)"
+    Write-Host "  Benoetigt   : Windows PowerShell 5.1 (Edition Desktop)"
+    Write-Host ""
+    Write-Host "  Grund: Unter PowerShell 7 lassen sich NTFS-Rechte und Eigentuemer"
+    Write-Host "  der bearbeiteten Dateien nicht uebernehmen. Der Lauf wuerde die"
+    Write-Host "  Berechtigungen Ihrer Ablage still veraendern."
+    Write-Host ""
+    Write-Host "  Bitte mit 'powershell.exe' starten, nicht mit 'pwsh'." -ForegroundColor Yellow
+    Write-Host ("=" * 70) -ForegroundColor Red
+    Write-Host ""
+    exit 2
+}
+
+
+
+# ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Bindet _gemeinsam.psm1 ein, wenn vorhanden. Die eingebauten Kopien der
+# Helfer bleiben bestehen - so bleibt jedes Skript einzeln lauffaehig und
+# die ps2exe-Uebersetzung funktioniert unveraendert. Genutzt wird das
+# Modul fuer das gemeinsame Laufprotokoll (migration.jsonl).
+$script:GemeinsamGeladen = $false
+try {
+    $gemModul = Join-Path $PSScriptRoot '_gemeinsam.psm1'
+    if (Test-Path -LiteralPath $gemModul) {
+        Import-Module $gemModul -Force -DisableNameChecking -ErrorAction Stop
+        $script:GemeinsamGeladen = $true
+    }
+} catch {
+    # Ohne Modul laeuft das Skript mit seinen eingebauten Helfern weiter.
+}
+
+
+# ==================================================================
 # KONFIGURATION
 # ==================================================================
-$scriptDir = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { $PWD.Path } else { $PSScriptRoot }
+# Logs liegen direkt neben Skript/EXE. PSScriptRoot greift bei direktem
+# Aufruf; bei ps2exe-EXEs ist PSScriptRoot leer - dann liefert die
+# Entry-Assembly das EXE-Verzeichnis. $PWD nur als letzter Fallback.
+#
+# Der frueher hier stehende Einzeiler fiel bei einer ps2exe-EXE sofort auf
+# $PWD zurueck, also auf das aktuelle Arbeitsverzeichnis: bei Doppelklick
+# aus dem Explorer zufaellig, bei einer Verknuepfung frei einstellbar.
+# Haupt-Log, Detail-Log und Ergebnis-CSV landeten damit an wechselnden
+# Orten - und das, obwohl der Skriptkopf die ps2exe-Uebersetzung
+# ausdruecklich dokumentiert. Gleiche Fassung wie in 2a, 6, 7, 8 und 9.
+function Resolve-ScriptDirectory {
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        return $PSScriptRoot
+    }
+    if ($MyInvocation.MyCommand.Path) {
+        return Split-Path -Parent $MyInvocation.MyCommand.Path
+    }
+    try {
+        $entry = [System.Reflection.Assembly]::GetEntryAssembly()
+        if ($entry -and $entry.Location) {
+            return Split-Path -Parent $entry.Location
+        }
+    } catch {}
+    return $PWD.Path
+}
+
+$scriptDir = Resolve-ScriptDirectory
 
 # Log-Verzeichnis: bevorzugt neben dem Skript, sonst LOCALAPPDATA, sonst TEMP.
 # Vorher wurde ungeprueft in $scriptDir geschrieben. Liegt das Skript auf einer
@@ -275,7 +352,7 @@ function Test-IsOwnExcelProcess {
 # HELPER-FUNKTIONEN
 # ==================================================================
 
-function Get-LongPath {
+function Add-LongPathPrefix {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
     if ($Path -match "^\\\\\?\\")            { return $Path }
@@ -402,7 +479,7 @@ function Invoke-WithRetry {
 # ------------------------------------------------------------------
 # Aktive Wartephase auf Datei-Freigabe (AV-Scanner / OS-Cache)
 # ------------------------------------------------------------------
-function Wait-FileReady {
+function Wait-FileAvailable {
     param(
         [Parameter(Mandatory)] [string]$Path,
         [int]$TimeoutSec     = $WaitFileReadyTimeoutSec,
@@ -432,7 +509,7 @@ function Wait-FileReady {
             $fs.Dispose()
             if ($attempts -gt 1) {
                 $script:RetryRecovered++
-                Write-DetailedLog "Wait-FileReady erfolgreich nach $attempts Versuchen: $Path" "DEBUG"
+                Write-DetailedLog "Wait-FileAvailable erfolgreich nach $attempts Versuchen: $Path" "DEBUG"
             }
             return $true
         } catch [System.UnauthorizedAccessException] {
@@ -444,7 +521,7 @@ function Wait-FileReady {
     }
 
     $script:RetryFailed++
-    Write-DetailedLog "Wait-FileReady Timeout nach ${TimeoutSec}s ($attempts Versuche): $Path" "WARN"
+    Write-DetailedLog "Wait-FileAvailable Timeout nach ${TimeoutSec}s ($attempts Versuche): $Path" "WARN"
     return $false
 }
 
@@ -554,9 +631,13 @@ function Remove-OrphanedBackups {
             $fi = [System.IO.FileInfo]::new($bak)
             if (-not $fi.Exists) { continue }
 
-            $origOk = $false
+            $origOk  = $false
+            $origLen = -1
             if ([System.IO.File]::Exists($orig)) {
-                try { $origOk = ([System.IO.FileInfo]::new($orig)).Length -gt 0 } catch { $origOk = $false }
+                try {
+                    $origLen = ([System.IO.FileInfo]::new($orig)).Length
+                    $origOk  = $origLen -gt 0
+                } catch { $origOk = $false; $origLen = -1 }
             }
             if (-not $origOk) {
                 $res.Orphans++
@@ -565,14 +646,40 @@ function Remove-OrphanedBackups {
                 continue
             }
 
-            if ($fi.LastWriteTime -gt $cutoff) {
+            # Das Original muss mindestens so gross sein wie das Backup.
+            # 'Length -gt 0' allein genuegt nicht: ein Abbruch mitten im
+            # 'Copy work->final' hinterlaesst ein TEILWEISE geschriebenes
+            # Original mit Groesse > 0 - genau der Fall, den der Kommentar an
+            # der Backup-Erzeugung als Grund nennt, ein altes .bak keinesfalls
+            # zu ueberschreiben. Ohne diese Pruefung wurde beim naechsten Lauf
+            # die einzige unversehrte Kopie geloescht.
+            if ($origLen -lt $fi.Length) {
+                $res.Orphans++
+                $res.OrphanList.Add($bak)
+                Write-Log ("Backup groesser als das Original ({0:N0} statt {1:N0} Bytes) - Original " +
+                           "moeglicherweise abgeschnitten. NICHT geloescht, bitte pruefen: {2}" -f `
+                           $fi.Length, $origLen, $bak) "WARN"
+                continue
+            }
+
+            # Altersfrist an der CreationTime messen, NICHT an der
+            # LastWriteTime. Das Backup entsteht per [System.IO.File]::Copy,
+            # und Copy uebertraegt die LastWriteTime der QUELLE auf das Ziel -
+            # nur die CreationTime wird neu gesetzt. Auf Archiv-Ablagen ist
+            # die LastWriteTime der Dokumente typischerweise Jahre alt, das
+            # Backup erbt sie. Damit galt ein Sekunden altes .bak sofort als
+            # verwaist (nachgestellt: Original von 2020, Backup gerade erzeugt
+            # -> 'wird geloescht'), die Frist war wirkungslos und der
+            # Kept-Zweig praktisch toter Code. Mit der CreationTime bleibt
+            # auch das .bak eines parallel laufenden Durchgangs verschont.
+            if ($fi.CreationTime -gt $cutoff) {
                 $res.Kept++
                 continue
             }
 
             if (Confirm-Write $bak 'Verwaistes Backup loeschen') {
                 try {
-                    [System.IO.File]::Delete((Get-LongPath $bak))
+                    [System.IO.File]::Delete((Add-LongPathPrefix $bak))
                     $res.Deleted++
                     Write-DetailedLog "Verwaistes Backup entfernt: $bak" "DEBUG"
                 } catch {
@@ -627,6 +734,17 @@ function Write-CsvLog {
         [string]$Path,
         [string]$Details = ''
     )
+
+    # Gemeinsames Laufprotokoll (migration.jsonl) - ergaenzt das
+    # skripteigene Protokoll, ersetzt es nicht. Erst damit laesst sich
+    # der Fortschritt ueber alle elf Schritte hinweg auswerten.
+    if ($script:GemeinsamGeladen) {
+        try {
+            Write-Laufprotokoll -Skript '2b_entferne_schutz_excel' `
+                -Pfad $Path -Aktion 'Schutz entfernen' `
+                -Status $Status -Detail $Details
+        } catch { }
+    }
     if (-not $script:CsvLogWriter) { return }
     $ts      = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $escAct  = '"' + (($Actions  -replace '"', '""') -replace "`r`n|`r|`n", ' ') + '"'
@@ -674,10 +792,10 @@ function Invoke-WindowsTempCleanup {
         if (-not $hit) { $skipped++; return }
         try {
             if ($_.PSIsContainer) {
-                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
                 if (-not (Test-Path -LiteralPath $_.FullName)) { $removedDirs++ }
             } else {
-                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
                 if (-not (Test-Path -LiteralPath $_.FullName)) { $removedFiles++ }
             }
         } catch {}
@@ -708,7 +826,7 @@ function Remove-StaleTempFolders {
                     $stillRunning = $true
                 } catch {}
                 if (-not $stillRunning) {
-                    try { Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+                    try { Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false } catch {}
                 }
             }
         } catch {}
@@ -720,7 +838,7 @@ function Remove-StaleTempFolders {
 # ------------------------------------------------------------------
 function Test-FileIsLocked {
     param([string]$FilePath)
-    $lp = Get-LongPath $FilePath
+    $lp = Add-LongPathPrefix $FilePath
     try {
         if (-not [System.IO.File]::Exists($lp)) { return 'Free' }
         $stream = [System.IO.File]::Open(
@@ -977,7 +1095,10 @@ function Get-FileSecuritySnapshot {
                 [System.Security.AccessControl.AccessControlSections]::Group)
         }
     } catch {
-        Write-DetailedLog "Sicherheitsinfo nicht lesbar ($Path): $_" "DEBUG"
+        # Bewusst WARN statt DEBUG: Schlaegt das Lesen fehl, werden Rechte und
+        # Eigentuemer der Datei nach der Ersetzung NICHT wiederhergestellt.
+        # Als DEBUG-Zeile ging dieser Rechteverlust im Detail-Log unter.
+        Write-Log "Sicherheitsinfo nicht lesbar - Rechte gehen bei der Ersetzung verloren ($Path): $_" "WARN"
         return $null
     }
 }
@@ -1010,6 +1131,81 @@ function Set-FileSecuritySnapshot {
             Write-DetailedLog "Owner nicht gesetzt (kein Admin-Privileg - im Nutzer-Kontext unkritisch): $Path" "DEBUG"
         }
     }
+}
+
+# ==================================================================
+# LAUFENDE OFFICE-SITZUNGEN
+# ==================================================================
+# Diese beiden Funktionen fehlten hier als einzigem der COM-Skripte
+# (2a, 2c, 7 und 9 haben sie). Fuer Excel gilt die Begruendung
+# unveraendert: 'New-Object -ComObject Excel.Application' startet keine
+# neue Instanz, wenn Excel bereits laeuft, sondern haengt sich an die
+# vorhandene Sitzung. Visible=$false laesst sie fuer den Anwender wie
+# abgestuerzt aussehen, DisplayAlerts=$false schaltet seine Warnhinweise
+# ab, und die eigene Instanz ist danach nicht mehr zuverlaessig von der
+# fremden zu unterscheiden - womit auch die PID-Bindung beim Aufraeumen
+# ins Leere greift.
+
+function Get-RunningOfficeSessions {
+    <#
+        Liefert Office-Prozesse mit sichtbarem Hauptfenster, also echte
+        Sitzungen des Anwenders - im Unterschied zu unsichtbaren
+        Automatisierungs-Instanzen.
+    #>
+    param([string[]]$ProcessNames = @('EXCEL'))
+    $found = @()
+    foreach ($n in $ProcessNames) {
+        try {
+            $found += @(Get-Process -Name $n -ErrorAction SilentlyContinue |
+                        Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero })
+        } catch { }
+    }
+    return ,@($found)
+}
+
+function Show-OfficeRunningWarning {
+    <#
+        Weist vor dem ersten COM-Zugriff auf bereits laufende Sitzungen hin.
+        Die Sitzung wird NICHT beendet - dafuer sorgt die PID-Bindung an
+        den Quit-Stellen. Ein sauberer Lauf setzt aber ein geschlossenes
+        Excel voraus.
+
+        Rueckgabe: $true = fortfahren, $false = Anwender bricht ab.
+    #>
+    param([switch]$Silent)
+
+    $sessions = Get-RunningOfficeSessions
+    if ($sessions.Count -eq 0) { return $true }
+
+    $namen = ($sessions | ForEach-Object { $_.ProcessName } | Select-Object -Unique) -join ', '
+    $pids  = ($sessions | ForEach-Object { $_.Id }) -join ', '
+
+    if ($Silent) {
+        Write-Warning "Laufende Office-Sitzungen erkannt ($namen, PID: $pids) - sie werden geschuetzt, aber nicht geschlossen."
+        return $true
+    }
+
+    Write-Host ""
+    Write-Host ("=" * 66) -ForegroundColor Yellow
+    Write-Host "  WARNUNG: Excel laeuft bereits" -ForegroundColor Yellow
+    Write-Host ("=" * 66) -ForegroundColor Yellow
+    Write-Host "  Gefundene Sitzungen: $namen (PID: $pids)"
+    Write-Host ""
+    Write-Host "  Ihre Sitzung wird vom Skript NICHT beendet. Waehrend des Laufs"
+    Write-Host "  kann sie aber ausgeblendet werden und Warnhinweise sind"
+    Write-Host "  abgeschaltet - das wirkt wie ein Absturz."
+    Write-Host "  Ausserdem laesst sich die eigene Automatisierungs-Instanz dann"
+    Write-Host "  nicht mehr zuverlaessig von Ihrer Sitzung unterscheiden."
+    Write-Host ""
+    Write-Host "  EMPFEHLUNG: Excel jetzt schliessen und das Skript neu starten." -ForegroundColor Yellow
+    Write-Host ("=" * 66) -ForegroundColor Yellow
+    Write-Host ""
+    $answer = Read-Host "Trotzdem fortfahren? [j/N]"
+    if ($answer -notmatch '^[JjYy]') {
+        Write-Host "Abgebrochen. Bitte Excel schliessen und neu starten." -ForegroundColor Cyan
+        return $false
+    }
+    return $true
 }
 
 # ==================================================================
@@ -1254,7 +1450,14 @@ function Convert-ExcelViaCom {
         } finally {
             Invoke-Expression $comDown
         }
-    } -ArgumentList $SourcePath, $DestPathBase, $OriginalExtension, (,$Passwords), $pidFile, $ComInitCode, $ComTeardownCode, $PreferPasswordFirst.IsPresent
+    # KEIN fuehrendes Komma vor $Passwords: (,$Passwords) umschliesst das
+    # string[] mit einem 1-Element-Array, das ueber die Job-Grenze nicht
+    # entrollt wird. $tryList enthaelt dann als erstes Element kein Passwort,
+    # sondern eine ArrayList - genau der COM-Fehler 'ArrayList kann nicht in
+    # Object konvertiert werden'. Die einzelnen Passwoerter werden nie
+    # probiert (nachgestellt: Typen=[ArrayList, String] statt vier Strings).
+    # Bei leerer Liste verschieben sich die Folgeparameter nicht.
+    } -ArgumentList $SourcePath, $DestPathBase, $OriginalExtension, $Passwords, $pidFile, $ComInitCode, $ComTeardownCode, $PreferPasswordFirst.IsPresent
 
     if (-not (Wait-Job $job -Timeout $FileOpenTimeoutSeconds)) {
         Stop-Job  $job -ErrorAction SilentlyContinue
@@ -1351,7 +1554,8 @@ function Remove-OpenPassword {
         } finally {
             Invoke-Expression $comDown
         }
-    } -ArgumentList $FilePath, (,$Passwords), $pidFile, $ComInitCode, $ComTeardownCode
+    # Kein fuehrendes Komma - Begruendung siehe oben.
+    } -ArgumentList $FilePath, $Passwords, $pidFile, $ComInitCode, $ComTeardownCode
 
     if (-not (Wait-Job $job -Timeout $FileOpenTimeoutSeconds)) {
         Stop-Job  $job -ErrorAction SilentlyContinue
@@ -1603,7 +1807,7 @@ trap {
     try { Stop-AllTrackedExcel } catch {}
     try { Sync-LogWriters }      catch {}
     try { Close-LogWriters }     catch {}
-    if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
     break
 }
 
@@ -1722,12 +1926,44 @@ if (-not (Test-Path -LiteralPath $TargetPath)) {
     exit 1
 }
 
+# Vor dem ersten COM-Zugriff (Smoke-Test weiter unten) auf laufende
+# Excel-Sitzungen hinweisen. Im Modus -NoInteractive nur warnen, nicht
+# fragen - dort sieht niemand die Rueckfrage.
+if (-not (Show-OfficeRunningWarning -Silent:$NoInteractive)) { exit 0 }
+
 Remove-StaleTempFolders
 
 if (Test-Path -LiteralPath $TempPath) {
-    Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
 }
-New-Item -LiteralPath $TempPath -ItemType Directory -Force | Out-Null
+# [System.IO.Directory]::CreateDirectory statt New-Item.
+#
+# Hier stand 'New-Item -LiteralPath ... -ItemType Directory'. New-Item
+# hat aber gar keinen Parameter -LiteralPath (nur -Path, -Name, -ItemType,
+# -Value, -Force, -Credential) - der Aufruf scheiterte mit einer
+# ParameterBindingException. Da er nicht abbrechend ist, lief das Skript
+# weiter, nur ohne Arbeitsordner: die Zeile darueber hatte einen evtl.
+# vorhandenen Vorgaenger gerade geloescht, es gab also keinen Rueckfall.
+#
+# Folge: der Trust-Center-Smoke-Test konnte seine Testmappe nicht anlegen
+# und meldete faelschlich "Dokumentenordner nicht vertrauenswuerdig";
+# danach scheiterte fuer JEDE Datei die Arbeitskopie. Das Skript hat in
+# diesem Zustand keine einzige Datei entschuetzt.
+#
+# CreateDirectory ist ausserdem provider-frei und kommt - anders als die
+# PowerShell-Cmdlets - zuverlaessig mit '\\?\'-Praefixen zurecht. Es wirft
+# nicht, wenn das Verzeichnis bereits existiert.
+try {
+    [void][System.IO.Directory]::CreateDirectory($TempPath)
+} catch {
+    Write-Host "FEHLER: Arbeitsordner konnte nicht angelegt werden: $TempPath" -ForegroundColor Red
+    Write-Host "        $($_.Exception.Message)" -ForegroundColor Red
+    exit 2
+}
+if (-not [System.IO.Directory]::Exists($TempPath)) {
+    Write-Host "FEHLER: Arbeitsordner fehlt nach dem Anlegen: $TempPath" -ForegroundColor Red
+    exit 2
+}
 
 # Restore-Privilegien (Admin-Kontext) fuer ACL/Owner-Erhalt aktivieren.
 Enable-RestorePrivileges
@@ -1782,7 +2018,7 @@ if (-not $smokeTest.Ok) {
         try { Stop-AllTrackedExcel } catch {}
         Sync-LogWriters
         Close-LogWriters
-        if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
         exit 2
     }
 
@@ -1793,7 +2029,7 @@ if (-not $smokeTest.Ok) {
         try { Stop-AllTrackedExcel } catch {}
         Sync-LogWriters
         Close-LogWriters
-        if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
         exit 0
     }
     Write-Log "Smoke-Test-Warnung vom Benutzer ignoriert - Fortsetzung." "WARN"
@@ -1815,7 +2051,7 @@ $allExcelExt    = "^\.(xls|xlt|xla|xlsx|xlsm|xltx|xltm|xlsb|xlam)$"
 $backupCleanup = $null
 if (-not $SkipBackupCleanup) {
     Write-Host "Suche zurueckgebliebene Backups frueherer Laeufe..." -ForegroundColor DarkGray
-    $backupCleanup = Remove-OrphanedBackups -RootPath (Get-LongPath $TargetPath)
+    $backupCleanup = Remove-OrphanedBackups -RootPath (Add-LongPathPrefix $TargetPath)
 
     if ($backupCleanup.Deleted -gt 0 -or $backupCleanup.Orphans -gt 0 -or $backupCleanup.Kept -gt 0) {
         Write-Host ("  Backups: {0} entfernt, {1} behalten, {2} ohne Original" -f `
@@ -1850,7 +2086,7 @@ if (-not $SkipBackupCleanup) {
 if ($script:UseProgress -and -not $script:SkipPreScan) {
     Write-Host "Zaehle Dateien fuer ETA (bitte warten)..." -ForegroundColor DarkGray
     $etaCount = 0
-    Get-ExcelFilesRobust (Get-LongPath $TargetPath) $allExcelExt -StringsOnly | ForEach-Object { $etaCount++ }
+    Get-ExcelFilesRobust (Add-LongPathPrefix $TargetPath) $allExcelExt -StringsOnly | ForEach-Object { $etaCount++ }
     $script:TotalFiles = $etaCount
     Write-Host "Gefunden: $($script:TotalFiles) Excel-Dateien`n" -ForegroundColor DarkGray
 }
@@ -1874,7 +2110,7 @@ $stats = @{
 Write-Host "Starte Verarbeitung..." -ForegroundColor Cyan
 
 try {
-Get-ExcelFilesRobust (Get-LongPath $TargetPath) $allExcelExt |
+Get-ExcelFilesRobust (Add-LongPathPrefix $TargetPath) $allExcelExt |
     ForEach-Object {
 
     if ($script:ShouldStop) { throw [System.OperationCanceledException]::new() }
@@ -1914,11 +2150,29 @@ Get-ExcelFilesRobust (Get-LongPath $TargetPath) $allExcelExt |
             return
         }
         if (Confirm-Write $file.FullName 'Verwaiste Sperrdatei loeschen') {
-            try { [System.IO.File]::Delete((Get-LongPath $file.FullName)) } catch {}
-            $stats.Junk++
-            if (-not $script:UseProgress) { Write-Host "-> JUNK" -ForegroundColor DarkGray }
-            Write-DetailedLog "Junk entfernt: $($file.FullName)" "DEBUG"
-            Write-CsvLog -Status "JUNK" -Actions "Junk geloescht" -Path $file.FullName
+            # Erfolg pruefen, statt ihn anzunehmen. Der Delete lief zuvor in
+            # ein leeres catch: schlug er fehl (Datei noch gehalten, keine
+            # Rechte), meldete das Skript trotzdem 'Junk geloescht' und zaehlte
+            # ihn mit - die Sperrdatei blieb aber liegen und blockierte die
+            # zugehoerige Mappe weiter.
+            $junkWeg = $false
+            try {
+                [System.IO.File]::Delete((Add-LongPathPrefix $file.FullName))
+                $junkWeg = -not [System.IO.File]::Exists((Add-LongPathPrefix $file.FullName))
+            } catch {
+                Write-DetailedLog "Sperrdatei nicht loeschbar: $($file.FullName) - $_" "WARN"
+            }
+            if ($junkWeg) {
+                $stats.Junk++
+                if (-not $script:UseProgress) { Write-Host "-> JUNK" -ForegroundColor DarkGray }
+                Write-DetailedLog "Junk entfernt: $($file.FullName)" "DEBUG"
+                Write-CsvLog -Status "JUNK" -Actions "Junk geloescht" -Path $file.FullName
+            } else {
+                $stats.Errors++
+                if (-not $script:UseProgress) { Write-Host "-> ERR (Sperrdatei)" -ForegroundColor Red }
+                Write-Log "Verwaiste Sperrdatei nicht loeschbar: $($file.FullName)" "WARN"
+                Write-CsvLog -Status "ERR" -Actions "Sperrdatei nicht loeschbar" -Path $file.FullName
+            }
         } else {
             $stats.WouldChange++
             if (-not $script:UseProgress) { Write-Host "-> WHATIF (Junk)" -ForegroundColor DarkCyan }
@@ -1928,7 +2182,7 @@ Get-ExcelFilesRobust (Get-LongPath $TargetPath) $allExcelExt |
         return
     }
 
-    $srcLong = Get-LongPath $file.FullName
+    $srcLong = Add-LongPathPrefix $file.FullName
 
     # Nur das ReadOnly-Bit loeschen. Vorher wurde pauschal auf 'Normal' gesetzt
     # und damit auch Hidden, System, Archive und NotContentIndexed entfernt.
@@ -1996,8 +2250,8 @@ Get-ExcelFilesRobust (Get-LongPath $TargetPath) $allExcelExt |
         }
         Unblock-File -LiteralPath $tempFile -ErrorAction SilentlyContinue
 
-        if (-not (Wait-FileReady -Path $tempFile -TimeoutSec $WaitFileReadyTimeoutSec)) {
-            Write-DetailedLog "Wait-FileReady nach Copy ausgelaufen, fahre fort: $tempFile" "WARN"
+        if (-not (Wait-FileAvailable -Path $tempFile -TimeoutSec $WaitFileReadyTimeoutSec)) {
+            Write-DetailedLog "Wait-FileAvailable nach Copy ausgelaufen, fahre fort: $tempFile" "WARN"
         }
 
         $wasConverted        = $false
@@ -2039,13 +2293,13 @@ Get-ExcelFilesRobust (Get-LongPath $TargetPath) $allExcelExt |
                     Write-DetailedLog "REPAIR-Fallback genutzt (xlRepairFile=1): $($file.FullName)" "WARN"
                 }
 
-                if (-not (Wait-FileReady -Path $workFile -TimeoutSec $WaitFileReadyTimeoutSec)) {
-                    Write-DetailedLog "Wait-FileReady nach Konvertierung ausgelaufen: $workFile" "WARN"
+                if (-not (Wait-FileAvailable -Path $workFile -TimeoutSec $WaitFileReadyTimeoutSec)) {
+                    Write-DetailedLog "Wait-FileAvailable nach Konvertierung ausgelaufen: $workFile" "WARN"
                 }
 
                 $wasConverted = $true
                 $stats.Converted++
-                Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
                 Write-DetailedLog "Konvertiert: $($file.FullName) -> $workFile" "DEBUG"
 
             } catch {
@@ -2098,8 +2352,8 @@ Get-ExcelFilesRobust (Get-LongPath $TargetPath) $allExcelExt |
                 }
                 if ($pwResult.UsedPassword) { Move-PasswordToFront $pwResult.UsedPassword }
 
-                if (-not (Wait-FileReady -Path $workFile -TimeoutSec $WaitFileReadyTimeoutSec)) {
-                    Write-DetailedLog "Wait-FileReady nach Passwort-Entfernung ausgelaufen: $workFile" "WARN"
+                if (-not (Wait-FileAvailable -Path $workFile -TimeoutSec $WaitFileReadyTimeoutSec)) {
+                    Write-DetailedLog "Wait-FileAvailable nach Passwort-Entfernung ausgelaufen: $workFile" "WARN"
                 }
                 Write-DetailedLog "Oeffnen-Passwort entfernt: $($file.FullName)" "DEBUG"
 
@@ -2185,6 +2439,12 @@ Get-ExcelFilesRobust (Get-LongPath $TargetPath) $allExcelExt |
             Invoke-WithRetry -OperationName "Copy Backup ($($file.Name))" -ScriptBlock {
                 [System.IO.File]::Copy($srcLong, $backupPath, $true)
             }
+            # Erzeugungszeit ausdruecklich stempeln: Remove-OrphanedBackups
+            # misst das Alter daran. Musste das vorhandene .bak oben
+            # ueberschrieben werden (Move fehlgeschlagen), behielte die Datei
+            # sonst die ALTE CreationTime und ein parallel laufender Durchgang
+            # koennte dieses frische Backup als verwaist loeschen.
+            try { [System.IO.File]::SetCreationTime($backupPath, (Get-Date)) } catch {}
 
             try {
                 Invoke-WithRetry -OperationName "Copy work->final ($($file.Name))" -ScriptBlock {
@@ -2281,7 +2541,7 @@ Get-ExcelFilesRobust (Get-LongPath $TargetPath) $allExcelExt |
 
     } finally {
         if (-not [string]::IsNullOrWhiteSpace($workFile)) {
-            Remove-Item -LiteralPath $workFile -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $workFile -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
         }
         # Reservierten Platzhalter nur entfernen, wenn er leer geblieben ist.
         if ($reservedPlaceholder) {
@@ -2311,7 +2571,7 @@ try {
 } catch {
     Write-DetailedLog "Stop-AllTrackedExcel Fehler beim Endlauf: $_" "WARN"
 }
-if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue }
+if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
 
 $duration = (Get-Date) - $ScriptStartTime
 $durStr   = $duration.ToString('hh\:mm\:ss')

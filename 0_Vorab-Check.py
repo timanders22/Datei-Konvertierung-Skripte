@@ -59,6 +59,8 @@ import fnmatch
 import hashlib
 import logging
 import platform
+import atexit
+import tempfile
 import threading
 import subprocess
 
@@ -265,17 +267,23 @@ def setup_console():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+    except Exception as _e:
+        logging.debug(f"setup_console: Exception verworfen: {_e!r}")
 
 def setup_logging():
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    # DEBUG statt INFO: An zwoelf Stellen werden verschluckte Ausnahmen mit
+    # logging.debug() protokolliert - genau die Information, mit der sich ein
+    # 'es passiert einfach nichts' spaeter aufklaeren laesst. Mit INFO auf dem
+    # Root-Logger wurden sie samt und sonders verworfen, die catch-Bloecke
+    # waren also stumm. Das Level gehoert an den Handler, nicht an den Logger.
+    root.setLevel(logging.DEBUG)
     root.handlers.clear()
     try:
         os.makedirs(os.path.dirname(LOG_FILE) or TMP_DIR, exist_ok=True)
         fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
         fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        fh.setLevel(logging.DEBUG)
         root.addHandler(fh)
     except Exception as e:
         # Ohne NullHandler wuerde logging auf stderr ausweichen -> doppelte Ausgabe.
@@ -301,8 +309,8 @@ def pause(prompt):
         return
     try:
         input(prompt)
-    except Exception:
-        pass
+    except Exception as _e:
+        logging.debug(f"pause: Exception verworfen: {_e!r}")
 
 def log_info(msg):
     print(msg)
@@ -367,29 +375,139 @@ def _decode_bytes(b):
             continue
     return b.decode("utf-8", errors="replace")
 
+# Ausgabedateien, die sich noch nicht loeschen liessen. Ein vom Kind
+# abgesetzter Enkel erbt das Ausgabe-Handle und haelt es offen, solange er
+# laeuft - die Datei ist dann bis zu seinem Ende gesperrt. Statt sie liegen
+# zu lassen, wird bei jedem weiteren Aufruf und beim Programmende erneut
+# aufgeraeumt.
+_PENDING_TEMP_DELETES = []
+
+def _drop_temp_file(path):
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        _PENDING_TEMP_DELETES.append(path)
+
+def _sweep_pending_temp_files():
+    for path in list(_PENDING_TEMP_DELETES):
+        try:
+            os.remove(path)
+            _PENDING_TEMP_DELETES.remove(path)
+        except FileNotFoundError:
+            _PENDING_TEMP_DELETES.remove(path)
+        except Exception as _e:
+            logging.debug(f"_sweep_pending_temp_files({path}): noch gesperrt: {_e!r}")
+
+atexit.register(_sweep_pending_temp_files)
+
+def _read_output_file(path):
+    try:
+        with open(path, "rb") as fh:
+            return _decode_bytes(fh.read())
+    except Exception as _e:
+        logging.debug(f"_read_output_file({path}): Exception verworfen: {_e!r}")
+        return ""
+
+def _kill_process_tree(proc):
+    """Den gesamten Prozessbaum beenden, nicht nur den direkten Kindprozess.
+
+    Nach einem Timeout muss auch ein abgesetzter Enkel weg (Installer, der
+    sich per 'start' oder ueber einen Java-Launcher selbstaendig gemacht
+    hat). Sonst laeuft er unbeaufsichtigt weiter, waehrend das Skript ihn
+    als abgebrochen protokolliert und den naechsten Installer startet -
+    msiexec-Sperre und halbfertige Installationen sind die Folge.
+    """
+    if proc is None:
+        return
+    try:
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                       capture_output=True, timeout=30,
+                       startupinfo=get_startupinfo())
+    except Exception as _e:
+        logging.debug(f"_kill_process_tree: taskkill fehlgeschlagen: {_e!r}")
+    try:
+        proc.kill()
+    except Exception as _e:
+        logging.debug(f"_kill_process_tree: kill verworfen: {_e!r}")
+    try:
+        proc.wait(timeout=10)
+    except Exception as _e:
+        logging.debug(f"_kill_process_tree: wait nach kill: {_e!r}")
+
 def run_cmd(args, timeout=30, cwd=None, extra_env=None):
+    """Programm ausfuehren und Ausgabe einsammeln - mit bindendem Timeout.
+
+    Bewusst NICHT subprocess.run(capture_output=True): dessen timeout ist
+    auf Windows nicht bindend. Laeuft die Zeit ab, toetet run() nur den
+    DIREKTEN Kindprozess und ruft danach communicate() OHNE timeout auf, um
+    die restliche Ausgabe noch einzusammeln (siehe CPython-Quelltext,
+    subprocess.run, Zweig '_mswindows'). Diese zweite Runde wartet auf das
+    Pipe-Ende. Ein vom Kind gestarteter Enkel - bei .bat/cmd.exe/Installern
+    der Normalfall ('start ...', Java-Launcher, nachgeladene Setup-Stufen) -
+    hat die Pipe-Handles geerbt und haelt sie offen; der Aufruf kehrt dann
+    erst zurueck, wenn der Enkel VON SICH AUS endet.
+    Nachgestellt: .bat mit 30-s-Enkel, timeout=5 -> TimeoutExpired erst nach
+    30,5 s. Damit stand der komplette Zwei-Stufen-Lauf still, weil Stage 1
+    in relaunch_as_admin_and_wait() unbegrenzt auf Stage 2 wartet.
+
+    Deshalb: Ausgabe in DATEIEN statt in Pipes umlenken - dann haelt kein
+    geerbtes Handle den Aufruf auf -, mit wait(timeout=...) nur auf den
+    direkten Kindprozess warten und bei Ablauf den ganzen Prozessbaum
+    beenden.
+    """
+    _sweep_pending_temp_files()
+    out_fd = err_fd = None
+    out_path = err_path = None
+    proc = None
     try:
         env = None
         if extra_env:
             env = os.environ.copy()
             env.update(extra_env)
-        p = subprocess.run(
-            args,
-            capture_output=True,
-            text=False,
-            timeout=timeout,
-            shell=False,
-            cwd=cwd,
-            startupinfo=get_startupinfo(),
-            env=env,
-        )
-        return CmdResult(p.returncode, _decode_bytes(p.stdout), _decode_bytes(p.stderr))
+        out_fd, out_path = tempfile.mkstemp(prefix="vorabcheck_out_")
+        err_fd, err_path = tempfile.mkstemp(prefix="vorabcheck_err_")
+        timed_out = False
+        with os.fdopen(out_fd, "wb") as f_out, os.fdopen(err_fd, "wb") as f_err:
+            out_fd = err_fd = None      # Besitz an fdopen uebergeben
+            proc = subprocess.Popen(
+                args,
+                stdout=f_out,
+                stderr=f_err,
+                shell=False,
+                cwd=cwd,
+                startupinfo=get_startupinfo(),
+                env=env,
+            )
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill_process_tree(proc)
+        # Erst nach dem Schliessen lesen, sonst haelt der eigene
+        # Schreib-Handle die Datei noch.
+        stdout_text = _read_output_file(out_path)
+        stderr_text = _read_output_file(err_path)
+        if timed_out:
+            return CmdResult(timed_out=True, error="Timeout",
+                             stdout=stdout_text, stderr=stderr_text)
+        return CmdResult(proc.returncode, stdout_text, stderr_text)
     except FileNotFoundError:
         return CmdResult(not_found=True, error="FileNotFound")
-    except subprocess.TimeoutExpired:
-        return CmdResult(timed_out=True, error="Timeout")
     except Exception as e:
         return CmdResult(error=str(e))
+    finally:
+        for fd in (out_fd, err_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception as _e:
+                    logging.debug(f"run_cmd: close verworfen: {_e!r}")
+        for pth in (out_path, err_path):
+            _drop_temp_file(pth)
 
 def long_path(p):
     if not IS_WINDOWS or not p:
@@ -418,8 +536,8 @@ def isdir_with_timeout(path, timeout=8.0):
     def check():
         try:
             result["ok"] = os.path.isdir(path)
-        except Exception:
-            pass
+        except Exception as _e:
+            logging.debug(f"check: Exception verworfen: {_e!r}")
         finally:
             result["done"] = True
     t = threading.Thread(target=check, daemon=True)
@@ -464,6 +582,11 @@ def sha256_of(path):
     except Exception:
         return None
 
+# Platzhalter fuer eine Datei, deren Hash nicht gebildet werden konnte.
+# Kein gueltiger SHA-256-Wert, faellt also in jedem Vergleich auf und kann
+# nie versehentlich als "passt" durchgehen.
+HASH_UNREADABLE = "<nicht lesbar>"
+
 def hash_tree(root):
     """SHA-256 aller Dateien unterhalb von root, Schluessel = relativer Pfad.
 
@@ -484,11 +607,13 @@ def hash_tree(root):
                     rel = os.path.relpath(full, root_abs)
                 except Exception:
                     continue
+                # Nicht lesbare Dateien NICHT stillschweigend weglassen: sie
+                # verschwaenden sonst aus der Erwartungsliste und blieben in
+                # Stage 2 unbemerkt ungeprueft.
                 digest = sha256_of(full)
-                if digest:
-                    out[rel.replace("\\", "/").lower()] = digest
-    except Exception:
-        pass
+                out[rel.replace("\\", "/").lower()] = digest or HASH_UNREADABLE
+    except Exception as _e:
+        logging.debug(f"hash_tree: Exception verworfen: {_e!r}")
     return out
 
 # =============================================================================
@@ -621,7 +746,31 @@ def relaunch_as_admin_and_wait(stage_dir):
 
     handle = info.hProcess
     try:
-        kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+        # Frueher wurde hier mit INFINITE gewartet. Haengt Stage 2 - etwa an
+        # einem unsichtbar hinter anderen Fenstern liegenden Installer-Dialog -,
+        # stand Stage 1 ohne jede Ausgabe still und war von aussen nicht von
+        # einem Absturz zu unterscheiden.
+        # Ein harter Timeout loest das NICHT: Stage 1 laeuft auf mittlerer
+        # Integritaetsstufe und kann den elevierten Stage-2-Prozess nicht
+        # beenden. Ein Abbruch wuerde ihn nur verwaisen lassen, waehrend beide
+        # Stufen weiter in dieselbe Logdatei schreiben und der Anwender einen
+        # zweiten Lauf startet. Deshalb weiterhin unbegrenzt warten - aber in
+        # Minutenschritten und mit sichtbarem Lebenszeichen, damit erkennbar
+        # bleibt, worauf gewartet wird.
+        WAIT_TIMEOUT_RC = 0x00000102
+        WAIT_FAILED_RC  = 0xFFFFFFFF
+        wartete_min = 0
+        while True:
+            rc = kernel32.WaitForSingleObject(handle, 60_000)
+            if rc != WAIT_TIMEOUT_RC:
+                if rc == WAIT_FAILED_RC:
+                    log_err("   ❌ Warten auf Admin-Prozess fehlgeschlagen (WAIT_FAILED).")
+                    return None
+                break
+            wartete_min += 1
+            if wartete_min % 5 == 0:
+                log_info(f"   ⏳ Stage 2 läuft noch ({wartete_min} min). Falls nichts "
+                         f"vorangeht: nach einem offenen Installer-Fenster sehen.")
         exit_code = wintypes.DWORD()
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
             log_err("   ❌ Exit-Code des Admin-Prozesses nicht lesbar.")
@@ -633,8 +782,8 @@ def relaunch_as_admin_and_wait(stage_dir):
     finally:
         try:
             kernel32.CloseHandle(handle)
-        except Exception:
-            pass
+        except Exception as _e:
+            logging.debug(f"relaunch_as_admin_and_wait: Exception verworfen: {_e!r}")
 
 def harden_stage_dir():
     """Stage-Verzeichnis gegen Manipulation durch andere lokale Konten schuetzen.
@@ -655,8 +804,44 @@ def harden_stage_dir():
         if user:
             args += ["/grant", f"{user}:(OI)(CI)M"]
         run_cmd(args, timeout=60)
-    except Exception:
-        pass
+    except Exception as _e:
+        logging.debug(f"harden_stage_dir: Exception verworfen: {_e!r}")
+
+def harden_program_dir(path):
+    """Programmverzeichnis gegen Manipulation durch andere lokale Konten schuetzen.
+
+    Aus C:\\OCR startet 5_OCR_PDF.py tesseract.exe, gswin64c.exe, jbig2.exe
+    und verapdf.bat und laedt von dort DLLs - mit Vorrang vor
+    C:\\Program Files und gegebenenfalls mit Adminrechten. Ein direkt unter
+    C:\\ angelegter Ordner erbt aber die Standard-ACL von C:\\ und ist damit
+    fuer jeden authentifizierten Benutzer beschreibbar. Ohne diese Haertung
+    koennte ein Standardbenutzer dort ein eigenes Programm ablegen, das beim
+    naechsten Admin-Lauf mit Administratorrechten ausgefuehrt wird.
+
+    Rueckgabe True, wenn die ACL gesetzt werden konnte. Schlaegt es fehl
+    (kein Adminrecht, kein Besitz), wird das als offene Handarbeit vermerkt
+    statt still uebergangen - es ist eine Sicherheitszusage, kein Komfort.
+    """
+    if not IS_WINDOWS or not os.path.isdir(path):
+        return False
+    # SIDs statt Klartextnamen: 'Benutzer'/'Users' ist sprachabhaengig.
+    args = ["icacls", path, "/inheritance:r",
+            "/grant", "*S-1-5-32-544:(OI)(CI)F",    # Administratoren
+            "/grant", "*S-1-5-18:(OI)(CI)F",        # SYSTEM
+            "/grant", "*S-1-5-32-545:(OI)(CI)RX"]   # Benutzer: nur lesen/starten
+    try:
+        if run_cmd(args, timeout=60).ok:
+            log_info(f"✅ Zugriffsrechte gehärtet: {path}")
+            return True
+    except Exception as _e:
+        logging.debug(f"harden_program_dir: Exception verworfen: {_e!r}")
+    log_warn(f"   ⚠️ Zugriffsrechte für {path} konnten nicht gehärtet werden.")
+    STATE["manual_actions"].append(
+        f'Zugriffsrechte härten (als Administrator): icacls "{path}" '
+        f'/inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F '
+        f'/grant *S-1-5-32-545:(OI)(CI)RX'
+    )
+    return False
 
 def stage_copy_file(source, label=None):
     if not source or not os.path.isfile(long_path(source)):
@@ -706,8 +891,21 @@ def verify_staged_dir(entry):
     """
     root = entry.get("dir")
     expected = entry.get("files") or {}
-    if not root or not expected:
+    if not root:
         return True
+    # Ordner-Stage OHNE Hash-Liste ist kein "nichts zu pruefen", sondern ein
+    # fehlender Nachweis - und damit ein Abbruchgrund. Frueher lieferte der
+    # Zweig True und der komplette Baum lief ungeprueft mit Adminrechten.
+    if not expected:
+        log_err(f"   ❌ Keine Hash-Liste im Manifest für Stage-Ordner '{root}' – Abbruch.")
+        return False
+    unlesbar = sorted(k for k, v in expected.items() if v == HASH_UNREADABLE)
+    if unlesbar:
+        log_err(f"   ❌ Hash-Liste für '{root}' enthält {len(unlesbar)} nicht lesbare "
+                f"Datei(en) – Abbruch.")
+        for k in unlesbar[:10]:
+            log_err(f"      nicht lesbar: {k}")
+        return False
     if not os.path.isdir(long_path(root)):
         log_err(f"   ❌ Stage-Ordner fehlt: {root}")
         return False
@@ -740,8 +938,14 @@ def verify_staged_entry(entry):
     if not src or not os.path.isfile(long_path(src)):
         log_err(f"   ❌ Stage-Datei fehlt: {src}")
         return False
+    # Fehlende Pruefsumme = fehlender Nachweis = Abbruch. Frueher wurde hier
+    # nur gewarnt und die Datei mit Adminrechten trotzdem gestartet - genau
+    # der Austausch zwischen Stage 1 und Stage 2, gegen den dieses Modell
+    # gebaut ist, waere damit unbemerkt geblieben.
     if not expected:
-        log_warn(f"   ⚠️ Keine Pruefsumme im Manifest für {os.path.basename(src)} – wird ungeprüft ausgeführt.")
+        log_err(f"   ❌ Keine Prüfsumme im Manifest für {os.path.basename(src)} – "
+                f"Ausführung abgebrochen.")
+        return False
     else:
         actual = sha256_of(src)
         if actual != expected:
@@ -925,8 +1129,8 @@ def broadcast_env_change():
             ctypes.c_wchar_p("Environment"),
             SMTO_ABORTIFHUNG, 5000, ctypes.byref(result),
         )
-    except Exception:
-        pass
+    except Exception as _e:
+        logging.debug(f"broadcast_env_change: Exception verworfen: {_e!r}")
 
 def get_user_env(var_name):
     if not IS_WINDOWS:
@@ -1064,8 +1268,8 @@ def refresh_env_from_registry():
     merged = os.pathsep.join(parts + saved_extra)
     try:
         merged = os.path.expandvars(merged)
-    except Exception:
-        pass
+    except Exception as _e:
+        logging.debug(f"refresh_env_from_registry: Exception verworfen: {_e!r}")
     os.environ["PATH"] = merged
 
 # =============================================================================
@@ -1092,6 +1296,15 @@ def ensure_directories():
     # andere lokale Konten schreiben duerfen.
     if RUN_MODE == "stage1" and os.path.isdir(STAGE_DIR):
         harden_stage_dir()
+    # C:\OCR ist Programmverzeichnis, kein Arbeitsordner: 5_OCR_PDF.py startet
+    # daraus Programme und laedt DLLs, mit Vorrang vor C:\Program Files. Als
+    # direkt unter C:\ angelegter Ordner waere es sonst fuer jeden
+    # authentifizierten Benutzer beschreibbar - bei einem spaeteren Admin-Lauf
+    # eine lokale Rechteausweitung. Nur im Admin-Kontext versuchen; ohne
+    # Adminrechte schlaegt icacls ohnehin fehl und es entstuende bei jedem
+    # Lauf ein Falscheintrag in den offenen Handarbeiten.
+    if os.path.isdir(OCR_DIR) and is_admin():
+        harden_program_dir(OCR_DIR)
     print("")
 
 def _ensure_parent_dir(target):
@@ -1102,8 +1315,8 @@ def _ensure_parent_dir(target):
         except Exception:
             try:
                 os.makedirs(long_path(parent), exist_ok=True)
-            except Exception:
-                pass
+            except Exception as _e:
+                logging.debug(f"_ensure_parent_dir: Exception verworfen: {_e!r}")
 
 def copy_file_safe(source, target, retries=2, silent=False, soft=False):
     """soft=True: Fehlschlag nur als Warnung protokollieren.
@@ -1720,15 +1933,18 @@ def pick_installer_in_deploy(tool_key):
             return hits[0], cfg
     return None, cfg
 
-def pick_installer_in_stage(tool_key):
-    cfg = TOOL_INSTALLERS.get(tool_key) or {}
-    if not os.path.isdir(STAGE_ROOT):
-        return None, cfg
-    for pat in cfg.get("patterns", []):
-        for f in os.listdir(STAGE_ROOT):
-            if fnmatch.fnmatch(f.lower(), pat.lower()):
-                return os.path.join(STAGE_ROOT, f), cfg
-    return None, cfg
+# ENTFERNT: pick_installer_in_stage(tool_key)
+#
+# Die Funktion suchte im Stage-Ordner per Dateinamen-Muster nach einem
+# Installer und lieferte den ERSTEN Treffer aus os.listdir. Genutzt wurde
+# sie in Stage 2, also im Admin-Kontext - und zwar ohne Abgleich mit der
+# Pruefsumme aus dem Manifest. Damit konnten die gepruefte und die
+# tatsaechlich ausgefuehrte Datei auseinanderfallen.
+#
+# Stage 2 installiert jetzt ausschliesslich ueber stage2_install_pending()
+# und fuehrt dort genau den Pfad aus, dessen SHA-256 zuvor gegen das
+# Manifest geprueft wurde. Eine Suche nach Namensmuster gibt es im
+# Admin-Kontext nicht mehr.
 
 def stage_admin_tool(tool_key, deploy_available):
     if not deploy_available:
@@ -1750,15 +1966,16 @@ def try_install_tool(tool_key, deploy_available):
     needs_admin = cfg.get("admin", False)
 
     if RUN_MODE == "stage2":
-        installer, cfg = pick_installer_in_stage(tool_key)
-        if not installer:
-            log_warn(f"   ⚠️ Kein Stage-Installer für '{tool_key}' in {STAGE_ROOT} gefunden.")
-            return False
-        ok = run_installer(installer, cfg)
-        if ok:
-            STATE["installed_tools"].append(tool_key)
-            STATE["stage2_summary"].append(f"installed:{tool_key}")
-        return ok
+        # In Stage 2 wird ausschliesslich ueber stage2_install_pending()
+        # installiert - dort steht die Pruefsumme aus dem Manifest zur
+        # Verfuegung und genau die gepruefte Datei wird ausgefuehrt.
+        #
+        # Ein Namensmuster-Suchlauf im Stage-Ordner waere hier eine Luecke:
+        # er koennte eine andere, ungepruefte Datei erwischen und sie mit
+        # Adminrechten starten. Deshalb keine Ausfuehrung an dieser Stelle.
+        log_warn(f"   ⚠️ '{tool_key}' wird in Stage 2 nur über das geprüfte "
+                 f"Manifest installiert – kein ungeprüfter Suchlauf.")
+        return False
 
     if needs_admin and not is_admin():
         staged = stage_admin_tool(tool_key, deploy_available)
@@ -1883,8 +2100,8 @@ def _tessdata_writable_target(tess_exe):
             f.write("x")
         os.remove(testfile)
         return primary, False
-    except Exception:
-        pass
+    except Exception as _e:
+        logging.debug(f"_tessdata_writable_target: Exception verworfen: {_e!r}")
     local = os.environ.get("LOCALAPPDATA", "")
     if local:
         alt = os.path.join(local, "Tesseract-OCR", "tessdata")
@@ -2331,21 +2548,26 @@ def _verapdf_candidate_paths():
         os.path.join(os.environ.get("LOCALAPPDATA", ""), "verapdf", "verapdf.bat"),
     ]
 
-def _install_verapdf_silent(deploy_available):
+def _install_verapdf_silent(deploy_available, entry=None):
     if RUN_MODE == "stage2":
-        inst_dir = os.path.join(STAGE_ROOT, "verapdf_installer")
-        search_dir = inst_dir if os.path.isdir(inst_dir) else STAGE_ROOT
-        bat = None
+        # Nur den im Manifest vermerkten - und damit von verify_staged_entry
+        # geprueften - Pfad verwenden.
+        #
+        # Vorher wurde die .bat im Stage-Verzeichnis per Namensvergleich neu
+        # gesucht, mit Rueckfall auf STAGE_ROOT, wenn der Unterordner fehlte.
+        # verify_staged_dir prueft aber nur den im Manifest genannten Ordner:
+        # bei einem Manifest ohne 'dir'-Angabe waere so eine ungepruefte
+        # verapdf-install.bat aus STAGE_ROOT mit Adminrechten gestartet worden.
+        bat = (entry or {}).get("installer")
+        if not bat or not os.path.isfile(long_path(bat)):
+            log_warn("   ⚠️ Geprüfter veraPDF-Installer aus dem Manifest nicht vorhanden.")
+            return None
+        search_dir = os.path.dirname(bat)
         xml_file = None
         for f in os.listdir(search_dir):
-            lf = f.lower()
-            if lf == "verapdf-install.bat":
-                bat = os.path.join(search_dir, f)
-            elif lf == "auto-install.xml":
+            if f.lower() == "auto-install.xml":
                 xml_file = os.path.join(search_dir, f)
-        if not bat:
-            log_warn("   ⚠️ verapdf-install.bat in Stage-Verzeichnis nicht gefunden.")
-            return None
+                break
         if not xml_file:
             log_warn("   ⚠️ auto-install.xml in Stage-Verzeichnis nicht gefunden.")
             return None
@@ -2561,7 +2783,9 @@ def stage2_install_pending(manifest):
             )
             continue
         if tool == "verapdf":
-            _install_verapdf_silent(deploy_available=False)
+            # entry mitgeben: der Installer wird aus dem geprueften
+            # Manifest-Pfad gestartet, nicht per Namenssuche.
+            _install_verapdf_silent(deploy_available=False, entry=entry)
         elif tool == "ocr_binary":
             src = entry.get("installer")
             tgt = entry.get("target")
@@ -2589,7 +2813,31 @@ def stage2_install_pending(manifest):
             else:
                 log_warn("   ⚠️ pywin32_postinstall.py nicht gefunden.")
         else:
-            try_install_tool(tool, deploy_available=False)
+            # WICHTIG: genau die Datei ausfuehren, die oben geprueft wurde.
+            #
+            # Vorher stand hier 'try_install_tool(tool, ...)'. Das suchte den
+            # Installer im Stage-Ordner NEU ueber ein Dateinamen-Muster
+            # (pick_installer_in_stage). Geprueft wurde damit entry['installer'],
+            # ausgefuehrt aber, was os.listdir als erstes passend lieferte -
+            # und diese Reihenfolge ist nicht zugesichert.
+            #
+            # Der Stage-Ordner ist zwar gehaertet, das aufrufende Konto behaelt
+            # aber Schreibrecht (Modify). Wer dort zwischen Stage 1 und Stage 2
+            # eine ZWEITE, ebenfalls zum Muster passende Datei ablegt, konnte
+            # so an der Pruefsumme vorbei eine beliebige EXE mit Adminrechten
+            # starten lassen - genau die lokale Rechteausweitung, gegen die
+            # das ganze Stage-Modell gebaut ist.
+            verified = entry.get("installer")
+            cfg = TOOL_INSTALLERS.get(tool) or {}
+            if not verified or not os.path.isfile(long_path(verified)):
+                log_err(f"   ❌ Geprüfter Installer für '{tool}' nicht mehr vorhanden – übersprungen.")
+                STATE["manual_actions"].append(
+                    f"'{tool}' wurde NICHT installiert (Stage-Datei fehlt) – Stage 1 erneut ausführen."
+                )
+                continue
+            if run_installer(verified, cfg):
+                STATE["installed_tools"].append(tool)
+                STATE["stage2_summary"].append(f"installed:{tool}")
     print("")
 
 # =============================================================================
@@ -2628,13 +2876,23 @@ def print_summary():
     log_info(f" Warnungen:  {len(STATE['warnings'])}")
     log_info(f" Fehler:     {len(STATE['errors'])}")
 
+    # 'warnings' MUSS mit hinein. Es gibt Pfade, die ein fehlendes
+    # Pflichtwerkzeug ausschliesslich als Warnung ablegen (z. B. veraPDF ohne
+    # erfolgreiche Installation). Ohne diesen Eintrag meldete der Lauf
+    # 'Alles bereits korrekt eingerichtet' und endete mit Exit-Code 0 -
+    # obwohl ein benoetigtes Programm fehlt.
     nothing = not any(STATE[k] for k in (
         "created_dirs", "installed_packages", "installed_tools",
         "copied_files", "env_set", "path_added", "errors", "manual_actions",
-        "admin_pending",
+        "admin_pending", "warnings",
     ))
     if nothing:
         log_info("\n ✅ Alles bereits korrekt eingerichtet – keine Änderungen nötig.")
+    elif STATE["warnings"] and not (STATE["errors"] or STATE["manual_actions"]):
+        log_info("")
+        log_info(" ⚠️  Der Lauf ist ohne Fehler beendet, aber mit Warnungen –")
+        log_info("    bitte die Liste oben durchsehen. Ein fehlendes Werkzeug")
+        log_info("    fällt sonst erst im späteren Verarbeitungsschritt auf.")
     elif STATE["env_set"] or STATE["path_added"]:
         log_info("")
         log_info(" ℹ️  Hinweis: Offene Terminals/Editoren/VS Code neu starten,")
@@ -2700,14 +2958,50 @@ def main_stage1():
             try:
                 if os.path.isfile(STAGE_RESULT_FILE):
                     os.remove(STAGE_RESULT_FILE)
-            except Exception:
-                pass
+            except Exception as _e:
+                logging.debug(f"main_stage1: Exception verworfen: {_e!r}")
 
             harden_stage_dir()
+            # Ohne belastbare Pruefsumme darf ein Eintrag NICHT ins Manifest:
+            # Stage 2 wuerde ihn sonst mit Adminrechten ungeprueft ausfuehren.
+            # sha256_of() liefert bei jedem Fehler None (gesperrte Datei,
+            # Virenscanner, offenes Handle), hash_tree() ein leeres dict -
+            # genau in dem Moment also, in dem mit der Stage-Datei etwas nicht
+            # stimmt, faellt der Schutz weg, auf dem das ganze Two-Stage-Modell
+            # beruht. Ein Schutz, der bei Fehlern aufmacht statt zumacht, ist
+            # die falsche Richtung: solche Eintraege werden verworfen und als
+            # Handarbeit gemeldet.
+            geprueft = []
             for entry in STATE["admin_pending"]:
-                entry["sha256"] = sha256_of(entry.get("installer"))
+                name = os.path.basename(entry.get("installer") or entry.get("dir") or "?")
+                digest = sha256_of(entry.get("installer"))
+                if not digest:
+                    log_err(f"   ❌ Prüfsumme für {name} nicht bildbar – Eintrag wird NICHT "
+                            f"an Stage 2 übergeben (Datei gesperrt oder nicht lesbar?).")
+                    STATE["manual_actions"].append(
+                        f"{entry.get('tool', name)}: Prüfsumme nicht bildbar, Installation "
+                        f"von Hand nachholen ({entry.get('installer')})."
+                    )
+                    continue
+                entry["sha256"] = digest
                 if entry.get("dir"):
-                    entry["files"] = hash_tree(entry["dir"])
+                    files = hash_tree(entry["dir"])
+                    unlesbar = sorted(k for k, v in files.items() if v == HASH_UNREADABLE)
+                    if not files or unlesbar:
+                        grund = ("keine Datei lesbar" if not files
+                                 else f"{len(unlesbar)} Datei(en) nicht lesbar")
+                        log_err(f"   ❌ Hash-Liste für Ordner '{name}' unvollständig "
+                                f"({grund}) – Eintrag wird NICHT an Stage 2 übergeben.")
+                        for k in unlesbar[:5]:
+                            log_err(f"      nicht lesbar: {k}")
+                        STATE["manual_actions"].append(
+                            f"{entry.get('tool', name)}: Hash-Liste unvollständig, Installation "
+                            f"von Hand nachholen ({entry.get('dir')})."
+                        )
+                        continue
+                    entry["files"] = files
+                geprueft.append(entry)
+            STATE["admin_pending"] = geprueft
 
             manifest = {
                 "deploy_source":  DEPLOY_SOURCE,
@@ -2741,6 +3035,12 @@ def main_stage1():
     if STATE["errors"]:
         return 2
     if STATE["manual_actions"]:
+        return 1
+    # Auch reine Warnungen sichtbar machen: sie koennen ein fehlendes
+    # Pflichtwerkzeug bedeuten (veraPDF & Co.), und Exit-Code 0 haette dem
+    # Aufrufer - Aufgabenplanung oder Wrapper-Skript - einen sauberen Lauf
+    # gemeldet.
+    if STATE["warnings"]:
         return 1
     return 0
 
@@ -2876,6 +3176,12 @@ def main_stage2():
         return 2
     if STATE["manual_actions"]:
         return 1
+    # Auch reine Warnungen sichtbar machen: sie koennen ein fehlendes
+    # Pflichtwerkzeug bedeuten (veraPDF & Co.), und Exit-Code 0 haette dem
+    # Aufrufer - Aufgabenplanung oder Wrapper-Skript - einen sauberen Lauf
+    # gemeldet.
+    if STATE["warnings"]:
+        return 1
     return 0
 
 def main():
@@ -2885,8 +3191,8 @@ def main():
     parse_run_mode()
     try:
         os.makedirs(TMP_DIR, exist_ok=True)
-    except Exception:
-        pass
+    except Exception as _e:
+        logging.debug(f"main: Exception verworfen: {_e!r}")
     setup_logging()
 
     if RUN_MODE == "stage2":

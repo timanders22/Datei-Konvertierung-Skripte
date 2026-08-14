@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # ==================================================================
 # POWERPOINT-UPDATER: ALLE PPT/PPTX DURCH AKTUELLE ENGINE NEU SPEICHERN
 # ==================================================================
@@ -117,6 +117,34 @@ from datetime import datetime
 from typing import Optional, Tuple
 
 
+# ==================================================================
+# Konsolen-Encoding (UTF-8) - muss VOR jedem print stehen
+# ==================================================================
+# Ohne diesen Block bricht die erste Ausgabe mit Rahmenzeichen oder Emoji
+# unter der Windows-Standardcodepage (cp850/cp1252) mit UnicodeEncodeError
+# ab - auch bei Umleitung in eine Datei. Gleiche Fassung wie in 3a/3b.
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+# ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Fehlt _gemeinsam.py, laeuft alles unveraendert weiter.
+try:
+    _eigener_ordner = os.path.dirname(os.path.abspath(__file__))
+    if _eigener_ordner not in sys.path:
+        sys.path.insert(0, _eigener_ordner)
+    import _gemeinsam as gem
+except Exception:
+    gem = None
+
+
+
 IS_FROZEN = getattr(sys, "frozen", False)
 
 
@@ -185,6 +213,17 @@ EXCLUDE_DIR_NAMES = {"$recycle.bin", "system volume information",
 FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 
 # ==================================================================
+# Protokoll-Objekte fruehzeitig binden: _resolve_documents_dir() laeuft schon
+# beim Import und 'verwirft' Fehler mit detail_logger.debug(...) - der Name
+# wird aber erst am Ende von _setup_logging() belegt. Im Fehlerfall (Documents
+# nicht erreichbar, umgeleitetes Profil) loeste der Fehlerschlucker deshalb
+# selbst einen NameError aus und das Skript startete gar nicht.
+# getLogger liefert dieselben Objekte, die _setup_logging() spaeter mit
+# Handlern versieht - die Zuweisung dort bleibt unveraendert gueltig.
+file_logger   = logging.getLogger("FileLogger")
+detail_logger = logging.getLogger("DetailLogger")
+
+
 # Konfiguration
 # ==================================================================
 def _resolve_documents_dir() -> str:
@@ -192,8 +231,8 @@ def _resolve_documents_dir() -> str:
     try:
         if os.path.isdir(base):
             return win32api.GetLongPathName(base)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_resolve_documents_dir: Exception verworfen: {_e!r}")
     return base
 
 def _resolve_script_directory() -> str:
@@ -286,7 +325,33 @@ def _setup_logging() -> tuple:
 file_logger, detail_logger = _setup_logging()
 
 
+
+# ==================================================================
+# Gemeinsames Laufprotokoll (migration.jsonl)
+# ==================================================================
+# Jedes Skript schreibt sein eigenes Format: CSV mit Semikolon, CSV mit
+# Komma, .log, XLSX, teils mit BOM, teils ohne. Der Gesamtfortschritt
+# ueber die elf Schritte liess sich damit nicht auswerten - etwa die
+# Frage, welche Dateien in Schritt 2 liegen blieben und in Schritt 7
+# wieder auftauchen. Diese Zeile ERGAENZT die bestehenden Protokolle.
+_laufprotokoll = None
+
+
+def _protokoll(pfad: str, aktion: str, status: str, detail: str = "") -> None:
+    global _laufprotokoll
+    if gem is None:
+        return
+    try:
+        if _laufprotokoll is None:
+            _laufprotokoll = gem.Laufprotokoll(
+                os.path.splitext(os.path.basename(__file__))[0])
+        _laufprotokoll.schreibe(pfad, aktion, status, detail)
+    except Exception:
+        pass
+
 def log_conversion(old_path: str, new_path: str) -> None:
+    _protokoll(new_path or old_path, "konvertiert", "OK",
+               f"aus {old_path}")
     # Nachweisliste der Format-Konvertierungen (.ppt/.pps/.pot -> neu, und
     # Ausweichnamen bei Kollision) mit altem und neuem Pfad fuers Archiv.
     if not CONVERSIONS_CSV:
@@ -399,8 +464,8 @@ def send_summary_mail(
                         error_lines.pop(0)
         if error_lines:
             error_excerpt = "\nFehler-Auszug (letzte 50 Einträge):\n" + "".join(error_lines)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"send_summary_mail: Exception verworfen: {_e!r}")
 
     body = (
         f"PowerPoint-Updater – Laufbericht\n"
@@ -476,16 +541,16 @@ def append_resume(resume_path: str, file_path: str) -> None:
     try:
         with open(resume_path, "a", encoding="utf-8") as fh:
             fh.write(file_path + "\n")
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"append_resume: Exception verworfen: {_e!r}")
 
 
 def delete_resume_file(resume_path: str) -> None:
     try:
         if resume_path and os.path.exists(resume_path):
             os.remove(resume_path)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"delete_resume_file: Exception verworfen: {_e!r}")
 
 
 # ==================================================================
@@ -597,8 +662,8 @@ def _release_lock(lock_path: Optional[str]) -> None:
     if lock_path and os.path.exists(lock_path):
         try:
             os.remove(lock_path)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_release_lock: Exception verworfen: {_e!r}")
 
 
 # ==================================================================
@@ -611,19 +676,19 @@ def _signal_handler(sig, frame) -> None:
         try:
             ppt_app_global.Quit()
             time.sleep(1)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
 
     _kill_user_powerpoint()
 
     try:
         _cleanup_ppt_inetcache()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
     try:
         _cleanup_user_recent()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
 
     if os.path.exists(TEMP_PROCESS_PATH):
         try:
@@ -634,8 +699,8 @@ def _signal_handler(sig, frame) -> None:
 
     try:
         pythoncom.CoUninitialize()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
 
     _release_lock(active_lock_path)
     os._exit(1)
@@ -678,9 +743,9 @@ def snapshot_foreign_powerpoint_pids() -> None:
                     found.add(p.info["pid"])
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
-    except Exception:
+    except Exception as _e:
         # Im Zweifel lieber zu viel schuetzen als eine fremde Sitzung killen.
-        pass
+        detail_logger.debug(f"snapshot_foreign_powerpoint_pids: Exception verworfen: {_e!r}")
     _FOREIGN_POWERPOINT_PIDS = found
     if found:
         detail_logger.info(
@@ -806,16 +871,16 @@ def _configure_ppt_instance(ppt_app) -> None:
     ppt_app.Visible = COM_TRUE
     try:
         ppt_app.WindowState = 2   # ppWindowMinimized
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_configure_ppt_instance: Exception verworfen: {_e!r}")
     try:
         ppt_app.DisplayAlerts = 1   # ppAlertsNone
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_configure_ppt_instance: Exception verworfen: {_e!r}")
     try:
         ppt_app.AutomationSecurity = 3   # msoAutomationSecurityForceDisable
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_configure_ppt_instance: Exception verworfen: {_e!r}")
 
     ppt_app_pid = None
     try:
@@ -885,8 +950,8 @@ def _ppt_call_with_watchdog(call_label: str, timeout: float, ppt_pid,
                         proc.kill()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"_watchdog: Exception verworfen: {_e!r}")
 
     wd_thread = threading.Thread(target=_watchdog, daemon=True)
     wd_thread.start()
@@ -904,8 +969,8 @@ def _ppt_call_with_watchdog(call_label: str, timeout: float, ppt_pid,
         if restore_fn is not None:
             try:
                 restore_fn()
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_ppt_call_with_watchdog: Exception verworfen: {_e!r}")
 
 
 def _verify_trust_center_for_temp(ppt_app, ppt_pid: Optional[int],
@@ -932,28 +997,35 @@ def _verify_trust_center_for_temp(ppt_app, ppt_pid: Optional[int],
     except TimeoutError:
         if saveas_pres[0] is not None:
             try: saveas_pres[0].Close()
-            except Exception: pass
+            except Exception as _e:
+                detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
         try: _remove_from_mru(ppt_app, test_path)
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
         if os.path.exists(test_path):
             try: os.remove(test_path)
-            except Exception: pass
+            except Exception as _e:
+                detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
         return False, (f"TIMEOUT nach {timeout:.0f}s bei SaveAs - "
                        "Temp-Ordner blockiert oder PowerPoint haengt")
     except Exception as e:
         if saveas_pres[0] is not None:
             try: saveas_pres[0].Close()
-            except Exception: pass
+            except Exception as _e:
+                detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
         try: _remove_from_mru(ppt_app, test_path)
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
         if os.path.exists(test_path):
             try: os.remove(test_path)
-            except Exception: pass
+            except Exception as _e:
+                detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
         return False, f"SaveAs fehlgeschlagen: {e}"
 
     if not os.path.exists(test_path):
         try: _remove_from_mru(ppt_app, test_path)
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
         return False, "SaveAs hat keine Datei erzeugt"
 
     # --- (2) Open der gespeicherten Datei (mit Watchdog) ---
@@ -974,37 +1046,46 @@ def _verify_trust_center_for_temp(ppt_app, ppt_pid: Optional[int],
         # Watchdog hat den Prozess beendet; Datei aufraeumen und melden.
         if os.path.exists(test_path):
             try: os.remove(test_path)
-            except Exception: pass
+            except Exception as _e:
+                detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
         return False, (f"TIMEOUT nach {timeout:.0f}s bei Open - "
                        "Trust Center vermutlich nicht konfiguriert oder "
                        "Geschuetzte Ansicht aktiv")
     except Exception as e:
         if open_pres[0] is not None:
             try: open_pres[0].Close()
-            except Exception: pass
+            except Exception as _e:
+                detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
         try: _remove_from_mru(ppt_app, test_path)
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
         if os.path.exists(test_path):
             try: os.remove(test_path)
-            except Exception: pass
+            except Exception as _e:
+                detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
         return False, f"Open fehlgeschlagen: {e}"
 
     if open_pres[0] is None:
         try: _remove_from_mru(ppt_app, test_path)
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
         if os.path.exists(test_path):
             try: os.remove(test_path)
-            except Exception: pass
+            except Exception as _e:
+                detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
         return False, "Presentations.Open lieferte kein Praesentations-Objekt"
 
     # --- (3) Cleanup ---
     try: open_pres[0].Close()
-    except Exception: pass
+    except Exception as _e:
+        detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
     try: _remove_from_mru(ppt_app, test_path)
-    except Exception: pass
+    except Exception as _e:
+        detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
     if os.path.exists(test_path):
         try: os.remove(test_path)
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"_verify_trust_center_for_temp: Exception verworfen: {_e!r}")
     return True, ""
 
 
@@ -1120,8 +1201,8 @@ def _cleanup_ppt_inetcache() -> None:
                 try:
                     try:
                         os.chmod(fpath, 0o666)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"_cleanup_ppt_inetcache: Exception verworfen: {_e!r}")
                     os.remove(fpath)
                     files_deleted += 1
                     bytes_freed   += fsize
@@ -1190,8 +1271,8 @@ def _cleanup_user_recent() -> None:
             try:
                 try:
                     os.chmod(fpath, 0o666)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"_cleanup_user_recent: Exception verworfen: {_e!r}")
                 os.remove(fpath)
                 files_deleted += 1
                 bytes_freed   += fsize
@@ -1254,8 +1335,8 @@ def _enable_restore_privileges() -> None:
             try:
                 luid = win32security.LookupPrivilegeValue(None, name)
                 privs.append((luid, win32security.SE_PRIVILEGE_ENABLED))
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_enable_restore_privileges: Exception verworfen: {_e!r}")
         if not privs:
             return
         win32security.AdjustTokenPrivileges(htoken, 0, privs)
@@ -1288,6 +1369,27 @@ def _get_security_descriptor(path: str):
 
 
 def _apply_security_descriptor(path: str, sd) -> None:
+    """Eigentuemer, Gruppe und DACL einer ersetzten Datei wiederherstellen.
+
+    Alles wird in EINEM SetNamedSecurityInfo-Aufruf gesetzt. Frueher liefen
+    zwei getrennte Aufrufe (erst DACL, dann Owner) - und das Setzen des
+    Eigentuemers ordnet die Vererbung neu. Nachgestellt: eine Datei verlor
+    dabei die Kennzeichnung ihrer geerbten ACEs, und eine geerbte
+    EIGENTUEMERRECHTE-ACE (S-1-3-4) bekam zusaetzlich INHERIT_ONLY - damit galt
+    sie fuer die Datei selbst nicht mehr. Wer seinen Zugriff allein daraus
+    bezog, konnte die eigene Datei anschliessend nicht mehr oeffnen
+    (PermissionError). Das ist das Gegenteil dessen, was diese Funktion
+    bezweckt. Ein gemeinsamer Aufruf laesst Windows die Rechte in einem Zug
+    berechnen; der schaedliche Zwischenzustand entsteht gar nicht erst.
+
+    Der Eigentuemer wird ausserdem nur gesetzt, wenn er tatsaechlich abweicht -
+    ein privilegierter Schreibvorgang ohne Wirkung entfaellt damit.
+
+    Schlaegt der gemeinsame Aufruf fehl (typisch: kein SeRestorePrivilege im
+    Nutzer-Kontext, dann verweigert bereits das Owner-Feld), wird die DACL
+    einzeln nachgezogen. Damit bleibt das bisherige Verhalten erhalten, dass
+    wenigstens die Rechte ankommen.
+    """
     if sd is None:
         return
     try:
@@ -1300,48 +1402,72 @@ def _apply_security_descriptor(path: str, sd) -> None:
         dacl = sd.GetSecurityDescriptorDacl()
     except Exception:
         dacl = None
-    if dacl is not None:
-        try:
-            dacl_flags = win32security.DACL_SECURITY_INFORMATION
-            try:
-                ctrl, _rev = sd.GetSecurityDescriptorControl()
-                if ctrl & win32security.SE_DACL_PROTECTED:
-                    dacl_flags |= win32security.PROTECTED_DACL_SECURITY_INFORMATION
-                else:
-                    dacl_flags |= win32security.UNPROTECTED_DACL_SECURITY_INFORMATION
-            except Exception:
-                pass
-            win32security.SetNamedSecurityInfo(
-                p, win32security.SE_FILE_OBJECT, dacl_flags,
-                None, None, dacl, None)
-            detail_logger.debug(f"DACL wiederhergestellt: {path}")
-        except Exception as e:
-            detail_logger.warning(
-                f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e}")
-
     try:
         owner = sd.GetSecurityDescriptorOwner()
+    except Exception:
+        owner = None
+    try:
+        group = sd.GetSecurityDescriptorGroup()
+    except Exception:
         group = None
+
+    info = 0
+    if dacl is not None:
+        info |= win32security.DACL_SECURITY_INFORMATION
         try:
-            group = sd.GetSecurityDescriptorGroup()
-        except Exception:
-            pass
-        if owner is not None:
-            sec_flags = win32security.OWNER_SECURITY_INFORMATION
-            if group is not None:
-                sec_flags |= win32security.GROUP_SECURITY_INFORMATION
-            win32security.SetNamedSecurityInfo(
-                p, win32security.SE_FILE_OBJECT, sec_flags,
-                owner, group, None, None)
-            detail_logger.debug(f"Owner wiederhergestellt: {path}")
+            ctrl, _rev = sd.GetSecurityDescriptorControl()
+            if ctrl & win32security.SE_DACL_PROTECTED:
+                info |= win32security.PROTECTED_DACL_SECURITY_INFORMATION
+            else:
+                info |= win32security.UNPROTECTED_DACL_SECURITY_INFORMATION
+        except Exception as _e:
+            detail_logger.debug(f"_apply_security_descriptor: Exception verworfen: {_e!r}")
+
+    # Eigentuemer nur setzen, wenn er wirklich abweicht.
+    if owner is not None:
+        try:
+            akt = win32security.GetNamedSecurityInfo(
+                p, win32security.SE_FILE_OBJECT,
+                win32security.OWNER_SECURITY_INFORMATION
+            ).GetSecurityDescriptorOwner()
+            if (win32security.ConvertSidToStringSid(akt)
+                    == win32security.ConvertSidToStringSid(owner)):
+                owner = None
+        except Exception as _e:
+            detail_logger.debug(f"_apply_security_descriptor: Owner-Vergleich verworfen: {_e!r}")
+
+    if owner is not None:
+        info |= win32security.OWNER_SECURITY_INFORMATION
+    if group is not None:
+        info |= win32security.GROUP_SECURITY_INFORMATION
+    if not info:
+        return
+
+    nur_dacl = info & ~(win32security.OWNER_SECURITY_INFORMATION
+                        | win32security.GROUP_SECURITY_INFORMATION)
+
+    try:
+        win32security.SetNamedSecurityInfo(
+            p, win32security.SE_FILE_OBJECT, info, owner, group, dacl, None)
+        detail_logger.debug(f"Sicherheitsinfo wiederhergestellt: {path}")
+        return
     except Exception as e:
+        if owner is None and group is None:
+            detail_logger.warning(f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e}")
+            return
         if _restore_privileges_enabled:
-            detail_logger.warning(
-                f"Owner-Wiederherstellung fehlgeschlagen ({path}): {e}")
+            detail_logger.warning(f"Owner-Wiederherstellung fehlgeschlagen ({path}): {e}")
         else:
-            detail_logger.debug(
-                f"Owner nicht gesetzt (kein Admin-Privileg – im "
-                f"Nutzer-Kontext unkritisch): {path} – {e}")
+            detail_logger.debug(f"Owner nicht gesetzt (kein Admin-Privileg - im Nutzer-Kontext unkritisch): {path} - {e}")
+
+    # Rueckfall: wenigstens die DACL setzen.
+    if dacl is not None and nur_dacl:
+        try:
+            win32security.SetNamedSecurityInfo(
+                p, win32security.SE_FILE_OBJECT, nur_dacl, None, None, dacl, None)
+            detail_logger.debug(f"DACL wiederhergestellt (ohne Owner): {path}")
+        except Exception as e2:
+            detail_logger.warning(f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e2}")
 
 
 # ==================================================================
@@ -1364,6 +1490,24 @@ def safe_remove(path: str) -> bool:
         detail_logger.warning(f"Löschen fehlgeschlagen: {display_path(path)} – {e}")
         return False
 
+
+
+def _utime_rueckfall(pfad: str, zeiten) -> bool:
+    """Rueckfall, wenn win32file.SetFileTime scheitert.
+
+    Erhaelt Zugriffs- und Aenderungszeit - nicht die Erstellungszeit,
+    aber das ist deutlich besser als der vollstaendige Verlust des
+    Datums. Diesen Rueckfall hatte bisher nur 5_OCR_PDF.py; ohne ihn
+    verloren die uebrigen Skripte die Zeitstempel stillschweigend,
+    sobald pywin32 fehlte oder der Handle nicht zu oeffnen war.
+    """
+    try:
+        zugriff, geaendert = zeiten[1], zeiten[2]
+        os.utime(prepare_long_path(pfad),
+                 (zugriff.timestamp(), geaendert.timestamp()))
+        return True
+    except Exception:
+        return False
 
 def safe_exists(path: str) -> bool:
     try:
@@ -1430,8 +1574,8 @@ def release_unique_path(path: Optional[str]) -> None:
         p = _lp_for_reserve(path)
         if os.path.isfile(p) and os.path.getsize(p) == 0:
             os.remove(p)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"release_unique_path: Exception verworfen: {_e!r}")
 
 
 def safe_getsize(path: str) -> int:
@@ -1471,8 +1615,8 @@ def _wait_for_file_unlock(path: str,
             )
             try:
                 h.Close()
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_wait_for_file_unlock: Exception verworfen: {_e!r}")
             if attempt > 0:
                 detail_logger.debug(
                     f"Datei nach {attempt * retry_delay:.1f}s freigegeben: "
@@ -1567,13 +1711,21 @@ def robust_move(src: str, dst: str, max_retries: int = MAX_RETRIES) -> bool:
                 f"Verschoben (staging+replace): {display_path(src)} → {display_path(dst)}"
             )
             return True
-        except Exception as e:
-            detail_logger.warning(f"Verschieben Versuch {attempt+1}/{max_retries}: {e}")
+        # BaseException, nicht Exception: Der Signal-Handler beendet sich mit
+        # sys.exit() (SystemExit erbt von BaseException). Bei Strg+C mitten im
+        # Kopieren blieb die Staging-Datei '<Ziel>.tmp_new' sonst auf der
+        # Ablage liegen, und kein Aufraeumpfad erfasst sie je wieder.
+        except BaseException as e:
+            if isinstance(e, Exception):
+                detail_logger.warning(f"Verschieben Versuch {attempt+1}/{max_retries}: {e}")
             try:
                 if os.path.exists(stage_long):
                     safe_remove(stage)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"robust_move: Exception verworfen: {_e!r}")
+            # Abbruch nach dem Aufraeumen unveraendert weiterreichen.
+            if not isinstance(e, Exception):
+                raise
         if attempt < max_retries - 1:
             time.sleep(RETRY_DELAY)
     return False
@@ -1906,8 +2058,8 @@ def _temp_file_is_active(path: str) -> bool:
             win32file.OPEN_EXISTING, 0, None)
         try:
             h.Close()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_temp_file_is_active: Exception verworfen: {_e!r}")
         return False
     except Exception:
         # Sharing-/Lock-Violation oder anderer Zugriffsfehler -> als aktiv
@@ -1934,7 +2086,20 @@ def _path_matches_exclude(root_lower: str, exclude_patterns: list) -> bool:
 
 
 def file_generator(directory: str, clean_temp: bool = True,
-                   exclude_patterns: list = None):
+                   exclude_patterns: list = None,
+                   clean_appledouble: bool = False):
+    """PowerPoint-Dateien liefern und optional verwaiste Office-Reste raeumen.
+
+    clean_temp=False raeumt NICHTS - zwingend fuer den Probelauf, der
+    zusichert, das Dateisystem unangetastet zu lassen.
+
+    clean_appledouble steuert die '._*'-Dateien getrennt und ist bewusst
+    standardmaessig aus: Auf Freigaben mit Mac-Clients sind das
+    AppleDouble-Container (Finder-Metadaten, Resource-Forks) und keine
+    Office-Reste. Sie wurden ohne Endungsfilter im gesamten Baum geloescht,
+    also auch '._Foto.jpg' - Dateien, mit denen dieses Skript nichts zu tun
+    hat.
+    """
     extensions = {
         ".ppt",  ".pptx", ".pptm", ".ppam",
         ".pps",  ".ppsx", ".ppsm",
@@ -1976,7 +2141,7 @@ def file_generator(directory: str, clean_temp: bool = True,
 
         if clean_temp:
             for f in files:
-                if f.startswith("~$") or f.startswith("._"):
+                if f.startswith("~$") or (clean_appledouble and f.startswith("._")):
                     full_t = os.path.join(root, f)
                     try:
                         # Aktive Stub-Dateien (zugehoerige Datei offen) NICHT
@@ -1984,8 +2149,8 @@ def file_generator(directory: str, clean_temp: bool = True,
                         if _temp_file_is_active(full_t):
                             continue
                         safe_remove(full_t)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"file_generator: Exception verworfen: {_e!r}")
 
         for f in files:
             nl = f.lower()
@@ -2058,6 +2223,16 @@ def convert_ppt_file(
     converted_ok        = False
     ext            = os.path.splitext(file_path)[1].lower()
     update_complete = False
+    # Die Sicherung ist NACHWEISLICH gelungen. Nur dann darf der
+    # Fehlerpfad aus backup_path zurueckschreiben: scheitert robust_copy
+    # mitten in der Kopie, liegt am Backup-Pfad ein Fragment (shutil.copy2
+    # trunkiert das Ziel sofort), und verify_file prueft nur >= 100 Byte -
+    # ein solches Fragment wuerde ungeprueft ueber das Original laufen.
+    backup_ok      = False
+    # Die Zieldatei wurde in diesem Lauf angefasst (robust_move begonnen).
+    # Ist sie es nicht, ist target_path das unveraenderte Original und darf
+    # im Fehlerpfad weder ueberschrieben noch entfernt werden.
+    target_touched = False
 
     # PowerPoint-Add-Ins (.ppam) lassen sich NICHT via Presentations.Open
     # als Praesentation oeffnen (PowerPoint blockiert das strikt) und auch
@@ -2236,6 +2411,23 @@ def convert_ppt_file(
 
         if not pres_opened or pres is None:
             if skip_password:
+                # Vor dem SKIPPED pruefen, ob die COM-Instanz ueberhaupt noch
+                # lebt. Stuerzt PowerPoint zwischen zwei Dateien ab - womit der
+                # Code ausdruecklich rechnet -, scheitert Presentations.Open in
+                # allen Versuchen, und mit skip_password ging das als 'SKIPPED'
+                # zurueck. Der Wiederanlauf der Engine haengt aber allein an
+                # 'ERROR': er lief nie an, und JEDE weitere Datei scheiterte
+                # gegen dieselbe tote Instanz.
+                try:
+                    _ = ppt_app.Version
+                except Exception:
+                    pbar.write("  ✗  FEHLER: PowerPoint reagiert nicht mehr.")
+                    detail_logger.warning(
+                        f"COM-Instanz tot beim Oeffnen: {display_path(original_path)}"
+                    )
+                    log_error(original_path,
+                              Exception("PowerPoint-Instanz nicht mehr erreichbar"))
+                    return "ERROR"
                 pbar.write("  → ÜBERSPRUNGEN: Zugriff verweigert.")
                 detail_logger.warning(
                     f"Übersprungen (kein Zugriff): {display_path(original_path)}"
@@ -2249,8 +2441,8 @@ def convert_ppt_file(
         try:
             pres_format = pres.FileFormat
             detail_logger.debug(f"FileFormat: {pres_format}")
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"convert_ppt_file: Exception verworfen: {_e!r}")
 
         protection_removed = remove_protection(pres, original_path)
 
@@ -2288,8 +2480,8 @@ def convert_ppt_file(
                 f"[DRY-RUN] WOULD_UPDATE: {display_path(original_path)} → {new_ext}")
             try:
                 pres.Close()
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"convert_ppt_file: Exception verworfen: {_e!r}")
             pres = None
             return "WOULD_UPDATE"
 
@@ -2300,8 +2492,8 @@ def convert_ppt_file(
         try:
             pres.Password      = ""
             pres.WritePassword = ""
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"convert_ppt_file: Exception verworfen: {_e!r}")
         try:
             _ppt_call_with_watchdog(
                 "SaveAs",
@@ -2397,10 +2589,18 @@ def convert_ppt_file(
                         f"Veraltetes Backup gelöscht: {display_path(backup_path)}"
                     )
             if not robust_copy(target_path, backup_path):
+                # Am Backup-Pfad kann ein Torso liegen (Kopie mittendrin
+                # abgerissen). Er darf den Fehlerpfad unten nicht als
+                # Rueckfallquelle erreichen - entfernen und backup_path
+                # zuruecksetzen, BEVOR die Ausnahme geworfen wird.
+                bad_backup = backup_path
+                backup_path = None
+                safe_remove(bad_backup)
                 raise Exception(
-                    f"Backup fehlgeschlagen: {display_path(backup_path)}. "
+                    f"Backup fehlgeschlagen: {display_path(bad_backup)}. "
                     "Abbruch zum Schutz der Zieldatei."
                 )
+            backup_ok = True
 
         if is_temp_copy and safe_exists(file_path):
             safe_remove(file_path)
@@ -2408,6 +2608,9 @@ def convert_ppt_file(
 
         _wait_for_file_unlock(temp_save_path)
 
+        # Ab hier kann die Zieldatei veraendert sein - auch wenn robust_move
+        # scheitert (Cross-Volume-Rueckfall schreibt in Etappen).
+        target_touched = True
         if not robust_move(temp_save_path, target_path):
             raise Exception("Verschieben der konvertierten Datei fehlgeschlagen")
         # Ab hier steht die echte Datei am Zielpfad - der reservierte
@@ -2459,7 +2662,12 @@ def convert_ppt_file(
                     break
                 except Exception as e_utime:
                     if av_retry == 4:
-                        detail_logger.warning(f"Zeitstempel nicht wiederherstellbar: {e_utime}")
+                        if not _utime_rueckfall(target_path, orig_times):
+                            detail_logger.warning(f"Zeitstempel nicht wiederherstellbar: {e_utime}")
+                        else:
+                            detail_logger.info(
+                                "Zeitstempel ueber os.utime-Rueckfall gesetzt "
+                                "(ohne Erstellungszeit).")
                     else:
                         time.sleep(0.5)
 
@@ -2475,7 +2683,10 @@ def convert_ppt_file(
     except Exception as e:
         pbar.write(f"  ✗  FEHLER: '{os.path.basename(original_path)}'")
 
-        if backup_path and safe_exists(backup_path) and target_path:
+        # Nur eine nachweislich gelungene Sicherung ist eine Rueckfallquelle.
+        have_backup = bool(backup_ok and backup_path and safe_exists(backup_path))
+
+        if have_backup and target_path and target_touched:
             if robust_copy(backup_path, target_path):
                 _apply_security_descriptor(target_path, orig_sd)
                 safe_remove(backup_path)
@@ -2485,7 +2696,12 @@ def convert_ppt_file(
                     "    ⚠ KRITISCH: Rollback fehlgeschlagen! "
                     "Backup-Datei aus Sicherheitsgründen bewahrt."
                 )
-        elif not backup_path and target_path and safe_exists(target_path):
+        elif have_backup and target_path:
+            # Die Zieldatei wurde nie angefasst - sie IST das Original.
+            # Zurueckkopieren waere ein Risiko ohne jeden Nutzen.
+            safe_remove(backup_path)
+            pbar.write("    → Zieldatei unverändert – kein Rollback nötig")
+        elif target_touched and target_path and safe_exists(target_path):
             if update_complete:
                 pbar.write(
                     "    ⚠  Spaeter Fehler nach erfolgreicher Konvertierung – "
@@ -2509,13 +2725,13 @@ def convert_ppt_file(
         if pres is not None:
             try:
                 pres.Close()
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"convert_ppt_file: Exception verworfen: {_e!r}")
             pres = None
         try:
             _remove_from_mru(ppt_app, *mru_paths_to_clean)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"convert_ppt_file: Exception verworfen: {_e!r}")
         if is_temp_copy and safe_exists(file_path):
             safe_remove(file_path)
         if temp_save_path and safe_exists(temp_save_path):
@@ -2578,7 +2794,12 @@ def process_directory(
     os.makedirs(TEMP_PROCESS_PATH, exist_ok=True)
 
     resume_set = resume_set or set()
-    gen = file_generator(directory, clean_temp=True,
+    # clean_temp=not dry_run: Der Probelauf sichert zu, das Dateisystem
+    # unangetastet zu lassen. Mit dem frueher fest verdrahteten
+    # clean_temp=True loeschte gerade der Modus, den man vor dem ersten
+    # Echtlauf auf einer fremden Ablage waehlt, bereits Dateien im ganzen
+    # Baum. Gleiche Ursache und gleiche Korrektur wie in 3b.
+    gen = file_generator(directory, clean_temp=not dry_run,
                          exclude_patterns=exclude_patterns)
     if resume_set:
         _src_gen = gen
@@ -2658,8 +2879,8 @@ def process_directory(
                 try:
                     if ppt_app_global is not None:
                         ppt_app_global.Quit()
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
                 _kill_user_powerpoint()
                 _cleanup_ppt_inetcache()
                 _cleanup_user_recent()

@@ -124,6 +124,19 @@ except Exception:
     pass
 
 # ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Fehlt _gemeinsam.py, laeuft alles unveraendert weiter.
+try:
+    _eigener_ordner = os.path.dirname(os.path.abspath(__file__))
+    if _eigener_ordner not in sys.path:
+        sys.path.insert(0, _eigener_ordner)
+    import _gemeinsam as gem
+except Exception:
+    gem = None
+
+
+# ==================================================================
 # COM-Konstanten
 # ==================================================================
 COM_TRUE  = -1
@@ -172,6 +185,17 @@ TARGET_LAST_EDITED = 7
 
 OFFICE_VERSIONS_SUPPORTED = "Office 2019 / 2021 / 2024 / 365 (DE/EN)"
 
+# Protokoll-Objekte fruehzeitig binden: _resolve_documents_dir() laeuft schon
+# beim Import und 'verwirft' Fehler mit detail_logger.debug(...) - der Name
+# wird aber erst am Ende von _setup_logging() belegt. Im Fehlerfall (Documents
+# nicht erreichbar, umgeleitetes Profil) loeste der Fehlerschlucker deshalb
+# selbst einen NameError aus und das Skript startete gar nicht.
+# getLogger liefert dieselben Objekte, die _setup_logging() spaeter mit
+# Handlern versieht - die Zuweisung dort bleibt unveraendert gueltig.
+file_logger   = logging.getLogger("FileLogger")
+detail_logger = logging.getLogger("DetailLogger")
+
+
 # ==================================================================
 # Konfiguration
 # ==================================================================
@@ -180,8 +204,8 @@ def _resolve_documents_dir() -> str:
     try:
         if os.path.isdir(base):
             return win32api.GetLongPathName(base)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_resolve_documents_dir: Exception verworfen: {_e!r}")
     return base
 
 _docs_base = _resolve_documents_dir()
@@ -207,6 +231,14 @@ EXCEL_RESTART_EVERY = 200
 # Re-Open greifen koennen. Ein langer Wert wuerde die Konflikt-Erkennung
 # pro Datei um ein Vielfaches verzoegern.
 OPEN_TIMEOUT         = 20.0
+
+# Bewusst deutlich groesser als OPEN_TIMEOUT. Der kurze Open-Wert dient
+# der schnellen Konflikt-Erkennung; beim Speichern gibt es nichts zu
+# erkennen, dafuer aber echte Arbeit: eine grosse Arbeitsmappe ueber eine
+# langsame Freigabe zu schreiben darf dauern. Der Waechter soll hier nur
+# den echten Haenger abfangen (modaler Dialog, DFS-Ausfall), nicht einen
+# langsamen, aber laufenden Schreibvorgang abwuergen.
+SAVE_TIMEOUT         = 300.0
 
 AV_WAIT_TIMEOUT      = 15.0
 AV_WAIT_POLL         = 0.3
@@ -276,7 +308,33 @@ _log_dir_global: str = ""
 file_logger, detail_logger = _setup_logging()
 
 
+
+# ==================================================================
+# Gemeinsames Laufprotokoll (migration.jsonl)
+# ==================================================================
+# Jedes Skript schreibt sein eigenes Format: CSV mit Semikolon, CSV mit
+# Komma, .log, XLSX, teils mit BOM, teils ohne. Der Gesamtfortschritt
+# ueber die elf Schritte liess sich damit nicht auswerten - etwa die
+# Frage, welche Dateien in Schritt 2 liegen blieben und in Schritt 7
+# wieder auftauchen. Diese Zeile ERGAENZT die bestehenden Protokolle.
+_laufprotokoll = None
+
+
+def _protokoll(pfad: str, aktion: str, status: str, detail: str = "") -> None:
+    global _laufprotokoll
+    if gem is None:
+        return
+    try:
+        if _laufprotokoll is None:
+            _laufprotokoll = gem.Laufprotokoll(
+                os.path.splitext(os.path.basename(__file__))[0])
+        _laufprotokoll.schreibe(pfad, aktion, status, detail)
+    except Exception:
+        pass
+
 def log_conversion(old_path: str, new_path: str) -> None:
+    _protokoll(new_path or old_path, "konvertiert", "OK",
+               f"aus {old_path}")
     # Nachweisliste der Format-Konvertierungen (.xls/.xlt/.xla -> neu, und
     # Ausweichnamen bei Kollision) mit altem und neuem Pfad fuers Archiv.
     if not CONVERSIONS_CSV:
@@ -396,8 +454,8 @@ def send_summary_mail(
                         error_lines.pop(0)
         if error_lines:
             error_excerpt = "\nFehler-Auszug (letzte 50 Einträge):\n" + "".join(error_lines)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"send_summary_mail: Exception verworfen: {_e!r}")
 
     body = (
         f"Excel-Updater – Laufbericht\n"
@@ -460,8 +518,8 @@ def _restore_excel_settings(excel) -> None:
         excel.ScreenUpdating   = COM_TRUE
         excel.EnableEvents     = COM_TRUE
         excel.AskToUpdateLinks = COM_TRUE
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_restore_excel_settings: Exception verworfen: {_e!r}")
 
 def _normalize_username(name: str) -> str:
     return name.casefold() if name else ""
@@ -479,6 +537,27 @@ def _normalize_username(name: str) -> str:
 # und werden nie beendet.
 _FOREIGN_EXCEL_PIDS: set = set()
 
+# Der Schnappschuss allein genuegt nicht: er wird genau einmal vor dem Start
+# gefuellt (snapshot_foreign_excel_pids). Jede Excel-Sitzung, die der Anwender
+# WAEHREND des Laufs oeffnet, steht nicht darin und galt damit als 'verwaist'
+# - _kill_orphaned_excel() beendete sie mit proc.kill(), also ohne
+# Speichern-Rueckfrage. Und die Funktion laeuft nicht einmal, sondern bei
+# jedem periodischen Neustart (alle EXCEL_RESTART_EVERY Dateien), bei jedem
+# Pre-Clean-Neustart, im Signal-Handler und im finally; bei einem Lauf ueber
+# eine grosse Ablage ist das faktisch ein Dauerzustand. Die Startwarnung sagt
+# dem Anwender ausdruecklich das Gegenteil zu ('Ihre Sitzung wird vom Skript
+# NICHT beendet').
+#
+# Deshalb wird die Frage umgedreht: Statt zu erraten, was fremd ist, wird
+# mitgeschrieben, welche Excel-Prozesse dieses Skript SELBST gestartet hat.
+# Nur die duerfen beendet werden - alles andere gehoert dem Anwender.
+_OWN_EXCEL_PIDS: set = set()
+
+
+def remember_own_excel_pid(pid) -> None:
+    if pid:
+        _OWN_EXCEL_PIDS.add(pid)
+
 
 def snapshot_foreign_excel_pids() -> None:
     """Merkt sich alle Excel-Prozesse, die vor dem Skriptstart liefen."""
@@ -492,9 +571,9 @@ def snapshot_foreign_excel_pids() -> None:
                     found.add(p.info["pid"])
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
-    except Exception:
+    except Exception as _e:
         # Im Zweifel lieber zu viel schuetzen als eine fremde Sitzung killen.
-        pass
+        detail_logger.debug(f"snapshot_foreign_excel_pids: Exception verworfen: {_e!r}")
     _FOREIGN_EXCEL_PIDS = found
     if found:
         detail_logger.info(
@@ -527,6 +606,14 @@ def _kill_orphaned_excel() -> None:
                 continue
             if is_foreign_excel_pid(proc.info["pid"]):
                 continue
+            # Nur eigene Instanzen beenden. Ein Excel, das dieses Skript nicht
+            # selbst gestartet hat, gehoert dem Anwender - auch wenn es erst
+            # nach dem Startschnappschuss aufgemacht wurde.
+            if proc.info["pid"] not in _OWN_EXCEL_PIDS:
+                detail_logger.debug(
+                    f"Excel-Prozess PID {proc.info['pid']} nicht vom Skript gestartet "
+                    f"- bleibt unangetastet.")
+                continue
             try:
                 proc.kill()
                 proc.wait(timeout=3)
@@ -547,21 +634,59 @@ def _lock_file_path(target_dir: str) -> str:
     digest = hashlib.sha1(target_dir.encode("utf-8")).hexdigest()[:16]
     return os.path.join(_docs_base, f"excel_updater_{digest}.lock")
 
+def _own_process_create_time() -> str:
+    """Startzeit des eigenen Prozesses als stabile Kennung."""
+    try:
+        return f"{psutil.Process(os.getpid()).create_time():.6f}"
+    except Exception as _e:
+        detail_logger.debug(f"_own_process_create_time: Exception verworfen: {_e!r}")
+        return ""
+
+
 def _acquire_lock(target_dir: str) -> Optional[str]:
+    """Verhindert parallele Laeufe auf demselben Zielverzeichnis.
+
+    Die Lebendpruefung des Lock-Halters erfolgt ueber PID + Startzeit, NICHT
+    ueber den Prozessnamen. Frueher galt ein Prozess nur dann als lebend, wenn
+    sein Name 'EXCEL' oder 'PYTHON' enthielt. Im dokumentierten
+    Auslieferungsweg (PyInstaller, --name
+    '3b_xls_xlsx_auf_neueste_Version_aktualisieren') heisst der Prozess aber
+    '3B_XLS_XLSX_AUF_NEUESTE_VERSION_AKTUALISIEREN.EXE' und enthaelt weder das
+    eine noch das andere - der Lock des laufenden Nachbarn wurde also als
+    'Stale-Lock entfernt' protokolliert und der zweite Lauf startete. Die
+    Startzeit schliesst zusaetzlich den Fall aus, dass das Betriebssystem die
+    PID inzwischen neu vergeben hat.
+    """
     lock_path = _lock_file_path(target_dir)
     if os.path.exists(lock_path):
-        # Stale-Lock-Check: PID aus Lock lesen, prüfen ob Prozess noch lebt.
         try:
             with open(lock_path, "r", encoding="utf-8") as f:
-                stale_pid = int(f.readline().strip())
+                zeilen = [z.strip() for z in f.readlines()]
+            stale_pid = int(zeilen[0]) if zeilen and zeilen[0] else -1
+            # Zeile 4 traegt die Startzeit; aeltere Lock-Dateien haben sie
+            # nicht - dann zaehlt allein die PID-Existenz (konservativ).
+            stale_ctime = zeilen[3] if len(zeilen) > 3 else ""
+
+            if stale_pid == os.getpid():
+                # Eigener Lock aus diesem Prozess - kein Fremdlauf.
+                return lock_path
+
             if psutil.pid_exists(stale_pid):
-                try:
-                    p = psutil.Process(stale_pid)
-                    if "EXCEL" in p.name().upper() or "PYTHON" in p.name().upper():
-                        return None  # echter laufender Prozess
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            # PID tot oder nicht mehr passend – Stale-Lock entfernen.
+                lebt = True
+                if stale_ctime:
+                    try:
+                        aktuell = f"{psutil.Process(stale_pid).create_time():.6f}"
+                        lebt = (aktuell == stale_ctime)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        # Kein Zugriff heisst nicht 'tot'. Im Zweifel den Lock
+                        # respektieren - ein verweigerter Start kostet nichts,
+                        # ein Parallellauf kann Dateien beschaedigen.
+                        lebt = True
+                if lebt:
+                    detail_logger.warning(
+                        f"Lock wird von PID {stale_pid} gehalten – Lauf wird nicht gestartet.")
+                    return None
+            # PID tot oder inzwischen neu vergeben – Stale-Lock entfernen.
             os.remove(lock_path)
             detail_logger.warning(f"Stale-Lock entfernt (PID {stale_pid}): {lock_path}")
         except Exception as e:
@@ -569,18 +694,32 @@ def _acquire_lock(target_dir: str) -> Optional[str]:
             return None
     try:
         with open(lock_path, "w", encoding="utf-8") as f:
-            f.write(f"{os.getpid()}\n{datetime.now().isoformat()}\n{target_dir}\n")
+            f.write(f"{os.getpid()}\n{datetime.now().isoformat()}\n{target_dir}\n"
+                    f"{_own_process_create_time()}\n")
         return lock_path
     except Exception as e:
         detail_logger.warning(f"Lock-Datei nicht schreibbar: {e}")
         return None
 
 def _release_lock(lock_path: Optional[str]) -> None:
+    # Nur den EIGENEN Lock entfernen. Frueher wurde die Datei bedingungslos
+    # geloescht - der zuerst fertige Lauf raeumte damit den Lock eines noch
+    # laufenden Nachbarn ab.
     if lock_path and os.path.exists(lock_path):
         try:
+            with open(lock_path, "r", encoding="utf-8") as f:
+                besitzer = int(f.readline().strip())
+            if besitzer != os.getpid():
+                detail_logger.warning(
+                    f"Lock gehoert PID {besitzer}, nicht diesem Prozess "
+                    f"({os.getpid()}) – bleibt bestehen.")
+                return
+        except Exception as _e:
+            detail_logger.debug(f"_release_lock: Besitzpruefung verworfen: {_e!r}")
+        try:
             os.remove(lock_path)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_release_lock: Exception verworfen: {_e!r}")
 
 active_lock_path: Optional[str] = None
 
@@ -628,22 +767,22 @@ def _signal_handler(sig, frame) -> None:
     if excel_app_global is not None:
         try:
             _restore_excel_settings(excel_app_global)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
         try:
             excel_app_global.Quit()
             time.sleep(1)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
     _kill_orphaned_excel()
     try:
         _cleanup_excel_inetcache()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
     try:
         _cleanup_user_recent()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
     _safe_cleanup_temp()
     _release_lock(active_lock_path)
     sys.exit(130)
@@ -729,9 +868,10 @@ def _check_excel_running_warning(auto_mode: bool = False, no_kill: bool = False)
     print("=" * 66)
     print(f"  Gefundene Excel-Prozesse (PID): {pids_str}")
     print()
-    print("  Ihre Sitzung wird vom Skript NICHT beendet. Waehrend des Laufs")
-    print("  kann sie aber ausgeblendet werden und Warnhinweise sind")
-    print("  abgeschaltet - das wirkt wie ein Absturz.")
+    print("  Ihre Sitzung wird vom Skript NICHT beendet - auch eine, die Sie")
+    print("  erst waehrend des Laufs oeffnen, bleibt unangetastet. Waehrend")
+    print("  des Laufs kann sie aber ausgeblendet werden und Warnhinweise")
+    print("  sind abgeschaltet - das wirkt wie ein Absturz.")
     print("  Ausserdem laesst sich die eigene Automatisierungs-Instanz dann")
     print("  nicht mehr zuverlaessig von Ihrer Sitzung unterscheiden.")
     print()
@@ -813,8 +953,8 @@ def wait_for_file_unlocked(
             )
             try:
                 h.Close()
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"wait_for_file_unlocked: Exception verworfen: {_e!r}")
             return True
         except pywintypes.error as e:
             last_err = e
@@ -874,8 +1014,8 @@ def _enable_restore_privileges() -> None:
             try:
                 luid = win32security.LookupPrivilegeValue(None, name)
                 privs.append((luid, win32security.SE_PRIVILEGE_ENABLED))
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_enable_restore_privileges: Exception verworfen: {_e!r}")
         if not privs:
             return
         win32security.AdjustTokenPrivileges(htoken, 0, privs)
@@ -908,6 +1048,27 @@ def _get_security_descriptor(path: str):
 
 
 def _apply_security_descriptor(path: str, sd) -> None:
+    """Eigentuemer, Gruppe und DACL einer ersetzten Datei wiederherstellen.
+
+    Alles wird in EINEM SetNamedSecurityInfo-Aufruf gesetzt. Frueher liefen
+    zwei getrennte Aufrufe (erst DACL, dann Owner) - und das Setzen des
+    Eigentuemers ordnet die Vererbung neu. Nachgestellt: eine Datei verlor
+    dabei die Kennzeichnung ihrer geerbten ACEs, und eine geerbte
+    EIGENTUEMERRECHTE-ACE (S-1-3-4) bekam zusaetzlich INHERIT_ONLY - damit galt
+    sie fuer die Datei selbst nicht mehr. Wer seinen Zugriff allein daraus
+    bezog, konnte die eigene Datei anschliessend nicht mehr oeffnen
+    (PermissionError). Das ist das Gegenteil dessen, was diese Funktion
+    bezweckt. Ein gemeinsamer Aufruf laesst Windows die Rechte in einem Zug
+    berechnen; der schaedliche Zwischenzustand entsteht gar nicht erst.
+
+    Der Eigentuemer wird ausserdem nur gesetzt, wenn er tatsaechlich abweicht -
+    ein privilegierter Schreibvorgang ohne Wirkung entfaellt damit.
+
+    Schlaegt der gemeinsame Aufruf fehl (typisch: kein SeRestorePrivilege im
+    Nutzer-Kontext, dann verweigert bereits das Owner-Feld), wird die DACL
+    einzeln nachgezogen. Damit bleibt das bisherige Verhalten erhalten, dass
+    wenigstens die Rechte ankommen.
+    """
     if sd is None:
         return
     try:
@@ -920,48 +1081,72 @@ def _apply_security_descriptor(path: str, sd) -> None:
         dacl = sd.GetSecurityDescriptorDacl()
     except Exception:
         dacl = None
-    if dacl is not None:
-        try:
-            dacl_flags = win32security.DACL_SECURITY_INFORMATION
-            try:
-                ctrl, _rev = sd.GetSecurityDescriptorControl()
-                if ctrl & win32security.SE_DACL_PROTECTED:
-                    dacl_flags |= win32security.PROTECTED_DACL_SECURITY_INFORMATION
-                else:
-                    dacl_flags |= win32security.UNPROTECTED_DACL_SECURITY_INFORMATION
-            except Exception:
-                pass
-            win32security.SetNamedSecurityInfo(
-                p, win32security.SE_FILE_OBJECT, dacl_flags,
-                None, None, dacl, None)
-            detail_logger.debug(f"DACL wiederhergestellt: {path}")
-        except Exception as e:
-            detail_logger.warning(
-                f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e}")
-
     try:
         owner = sd.GetSecurityDescriptorOwner()
+    except Exception:
+        owner = None
+    try:
+        group = sd.GetSecurityDescriptorGroup()
+    except Exception:
         group = None
+
+    info = 0
+    if dacl is not None:
+        info |= win32security.DACL_SECURITY_INFORMATION
         try:
-            group = sd.GetSecurityDescriptorGroup()
-        except Exception:
-            pass
-        if owner is not None:
-            sec_flags = win32security.OWNER_SECURITY_INFORMATION
-            if group is not None:
-                sec_flags |= win32security.GROUP_SECURITY_INFORMATION
-            win32security.SetNamedSecurityInfo(
-                p, win32security.SE_FILE_OBJECT, sec_flags,
-                owner, group, None, None)
-            detail_logger.debug(f"Owner wiederhergestellt: {path}")
+            ctrl, _rev = sd.GetSecurityDescriptorControl()
+            if ctrl & win32security.SE_DACL_PROTECTED:
+                info |= win32security.PROTECTED_DACL_SECURITY_INFORMATION
+            else:
+                info |= win32security.UNPROTECTED_DACL_SECURITY_INFORMATION
+        except Exception as _e:
+            detail_logger.debug(f"_apply_security_descriptor: Exception verworfen: {_e!r}")
+
+    # Eigentuemer nur setzen, wenn er wirklich abweicht.
+    if owner is not None:
+        try:
+            akt = win32security.GetNamedSecurityInfo(
+                p, win32security.SE_FILE_OBJECT,
+                win32security.OWNER_SECURITY_INFORMATION
+            ).GetSecurityDescriptorOwner()
+            if (win32security.ConvertSidToStringSid(akt)
+                    == win32security.ConvertSidToStringSid(owner)):
+                owner = None
+        except Exception as _e:
+            detail_logger.debug(f"_apply_security_descriptor: Owner-Vergleich verworfen: {_e!r}")
+
+    if owner is not None:
+        info |= win32security.OWNER_SECURITY_INFORMATION
+    if group is not None:
+        info |= win32security.GROUP_SECURITY_INFORMATION
+    if not info:
+        return
+
+    nur_dacl = info & ~(win32security.OWNER_SECURITY_INFORMATION
+                        | win32security.GROUP_SECURITY_INFORMATION)
+
+    try:
+        win32security.SetNamedSecurityInfo(
+            p, win32security.SE_FILE_OBJECT, info, owner, group, dacl, None)
+        detail_logger.debug(f"Sicherheitsinfo wiederhergestellt: {path}")
+        return
     except Exception as e:
+        if owner is None and group is None:
+            detail_logger.warning(f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e}")
+            return
         if _restore_privileges_enabled:
-            detail_logger.warning(
-                f"Owner-Wiederherstellung fehlgeschlagen ({path}): {e}")
+            detail_logger.warning(f"Owner-Wiederherstellung fehlgeschlagen ({path}): {e}")
         else:
-            detail_logger.debug(
-                f"Owner nicht gesetzt (kein Admin-Privileg – im "
-                f"Nutzer-Kontext unkritisch): {path} – {e}")
+            detail_logger.debug(f"Owner nicht gesetzt (kein Admin-Privileg - im Nutzer-Kontext unkritisch): {path} - {e}")
+
+    # Rueckfall: wenigstens die DACL setzen.
+    if dacl is not None and nur_dacl:
+        try:
+            win32security.SetNamedSecurityInfo(
+                p, win32security.SE_FILE_OBJECT, nur_dacl, None, None, dacl, None)
+            detail_logger.debug(f"DACL wiederhergestellt (ohne Owner): {path}")
+        except Exception as e2:
+            detail_logger.warning(f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e2}")
 
 
 # ==================================================================
@@ -973,14 +1158,32 @@ def safe_remove(path: str) -> bool:
         if os.path.exists(p):
             try:
                 win32api.SetFileAttributes(p, win32con.FILE_ATTRIBUTE_NORMAL)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"safe_remove: Exception verworfen: {_e!r}")
             os.remove(p)
             detail_logger.debug(f"Gelöscht: {path}")
             return True
         return False
     except Exception as e:
         detail_logger.warning(f"Löschen fehlgeschlagen: {path} – {e}")
+        return False
+
+
+def _utime_rueckfall(pfad: str, zeiten) -> bool:
+    """Rueckfall, wenn win32file.SetFileTime scheitert.
+
+    Erhaelt Zugriffs- und Aenderungszeit - nicht die Erstellungszeit,
+    aber das ist deutlich besser als der vollstaendige Verlust des
+    Datums. Diesen Rueckfall hatte bisher nur 5_OCR_PDF.py; ohne ihn
+    verloren die uebrigen Skripte die Zeitstempel stillschweigend,
+    sobald pywin32 fehlte oder der Handle nicht zu oeffnen war.
+    """
+    try:
+        zugriff, geaendert = zeiten[1], zeiten[2]
+        os.utime(prepare_long_path(pfad),
+                 (zugriff.timestamp(), geaendert.timestamp()))
+        return True
+    except Exception:
         return False
 
 def safe_exists(path: str) -> bool:
@@ -1047,8 +1250,8 @@ def release_unique_path(path: Optional[str]) -> None:
         p = _lp_for_reserve(path)
         if os.path.isfile(p) and os.path.getsize(p) == 0:
             os.remove(p)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"release_unique_path: Exception verworfen: {_e!r}")
 
 
 def safe_getsize(path: str) -> int:
@@ -1156,13 +1359,21 @@ def robust_move(src: str, dst: str, max_retries: int = MAX_RETRIES) -> bool:
                 )
             detail_logger.debug(f"Verschoben (staging+replace): {src} → {dst}")
             return True
-        except Exception as e:
-            detail_logger.warning(f"Verschieben Versuch {attempt+1}/{max_retries}: {e}")
+        # BaseException, nicht Exception: Der Signal-Handler beendet sich mit
+        # sys.exit() (SystemExit erbt von BaseException). Bei Strg+C mitten im
+        # Kopieren blieb die Staging-Datei '<Ziel>.tmp_new' sonst auf der
+        # Freigabe liegen, und kein Aufraeumpfad erfasst sie je wieder.
+        except BaseException as e:
+            if isinstance(e, Exception):
+                detail_logger.warning(f"Verschieben Versuch {attempt+1}/{max_retries}: {e}")
             try:
                 if os.path.exists(stage_long):
                     safe_remove(stage)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"robust_move: Exception verworfen: {_e!r}")
+            # Abbruch nach dem Aufraeumen unveraendert weiterreichen.
+            if not isinstance(e, Exception):
+                raise
         if attempt < max_retries - 1:
             time.sleep(RETRY_DELAY)
     return False
@@ -1237,8 +1448,8 @@ def sanitize_path(raw: str) -> str:
         path = path + "\\"
     try:
         path = os.path.normpath(path)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"sanitize_path: Exception verworfen: {_e!r}")
     return path
 
 def ask_directory() -> str:
@@ -1373,6 +1584,79 @@ def log_error(file_path: str, exc: Exception) -> None:
     detail_logger.error(f"Datei: {file_path}\n  -> {exc}\n{tb}")
 
 # ==================================================================
+# Allgemeiner Excel-Watchdog
+# ==================================================================
+def _excel_call_with_watchdog(call_label: str, timeout: float, excel_pid,
+                              call_fn, restore_fn=None):
+    """Fuehrt einen blockierenden COM-Aufruf mit Zeitwaechter aus.
+
+    Bisher war in diesem Skript ausschliesslich das Oeffnen abgesichert.
+    Das Speichern lief ungeschuetzt - und genau dort haengt Excel im
+    Alltag: grosse Arbeitsmappe auf einem Netzlaufwerk, modaler Dialog
+    hinter unsichtbarem Fenster, DFS-Timeout, Virenscanner. Ohne Waechter
+    blockierte der Lauf dort unbegrenzt, und zwar an der Stelle, an der
+    bereits eine Temp-Kopie existiert und das Original ersetzt werden
+    soll. 3a und 3c sichern alle COM-Aufrufe so ab; diese Fassung ist die
+    Excel-Entsprechung von _word_call_with_watchdog aus 3a.
+    """
+    done_event   = threading.Event()
+    timeout_flag = [False]
+
+    # Erstellungszeit SYNCHRON im Main-Thread erfassen, BEVOR der Watchdog-
+    # Thread startet - sonst koennte Windows die PID zwischenzeitlich an
+    # eine neue Excel-Sitzung des Benutzers vergeben und der Waechter
+    # wuerde nach Timeout den falschen Prozess killen.
+    expected_ct = None
+    if excel_pid:
+        try:
+            expected_ct = psutil.Process(excel_pid).create_time()
+        except Exception:
+            expected_ct = None
+
+    def watchdog():
+        if not done_event.wait(timeout):
+            timeout_flag[0] = True
+            if excel_pid:
+                try:
+                    proc = psutil.Process(excel_pid)
+                    try:
+                        proc_name = proc.name().upper()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        proc_name = ""
+                    if proc_name != "EXCEL.EXE":
+                        return
+                    if expected_ct is not None:
+                        try:
+                            if abs(proc.create_time() - expected_ct) > 0.001:
+                                return
+                        except Exception:
+                            return
+                    proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"watchdog: Exception verworfen: {_e!r}")
+
+    wd_thread = threading.Thread(target=watchdog, daemon=True)
+    wd_thread.start()
+
+    try:
+        return call_fn()
+    except Exception as e:
+        done_event.set()
+        if timeout_flag[0]:
+            raise TimeoutError(f"Excel Timeout bei {call_label}")
+        raise e
+    finally:
+        done_event.set()
+        if restore_fn is not None:
+            try:
+                restore_fn()
+            except Exception as _e:
+                detail_logger.debug(f"_excel_call_with_watchdog: Exception verworfen: {_e!r}")
+
+
+# ==================================================================
 # Excel-Open mit Watchdog
 # ==================================================================
 def safe_excel_open(excel_app, file_path, pw, corrupt_load=XL_CORRUPT_NORMAL,
@@ -1418,8 +1702,8 @@ def safe_excel_open(excel_app, file_path, pw, corrupt_load=XL_CORRUPT_NORMAL,
                             proc.kill()
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"watchdog: Exception verworfen: {_e!r}")
 
     wd_thread = threading.Thread(target=watchdog, daemon=True)
     wd_thread.start()
@@ -1427,12 +1711,12 @@ def safe_excel_open(excel_app, file_path, pw, corrupt_load=XL_CORRUPT_NORMAL,
     _prev_alerts = None
     try:
         _prev_alerts = excel_app.DisplayAlerts
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"safe_excel_open: Exception verworfen: {_e!r}")
     try:
         excel_app.DisplayAlerts = COM_FALSE
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"safe_excel_open: Exception verworfen: {_e!r}")
 
     wb = None
     try:
@@ -1465,8 +1749,8 @@ def safe_excel_open(excel_app, file_path, pw, corrupt_load=XL_CORRUPT_NORMAL,
         try:
             if _prev_alerts is not None:
                 excel_app.DisplayAlerts = _prev_alerts
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"safe_excel_open: Exception verworfen: {_e!r}")
 
     return wb
 
@@ -1518,8 +1802,8 @@ def _build_minimal_xlsx(target_path: str) -> None:
     if os.path.exists(target_path):
         try:
             os.remove(target_path)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_build_minimal_xlsx: Exception verworfen: {_e!r}")
 
     with zipfile.ZipFile(target_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml",          content_types)
@@ -1564,13 +1848,13 @@ def test_trust_center_smoke(excel_app, timeout: float = 25.0) -> Tuple[bool, str
         if wb is not None:
             try:
                 wb.Close(SaveChanges=COM_FALSE)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try:
             if os.path.exists(test_path):
                 os.remove(test_path)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
 
 # ==================================================================
 # OOXML-Versionsprüfung
@@ -1715,7 +1999,14 @@ def scan_definedName_conflicts(file_path: str) -> int:
     if not m:
         return 0
     inner = m.group(1)
-    entries = re.findall(r"<definedName\b[^>]*?>.*?</definedName>", inner, re.DOTALL)
+    entries = re.findall(
+            # Selbstschliessende Form ZUERST: <definedName .../> ohne
+            # Inhalt kommt in Excel-Dateien regelmaessig vor. Ohne
+            # diese Alternative verschmolz das Muster einen solchen
+            # Eintrag mit dem NAECHSTEN bis zu dessen </definedName> -
+            # der Pre-Clean traf damit den falschen Bereich.
+            r"<definedName[^>]*/>|<definedName[^>]*?>.*?</definedName>",
+            inner, re.DOTALL)
     count = 0
     for entry in entries:
         name_m = re.search(r'\bname\s*=\s*"([^"]*)"', entry)
@@ -1749,7 +2040,14 @@ def pre_clean_definedNames(file_path: str) -> Tuple[bool, int]:
         original_block = m.group(0)
         inner          = m.group(1)
 
-        entries = re.findall(r"<definedName\b[^>]*?>.*?</definedName>", inner, re.DOTALL)
+        entries = re.findall(
+            # Selbstschliessende Form ZUERST: <definedName .../> ohne
+            # Inhalt kommt in Excel-Dateien regelmaessig vor. Ohne
+            # diese Alternative verschmolz das Muster einen solchen
+            # Eintrag mit dem NAECHSTEN bis zu dessen </definedName> -
+            # der Pre-Clean traf damit den falschen Bereich.
+            r"<definedName[^>]*/>|<definedName[^>]*?>.*?</definedName>",
+            inner, re.DOTALL)
         if not entries:
             return (False, 0)
 
@@ -1817,8 +2115,8 @@ def pre_clean_definedNames(file_path: str) -> Tuple[bool, int]:
         try:
             if os.path.exists(tmp_clean):
                 os.remove(tmp_clean)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"pre_clean_definedNames: Exception verworfen: {_e!r}")
         return (False, 0)
 
 # ==================================================================
@@ -1947,16 +2245,16 @@ def append_resume(resume_path: str, file_path: str) -> None:
     try:
         with open(resume_path, "a", encoding="utf-8") as fh:
             fh.write(file_path + "\n")
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"append_resume: Exception verworfen: {_e!r}")
 
 
 def delete_resume_file(resume_path: str) -> None:
     try:
         if resume_path and os.path.exists(resume_path):
             os.remove(resume_path)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"delete_resume_file: Exception verworfen: {_e!r}")
 
 
 # Nur DAUERHAFT erledigte Status ins Resume schreiben. SKIPPED ist in 3b
@@ -1991,8 +2289,8 @@ def _temp_file_is_active(path: str) -> bool:
             win32file.OPEN_EXISTING, 0, None)
         try:
             h.Close()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_temp_file_is_active: Exception verworfen: {_e!r}")
         return False
     except pywintypes.error as e:
         if e.winerror in (WIN_ERROR_SHARING_VIOLATION, WIN_ERROR_LOCK_VIOLATION):
@@ -2030,7 +2328,20 @@ def _path_matches_exclude(root_lower: str, exclude_patterns: list) -> bool:
 
 
 def file_generator(directory: str, clean_temp: bool = True,
-                   exclude_patterns: list = None):
+                   exclude_patterns: list = None,
+                   clean_appledouble: bool = False):
+    """Excel-Dateien liefern und dabei optional verwaiste Office-Reste raeumen.
+
+    clean_temp=False raeumt NICHTS - zwingend fuer den Probelauf, der
+    zusichert, das Dateisystem unangetastet zu lassen.
+
+    clean_appledouble steuert die '._*'-Dateien getrennt und ist bewusst
+    standardmaessig aus: Auf NAS-/SMB-Freigaben mit Mac-Clients sind das
+    AppleDouble-Container (Finder-Metadaten, Resource-Forks) und keine
+    Excel-Reste. Sie wurden frueher ohne Endungsfilter im gesamten Baum
+    geloescht, also auch '._Foto.jpg' und '._Bericht.docx' - Dateien, mit
+    denen dieses Skript nichts zu tun hat.
+    """
     extensions = {
         ".xls", ".xlsx", ".xlsm", ".xlsb",
         ".xla", ".xlam",
@@ -2069,7 +2380,11 @@ def file_generator(directory: str, clean_temp: bool = True,
             pruned.append(d)
         dirs[:] = pruned
 
-        temp_files   = [f for f in files if f.startswith("~$") or f.startswith("._")]
+        # '._'-Dateien werden weiterhin von den Zieldateien getrennt (sie sind
+        # keine verarbeitbaren Mappen), aber nur dann zum Loeschen vorgemerkt,
+        # wenn das ausdruecklich verlangt ist.
+        temp_files   = [f for f in files
+                        if f.startswith("~$") or (clean_appledouble and f.startswith("._"))]
         target_files = [f for f in files if not (f.startswith("~$") or f.startswith("._"))]
 
         if clean_temp:
@@ -2081,8 +2396,8 @@ def file_generator(directory: str, clean_temp: bool = True,
                     if _temp_file_is_active(full_t):
                         continue
                     safe_remove(full_t)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"file_generator: Exception verworfen: {_e!r}")
 
         for f in target_files:
             nl = f.lower()
@@ -2153,13 +2468,13 @@ def remove_protection(
                         try:
                             wb.BreakLink(link, link_type)
                             changed = True
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"remove_protection: Exception verworfen: {_e!r}")
                     detail_logger.warning(
                         f"Externe Verknüpfungen entfernt (Type {link_type}): {file_path_display}"
                     )
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"remove_protection: Exception verworfen: {_e!r}")
 
     return changed
 
@@ -2249,14 +2564,14 @@ def resolve_name_conflicts(
                         f"Korrupter Bezug zur Löschung vorgemerkt: "
                         f"{getattr(nm, 'Name', '<unlesbar>')}"
                     )
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_try_delete_name: Exception verworfen: {_e!r}")
 
         if should_delete:
             try:
                 nm.Visible = COM_TRUE
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_try_delete_name: Exception verworfen: {_e!r}")
 
             try:
                 nm.Delete()
@@ -2290,8 +2605,8 @@ def resolve_name_conflicts(
                         detail_logger.debug(
                             f"[Pass {_pass+1}] Systemname Mappenebene gelöscht (Index {i})"
                         )
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"resolve_name_conflicts: Exception verworfen: {_e!r}")
         except Exception as e:
             detail_logger.warning(f"Fehler bei Mappen-Namen (Pass {_pass+1}): {e}")
 
@@ -2308,8 +2623,8 @@ def resolve_name_conflicts(
                                     f"[Pass {_pass+1}] Systemname Blattebene "
                                     f"'{getattr(ws, 'Name', '?')}' gelöscht (Index {i})"
                                 )
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"resolve_name_conflicts: Exception verworfen: {_e!r}")
                 except Exception as e:
                     detail_logger.debug(
                         f"Fehler bei Blatt-Namen "
@@ -2341,7 +2656,19 @@ def _save_as_workbook(
     new_format: int,
     new_ext: str,
     is_template: bool,
+    open_password: str = "",
 ) -> Tuple[str, int, str]:
+    """Mappe unter neuem Format speichern.
+
+    open_password ist das Kennwort, mit dem die Mappe geoeffnet werden konnte.
+    Es MUSS beim SaveAs wieder mitgegeben werden: 'Password=""' ist in
+    Excel-COM kein 'unveraendert lassen', sondern 'ohne Kennwort speichern'.
+    Nachgestellt mit echtem Excel - eine mit Kennwort erzeugte .xlsx kam nach
+    SaveAs(Password="") unverschluesselt heraus und liess sich ohne Kennwort
+    oeffnen; mit SaveAs(Password=<Kennwort>) blieb die Verschluesselung
+    erhalten. Da die entstandene Datei das Original ersetzt und das Backup bei
+    Erfolg geloescht wird, waere der Vertraulichkeitsverlust endgueltig.
+    """
     def _resolve_save_method(workbook):
         method = getattr(workbook, "SaveAs", None)
         if callable(method):
@@ -2369,16 +2696,28 @@ def _save_as_workbook(
             "(z.B. VBA-Funktion mit Namen 'SaveAs' im Workbook)."
         )
 
-    try:
-        save_method(
-            temp_save_path,
-            FileFormat           = new_format,
-            Password             = "",
-            WriteResPassword     = "",
-            ReadOnlyRecommended  = COM_FALSE,
-            AddToMru             = COM_FALSE,
-            ConflictResolution   = XL_LOCAL_SESSION_CHANGES,
+    # Der SaveAs laeuft jetzt unter Zeitwaechter (siehe
+    # _excel_call_with_watchdog). Vorher war in diesem Skript nur das
+    # Oeffnen abgesichert; ein Haenger beim Speichern blockierte den
+    # gesamten Lauf unbegrenzt.
+    def _do_save(path, fmt):
+        return _excel_call_with_watchdog(
+            f"SaveAs {os.path.basename(path)}",
+            SAVE_TIMEOUT,
+            excel_app_pid,
+            lambda: save_method(
+                path,
+                FileFormat           = fmt,
+                Password             = open_password,
+                WriteResPassword     = "",
+                ReadOnlyRecommended  = COM_FALSE,
+                AddToMru             = COM_FALSE,
+                ConflictResolution   = XL_LOCAL_SESSION_CHANGES,
+            ),
         )
+
+    try:
+        _do_save(temp_save_path, new_format)
         detail_logger.debug(f"SaveAs → {temp_save_path}")
         return temp_save_path, new_format, new_ext
 
@@ -2389,8 +2728,8 @@ def _save_as_workbook(
         if os.path.exists(temp_save_path):
             try:
                 safe_remove(temp_save_path)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_save_as_workbook: Exception verworfen: {_e!r}")
 
         new_ext        = ".xlsm" if not is_template else ".xltm"
         new_format     = XL_XLSM if not is_template else XL_XLTM
@@ -2403,15 +2742,7 @@ def _save_as_workbook(
             raise RuntimeError(
                 "wb.SaveAs (Makro-Fallback) ist nicht aufrufbar."
             )
-        save_method(
-            temp_save_path,
-            FileFormat           = new_format,
-            Password             = "",
-            WriteResPassword     = "",
-            ReadOnlyRecommended  = COM_FALSE,
-            AddToMru             = COM_FALSE,
-            ConflictResolution   = XL_LOCAL_SESSION_CHANGES,
-        )
+        _do_save(temp_save_path, new_format)
         detail_logger.debug(f"SaveAs (Makro-Fallback) → {temp_save_path}")
         return temp_save_path, new_format, new_ext
 
@@ -2544,18 +2875,18 @@ def convert_excel_file(
         try:
             _prev_display_alerts = excel_app.DisplayAlerts
             excel_app.DisplayAlerts = COM_FALSE
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
         try:
             excel_app.Interactive = COM_FALSE
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
 
         try:
             win32api.SetFileAttributes(prepare_long_path(file_path), win32con.FILE_ATTRIBUTE_NORMAL)
             detail_logger.debug(f"FILE_ATTRIBUTE_READONLY entfernt: {file_path}")
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
 
         wait_for_file_unlocked(file_path, timeout=AV_WAIT_TIMEOUT)
 
@@ -2596,6 +2927,10 @@ def convert_excel_file(
         last_exception      = None
         pre_clean_attempted = False
 
+        # Kennwort merken, mit dem das Oeffnen gelungen ist. Es muss beim
+        # SaveAs wieder mitgegeben werden, sonst schreibt Excel die Mappe
+        # unverschluesselt zurueck (siehe _save_as_workbook).
+        open_password = ""
         for open_attempt in range(MAX_RETRIES):
             timeout_occurred = False
 
@@ -2604,6 +2939,7 @@ def convert_excel_file(
                     wb = safe_excel_open(excel_app, file_path, pw,
                                          corrupt_load=XL_CORRUPT_NORMAL, timeout=OPEN_TIMEOUT)
                     wb_opened = True
+                    open_password = pw
                     detail_logger.debug(f"Geöffnet (Normal, Passwort: {'[LEER]' if pw == '' else '***'})")
                     break
                 except TimeoutError:
@@ -2651,8 +2987,8 @@ def convert_excel_file(
                     )
                     try:
                         _restore_excel_settings(excel_app)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
                     _quit_excel_app(excel_app)
                     _kill_orphaned_excel()
                     _cleanup_excel_inetcache()
@@ -2661,8 +2997,8 @@ def convert_excel_file(
                     excel_app = _create_excel_app()
                     try:
                         excel_app.Interactive = COM_FALSE
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
                     _prev_display_alerts = None
                     pbar.write("  ↻  Excel-Instanz neu gestartet – versuche Re-Open ...")
                     continue
@@ -2678,6 +3014,7 @@ def convert_excel_file(
                         wb = safe_excel_open(excel_app, file_path, pw,
                                              corrupt_load=XL_CORRUPT_REPAIR, timeout=OPEN_TIMEOUT)
                         wb_opened = True
+                        open_password = pw
                         detail_logger.debug(f"Geöffnet (Repair-Modus, Passwort: {'[LEER]' if pw == '' else '***'})")
                         break
                     except TimeoutError:
@@ -2736,8 +3073,8 @@ def convert_excel_file(
                         )
                         try:
                             _restore_excel_settings(excel_app)
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
                         _quit_excel_app(excel_app)
                         _kill_orphaned_excel()
                         _cleanup_excel_inetcache()
@@ -2746,8 +3083,8 @@ def convert_excel_file(
                         excel_app = _create_excel_app()
                         try:
                             excel_app.Interactive = COM_FALSE
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
                         _prev_display_alerts = None
 
                         for pw in passwords_to_try:
@@ -2756,6 +3093,7 @@ def convert_excel_file(
                                                      corrupt_load=XL_CORRUPT_NORMAL,
                                                      timeout=OPEN_TIMEOUT)
                                 wb_opened = True
+                                open_password = pw
                                 pbar.write("  ✓  Re-Open nach Hail-Mary erfolgreich.")
                                 break
                             except TimeoutError:
@@ -2766,13 +3104,13 @@ def convert_excel_file(
 
         try:
             excel_app.Interactive = COM_TRUE
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
         try:
             if _prev_display_alerts is not None:
                 excel_app.DisplayAlerts = _prev_display_alerts
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
 
         if timeout_occurred:
             if pre_clean_attempted:
@@ -2802,15 +3140,15 @@ def convert_excel_file(
 
         try:
             wb.Activate()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
 
         original_format = None
         try:
             original_format = wb.FileFormat
             detail_logger.debug(f"FileFormat: {original_format}")
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
 
         try:
             _need_writable_reopen = bool(wb.MultiUserEditing) and bool(wb.ReadOnly)
@@ -2835,8 +3173,8 @@ def convert_excel_file(
                     )
                     try:
                         wb.Close(SaveChanges=COM_FALSE)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
                     return "SKIPPED"
             try:
                 _reopen_path = wb.FullName
@@ -2907,8 +3245,8 @@ def convert_excel_file(
                     )
                     try:
                         wb.Close(SaveChanges=COM_FALSE)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
                     return "SKIPPED"
             original_mutated = True
 
@@ -2946,8 +3284,8 @@ def convert_excel_file(
             detail_logger.info(f"[DRY-RUN] WOULD_UPDATE: {original_path} – {grund}")
             try:
                 wb.Close(SaveChanges=COM_FALSE)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
             wb = None
             return "WOULD_UPDATE"
 
@@ -2983,8 +3321,8 @@ def convert_excel_file(
                             f"'{sheet.Name}' in {original_path}"
                         )
                         break
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
 
         if is_addin:
             new_format = XL_XLAM
@@ -3003,7 +3341,8 @@ def convert_excel_file(
         temp_save_path = os.path.join(TEMP_PROCESS_PATH, temp_save_name)
 
         temp_save_path, new_format, new_ext = _save_as_workbook(
-            wb, temp_save_path, new_format, new_ext, is_template
+            wb, temp_save_path, new_format, new_ext, is_template,
+            open_password=open_password,
         )
 
         try:
@@ -3107,7 +3446,12 @@ def convert_excel_file(
                     break
                 except Exception as e_utime:
                     if av_retry == 4:
-                        detail_logger.warning(f"Zeitstempel nicht wiederherstellbar: {e_utime}")
+                        if not _utime_rueckfall(target_path, orig_times):
+                            detail_logger.warning(f"Zeitstempel nicht wiederherstellbar: {e_utime}")
+                        else:
+                            detail_logger.info(
+                                "Zeitstempel ueber os.utime-Rueckfall gesetzt "
+                                "(ohne Erstellungszeit).")
                     else:
                         time.sleep(0.5)
 
@@ -3127,8 +3471,8 @@ def convert_excel_file(
         if wb is not None:
             try:
                 wb.Close(SaveChanges=COM_FALSE)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
             del wb
             wb = None
 
@@ -3189,14 +3533,14 @@ def convert_excel_file(
             release_unique_path(target_path)
         try:
             excel_app.Interactive = COM_TRUE
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
 
         if wb is not None:
             try:
                 wb.Close(SaveChanges=COM_FALSE)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
             del wb
             wb = None
         if is_temp_copy and safe_exists(file_path):
@@ -3218,6 +3562,17 @@ def process_file_with_retries(
 ) -> str:
     result = "ERROR"
     for attempt in range(MAX_RETRIES):
+        # Aktuelle Instanz aus excel_app_global nachziehen. convert_excel_file
+        # startet Excel bei einem Absturz intern neu, kann die Zuweisung aber
+        # nur an seinen eigenen Parameter machen - die hier gehaltene Referenz
+        # zeigt danach auf die per _quit_excel_app beendete Instanz. Der
+        # naechste Versuch lief damit gegen ein totes COM-Objekt.
+        # _create_excel_app() setzt excel_app_global; das ist die verlaessliche
+        # Quelle fuer die gerade gueltige Instanz.
+        if excel_app_global is not None and excel_app_global is not excel_app:
+            excel_app = excel_app_global
+            detail_logger.debug(
+                "process_file_with_retries: Excel-Instanz nach Neustart nachgezogen.")
         try:
             result = convert_excel_file(
                 full_path, excel_app, pbar,
@@ -3262,6 +3617,13 @@ def _create_excel_app() -> win32com.client.CDispatch:
     after    = _snapshot_excel_pids()
     new_pids = after - before
 
+    # ALLE neu entstandenen PIDs als eigene vermerken, nicht nur die
+    # ausgewaehlte: aus den uebrigen entstehen genau die Waisen, die
+    # _kill_orphaned_excel() aufraeumen soll. Was hier nicht steht, hat das
+    # Skript nicht gestartet und wird nie beendet.
+    for _p in new_pids:
+        remember_own_excel_pid(_p)
+
     if len(new_pids) == 1:
         excel_app_pid = new_pids.pop()
     elif len(new_pids) > 1:
@@ -3274,8 +3636,9 @@ def _create_excel_app() -> win32com.client.CDispatch:
         try:
             _, hwnd_pid = win32process.GetWindowThreadProcessId(app.Hwnd)
             excel_app_pid = hwnd_pid or None
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_create_excel_app: Exception verworfen: {_e!r}")
+        remember_own_excel_pid(excel_app_pid)
         if not excel_app_pid:
             detail_logger.warning(
                 "Excel-PID konnte nicht ermittelt werden – Watchdog-Timeout fällt aus."
@@ -3291,8 +3654,8 @@ def _quit_excel_app(app) -> None:
     pid_to_wait = excel_app_pid
     try:
         app.Quit()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_quit_excel_app: Exception verworfen: {_e!r}")
 
     if pid_to_wait:
         proc = None
@@ -3317,10 +3680,10 @@ def _quit_excel_app(app) -> None:
                         proc.wait(timeout=3)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                except Exception as _e:
+                    detail_logger.debug(f"_quit_excel_app: Exception verworfen: {_e!r}")
+            except Exception as _e:
+                detail_logger.debug(f"_quit_excel_app: Exception verworfen: {_e!r}")
 
     if excel_app_global is app:
         excel_app_global = None
@@ -3427,8 +3790,8 @@ def _cleanup_excel_inetcache() -> None:
                 try:
                     try:
                         os.chmod(fpath, 0o666)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"_cleanup_excel_inetcache: Exception verworfen: {_e!r}")
                     os.remove(fpath)
                     files_deleted += 1
                     bytes_freed   += fsize
@@ -3496,8 +3859,8 @@ def _cleanup_user_recent() -> None:
             try:
                 try:
                     os.chmod(fpath, 0o666)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"_cleanup_user_recent: Exception verworfen: {_e!r}")
                 os.remove(fpath)
                 files_deleted += 1
                 bytes_freed   += fsize
@@ -3536,7 +3899,13 @@ def process_directory(
     os.makedirs(TEMP_PROCESS_PATH, exist_ok=True)
 
     resume_set = resume_set or set()
-    gen = file_generator(directory, clean_temp=True,
+    # clean_temp=not dry_run: Der Probelauf sichert an drei Stellen zu, das
+    # Dateisystem unangetastet zu lassen ('laesst das Dateisystem vollstaendig
+    # unangetastet', 'SPEICHERT aber NICHTS', 'es wurde NICHTS geaendert').
+    # Mit dem frueher fest verdrahteten clean_temp=True loeschte gerade der
+    # Modus, den man vor dem ersten Echt-Lauf auf einer fremden Ablage waehlt,
+    # bereits Dateien im gesamten Baum (nachgestellt: 4 von 6 Probedateien).
+    gen = file_generator(directory, clean_temp=not dry_run,
                          exclude_patterns=exclude_patterns)
     if resume_set:
         _src_gen = gen
@@ -3605,8 +3974,8 @@ def process_directory(
                     )
                 try:
                     _restore_excel_settings(current_excel)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
                 _quit_excel_app(current_excel)
                 _kill_orphaned_excel()
                 _cleanup_excel_inetcache()
@@ -3617,6 +3986,15 @@ def process_directory(
             result = process_file_with_retries(
                 full_path, current_excel, pbar,
                 passwords, force_update, break_links, dry_run=dry_run)
+            # Wurde Excel waehrend der Verarbeitung neu gestartet, zeigt
+            # current_excel sonst weiter auf die beendete Instanz - jede
+            # weitere Datei liefe dann gegen ein totes COM-Objekt, und der
+            # Lebendtest weiter oben wuerde bei JEDER Datei einen erneuten
+            # Neustart ausloesen.
+            if excel_app_global is not None and excel_app_global is not current_excel:
+                current_excel = excel_app_global
+                detail_logger.debug(
+                    "process_directory: Excel-Instanz nach Neustart nachgezogen.")
             stats[result] = stats.get(result, 0) + 1
             # Resume im Probelauf NICHT fortschreiben: sonst gaelten die
             # Dateien beim spaeteren Echt-Lauf als bereits erledigt.
@@ -3862,9 +4240,17 @@ if __name__ == "__main__":
     print(f"  Ziel-Schema-Level:     lastEdited ≥ {TARGET_LAST_EDITED} (Excel 2019/2021/2024/365)")
     print(f"  Modus:                 {'Vorab zählen (ETA)' if count_first else 'Generator (kein ETA)'}")
     print(f"  Fortschrittsbalken:    {'an' if show_progress else 'aus (inline)'}")
-    print("  Passwortdateien:       Überspringen (als SKIPPED loggen)")
-    pw_display = f"{len(passwords)} hinterlegt" if passwords else "keines (Überspringen)"
-    print(f"  Passwörter:            {pw_display}")
+    # Die Zeile behauptete unabhaengig von der Lage 'Überspringen' und stand
+    # damit im Widerspruch zur direkt folgenden Zeile 'N hinterlegt'. Mit
+    # hinterlegten Kennwoertern werden verschluesselte Mappen sehr wohl
+    # geoeffnet und verarbeitet - nur bleiben sie jetzt auch verschluesselt.
+    if passwords:
+        print(f"  Passwortdateien:       Öffnen mit hinterlegtem Kennwort")
+        print(f"                         (Verschlüsselung bleibt erhalten)")
+        print(f"  Passwörter:            {len(passwords)} hinterlegt")
+    else:
+        print("  Passwortdateien:       Überspringen (als SKIPPED loggen)")
+        print("  Passwörter:            keines hinterlegt")
     print(f"  Externe Links:         {'ENTFERNEN ⚠️' if break_links else 'Behalten'}")
     print(f"  Force Update:          {'Ja (alle xlsx/xlsm)' if force_upd else 'Nein'}")
     if args.exclude_dir:

@@ -123,6 +123,20 @@ try:
 except Exception:
     pass
 
+# ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Fehlt _gemeinsam.py - etwa weil nur dieses eine Skript weitergegeben
+# wurde -, laeuft alles unveraendert weiter; die daraus bedienten
+# Zusatzfunktionen schalten sich dann still ab.
+try:
+    _eigener_ordner = os.path.dirname(os.path.abspath(__file__))
+    if _eigener_ordner not in sys.path:
+        sys.path.insert(0, _eigener_ordner)
+    import _gemeinsam as gem
+except Exception:
+    gem = None
+
 try:
     import pythoncom
     import win32com.client
@@ -310,7 +324,13 @@ _LOG_DIR = BASE_DIR
 # Logging
 # ==================================================================
 def _setup_logging() -> tuple:
+    # LOG_FILE und DETAILED_LOG_FILE gehoeren MIT in die global-Zeile:
+    # im Fallback-Zweig unten werden die Handler auf einen anderen
+    # Ordner umgelenkt, die Abschlussmeldungen zeigten aber weiterhin
+    # die urspruenglichen, NICHT beschreibbaren Pfade an - der Anwender
+    # suchte die Protokolle dort vergeblich.
     global RUN_SUMMARY_FILE, CONVERSIONS_CSV, _LOG_DIR
+    global LOG_FILE, DETAILED_LOG_FILE
     fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
     try:
@@ -328,6 +348,8 @@ def _setup_logging() -> tuple:
         # Run-Summary, Konvertierungs-CSV und Resume-Dateien in denselben
         # beschreibbaren Fallback-Ordner umlenken.
         _LOG_DIR        = fallback
+        LOG_FILE          = fh_path
+        DETAILED_LOG_FILE = dh_path
         RUN_SUMMARY_FILE = os.path.join(fallback, os.path.basename(RUN_SUMMARY_FILE))
         CONVERSIONS_CSV  = os.path.join(fallback, os.path.basename(CONVERSIONS_CSV))
         print(f"[WARN] Log-Ziel nicht beschreibbar ({e}) → {fallback}")
@@ -349,7 +371,33 @@ def _setup_logging() -> tuple:
 file_logger, detail_logger = _setup_logging()
 
 
+
+# ==================================================================
+# Gemeinsames Laufprotokoll (migration.jsonl)
+# ==================================================================
+# Jedes Skript schreibt sein eigenes Format: CSV mit Semikolon, CSV mit
+# Komma, .log, XLSX, teils mit BOM, teils ohne. Der Gesamtfortschritt
+# ueber die elf Schritte liess sich damit nicht auswerten - etwa die
+# Frage, welche Dateien in Schritt 2 liegen blieben und in Schritt 7
+# wieder auftauchen. Diese Zeile ERGAENZT die bestehenden Protokolle.
+_laufprotokoll = None
+
+
+def _protokoll(pfad: str, aktion: str, status: str, detail: str = "") -> None:
+    global _laufprotokoll
+    if gem is None:
+        return
+    try:
+        if _laufprotokoll is None:
+            _laufprotokoll = gem.Laufprotokoll(
+                os.path.splitext(os.path.basename(__file__))[0])
+        _laufprotokoll.schreibe(pfad, aktion, status, detail)
+    except Exception:
+        pass
+
 def log_conversion(old_path: str, new_path: str) -> None:
+    _protokoll(new_path or old_path, "konvertiert", "OK",
+               f"aus {old_path}")
     # Nachweisliste der Format-Konvertierungen (.xls/.xlt -> neu, und
     # Ausweichnamen bei Kollision) mit altem und neuem Pfad fuers Archiv.
     if not CONVERSIONS_CSV:
@@ -420,16 +468,16 @@ def append_resume(resume_path: str, file_path: str) -> None:
     try:
         with open(resume_path, "a", encoding="utf-8") as fh:
             fh.write(file_path + "\n")
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"append_resume: Exception verworfen: {_e!r}")
 
 
 def delete_resume_file(resume_path: str) -> None:
     try:
         if resume_path and os.path.exists(resume_path):
             os.remove(resume_path)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"delete_resume_file: Exception verworfen: {_e!r}")
 
 
 # ==================================================================
@@ -461,13 +509,13 @@ def _signal_handler(sig, frame) -> None:
     if excel_app_global is not None:
         try:
             _restore_com_addins(excel_app_global)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
         try:
             excel_app_global.Quit()
             time.sleep(1)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
         excel_app_global = None
 
     _kill_specific_excel()
@@ -476,17 +524,17 @@ def _signal_handler(sig, frame) -> None:
     # einen Signal-Handler-Kontext (nur lokale Datei-Loeschungen).
     try:
         _cleanup_excel_inetcache()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
     try:
         _cleanup_user_recent()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
 
     try:
         pythoncom.CoUninitialize()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
 
     sys.exit(130)
 
@@ -557,8 +605,8 @@ def _rmtree_onerror(func, path, exc_info):
     try:
         os.chmod(path, stat.S_IWRITE)
         func(path)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_rmtree_onerror: Exception verworfen: {_e!r}")
 
 
 # ==================================================================
@@ -697,10 +745,10 @@ def _disable_com_addins(app) -> None:
                 if ad.Connect:
                     ad.Connect = False
                     detail_logger.debug(f"COM-Add-In deaktiviert: {ad.Description}")
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _e:
+                detail_logger.debug(f"_disable_com_addins: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_disable_com_addins: Exception verworfen: {_e!r}")
 
 
 def _restore_com_addins(app) -> bool:
@@ -723,8 +771,8 @@ def _restore_com_addins(app) -> bool:
                     ad.Connect = orig
                     detail_logger.debug(
                         f"COM-Add-In wiederhergestellt: {ad.Description}")
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_restore_com_addins: Exception verworfen: {_e!r}")
     return True
 
 
@@ -742,8 +790,8 @@ def _restore_com_addins_fallback() -> None:
         try:
             app.Visible       = COM_FALSE
             app.DisplayAlerts = COM_FALSE
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_restore_com_addins_fallback: Exception verworfen: {_e!r}")
         _restore_com_addins(app)
     except Exception as e:
         detail_logger.warning(
@@ -754,8 +802,8 @@ def _restore_com_addins_fallback() -> None:
         if app is not None:
             try:
                 app.Quit()
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_restore_com_addins_fallback: Exception verworfen: {_e!r}")
 
 
 def _safe_cleanup_temp() -> None:
@@ -838,8 +886,8 @@ def _cleanup_excel_inetcache() -> None:
                 try:
                     try:
                         os.chmod(fpath, stat.S_IWRITE)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"_cleanup_excel_inetcache: Exception verworfen: {_e!r}")
                     os.remove(fpath)
                     files_deleted += 1
                     bytes_freed   += fsize
@@ -923,8 +971,8 @@ def _cleanup_user_recent() -> None:
             try:
                 try:
                     os.chmod(fpath, stat.S_IWRITE)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"_cleanup_user_recent: Exception verworfen: {_e!r}")
                 os.remove(fpath)
                 files_deleted += 1
                 bytes_freed   += fsize
@@ -984,24 +1032,24 @@ def _cleanup_windows_temp() -> None:
                 try:
                     os.remove(entry.path)
                     removed_files += 1
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"_cleanup_windows_temp: Exception verworfen: {_e!r}")
             elif entry.is_dir():
                 try:
                     shutil.rmtree(entry.path, ignore_errors=True)
                     if not os.path.exists(entry.path):
                         removed_dirs += 1
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as _e:
+                    detail_logger.debug(f"_cleanup_windows_temp: Exception verworfen: {_e!r}")
+        except Exception as _e:
+            detail_logger.debug(f"_cleanup_windows_temp: Exception verworfen: {_e!r}")
     try:
         detail_logger.info(
             f"Windows-Temp-Cleanup (Whitelist): {removed_files} Dateien, "
             f"{removed_dirs} Ordner aus {win_temp} entfernt, "
             f"{skipped} fremde Einträge unangetastet.")
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_cleanup_windows_temp: Exception verworfen: {_e!r}")
 
 # ==================================================================
 # Trust-Center-Registry-Check
@@ -1102,8 +1150,8 @@ def _run_com_with_watchdog(op: Callable[[], Any],
                                 proc.kill()
                         except (psutil.NoSuchProcess, psutil.AccessDenied):
                             pass
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"watchdog: Exception verworfen: {_e!r}")
 
     wd_thread = threading.Thread(target=watchdog, daemon=True)
     wd_thread.start()
@@ -1132,8 +1180,8 @@ def safe_excel_open(excel_app, file_path: str,
     excel_pid = None
     try:
         _, excel_pid = win32process.GetWindowThreadProcessId(excel_app.Hwnd)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"safe_excel_open: Exception verworfen: {_e!r}")
     if not excel_pid and excel_pid_global is not None:
         excel_pid = excel_pid_global
     excel_create_time = None
@@ -1142,8 +1190,8 @@ def safe_excel_open(excel_app, file_path: str,
     elif excel_pid:
         try:
             excel_create_time = psutil.Process(excel_pid).create_time()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"safe_excel_open: Exception verworfen: {_e!r}")
 
     return _run_com_with_watchdog(
         lambda: excel_app.Workbooks.Open(file_path, **open_kwargs),
@@ -1159,8 +1207,8 @@ def safe_excel_save(excel_app, save_func: Callable[[], Any],
     excel_pid = None
     try:
         _, excel_pid = win32process.GetWindowThreadProcessId(excel_app.Hwnd)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"safe_excel_save: Exception verworfen: {_e!r}")
     if not excel_pid and excel_pid_global is not None:
         excel_pid = excel_pid_global
     excel_create_time = None
@@ -1169,8 +1217,8 @@ def safe_excel_save(excel_app, save_func: Callable[[], Any],
     elif excel_pid:
         try:
             excel_create_time = psutil.Process(excel_pid).create_time()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"safe_excel_save: Exception verworfen: {_e!r}")
 
     return _run_com_with_watchdog(
         save_func, excel_pid, timeout, op_name="Excel-Save",
@@ -1239,8 +1287,8 @@ def _build_minimal_xlsx(target_path: str) -> None:
     if os.path.exists(target_path):
         try:
             os.remove(target_path)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_build_minimal_xlsx: Exception verworfen: {_e!r}")
 
     with zipfile.ZipFile(target_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml",          content_types)
@@ -1308,17 +1356,23 @@ def test_trust_center_smoke(timeout: float = 25.0) -> tuple:
 
         # Excel lautlos konfigurieren.
         try: excel.Visible            = COM_FALSE
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try: excel.DisplayAlerts      = COM_FALSE
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try: excel.ScreenUpdating     = COM_FALSE
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try: excel.EnableEvents       = COM_FALSE
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try: excel.AutomationSecurity = 3   # msoAutomationSecurityForceDisable
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try: excel.AskToUpdateLinks   = False
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
 
         # --- Open mit Watchdog ---
         try:
@@ -1351,10 +1405,12 @@ def test_trust_center_smoke(timeout: float = 25.0) -> tuple:
     finally:
         if wb is not None:
             try: wb.Close(SaveChanges=False)
-            except Exception: pass
+            except Exception as _e:
+                detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         if excel is not None:
             try: excel.Quit()
-            except Exception: pass
+            except Exception as _e:
+                detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
             # Falls Quit nicht greift: harter Kill ueber gemerkte PID.
             if test_pid:
                 try:
@@ -1366,17 +1422,17 @@ def test_trust_center_smoke(timeout: float = 25.0) -> tuple:
                         p.kill()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try:
             if os.path.exists(test_path):
                 os.remove(test_path)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try:
             pythoncom.CoUninitialize()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
 
 
 # ==================================================================
@@ -1422,8 +1478,8 @@ def _enable_restore_privileges() -> None:
             try:
                 luid = win32security.LookupPrivilegeValue(None, name)
                 privs.append((luid, win32security.SE_PRIVILEGE_ENABLED))
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_enable_restore_privileges: Exception verworfen: {_e!r}")
         if not privs:
             return
         win32security.AdjustTokenPrivileges(htoken, 0, privs)
@@ -1456,6 +1512,27 @@ def _get_security_descriptor(path: str):
 
 
 def _apply_security_descriptor(path: str, sd) -> None:
+    """Eigentuemer, Gruppe und DACL einer ersetzten Datei wiederherstellen.
+
+    Alles wird in EINEM SetNamedSecurityInfo-Aufruf gesetzt. Frueher liefen
+    zwei getrennte Aufrufe (erst DACL, dann Owner) - und das Setzen des
+    Eigentuemers ordnet die Vererbung neu. Nachgestellt: eine Datei verlor
+    dabei die Kennzeichnung ihrer geerbten ACEs, und eine geerbte
+    EIGENTUEMERRECHTE-ACE (S-1-3-4) bekam zusaetzlich INHERIT_ONLY - damit galt
+    sie fuer die Datei selbst nicht mehr. Wer seinen Zugriff allein daraus
+    bezog, konnte die eigene Datei anschliessend nicht mehr oeffnen
+    (PermissionError). Das ist das Gegenteil dessen, was diese Funktion
+    bezweckt. Ein gemeinsamer Aufruf laesst Windows die Rechte in einem Zug
+    berechnen; der schaedliche Zwischenzustand entsteht gar nicht erst.
+
+    Der Eigentuemer wird ausserdem nur gesetzt, wenn er tatsaechlich abweicht -
+    ein privilegierter Schreibvorgang ohne Wirkung entfaellt damit.
+
+    Schlaegt der gemeinsame Aufruf fehl (typisch: kein SeRestorePrivilege im
+    Nutzer-Kontext, dann verweigert bereits das Owner-Feld), wird die DACL
+    einzeln nachgezogen. Damit bleibt das bisherige Verhalten erhalten, dass
+    wenigstens die Rechte ankommen.
+    """
     if sd is None:
         return
     try:
@@ -1468,48 +1545,72 @@ def _apply_security_descriptor(path: str, sd) -> None:
         dacl = sd.GetSecurityDescriptorDacl()
     except Exception:
         dacl = None
-    if dacl is not None:
-        try:
-            dacl_flags = win32security.DACL_SECURITY_INFORMATION
-            try:
-                ctrl, _rev = sd.GetSecurityDescriptorControl()
-                if ctrl & win32security.SE_DACL_PROTECTED:
-                    dacl_flags |= win32security.PROTECTED_DACL_SECURITY_INFORMATION
-                else:
-                    dacl_flags |= win32security.UNPROTECTED_DACL_SECURITY_INFORMATION
-            except Exception:
-                pass
-            win32security.SetNamedSecurityInfo(
-                p, win32security.SE_FILE_OBJECT, dacl_flags,
-                None, None, dacl, None)
-            detail_logger.debug(f"DACL wiederhergestellt: {path}")
-        except Exception as e:
-            detail_logger.warning(
-                f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e}")
-
     try:
         owner = sd.GetSecurityDescriptorOwner()
+    except Exception:
+        owner = None
+    try:
+        group = sd.GetSecurityDescriptorGroup()
+    except Exception:
         group = None
+
+    info = 0
+    if dacl is not None:
+        info |= win32security.DACL_SECURITY_INFORMATION
         try:
-            group = sd.GetSecurityDescriptorGroup()
-        except Exception:
-            pass
-        if owner is not None:
-            sec_flags = win32security.OWNER_SECURITY_INFORMATION
-            if group is not None:
-                sec_flags |= win32security.GROUP_SECURITY_INFORMATION
-            win32security.SetNamedSecurityInfo(
-                p, win32security.SE_FILE_OBJECT, sec_flags,
-                owner, group, None, None)
-            detail_logger.debug(f"Owner wiederhergestellt: {path}")
+            ctrl, _rev = sd.GetSecurityDescriptorControl()
+            if ctrl & win32security.SE_DACL_PROTECTED:
+                info |= win32security.PROTECTED_DACL_SECURITY_INFORMATION
+            else:
+                info |= win32security.UNPROTECTED_DACL_SECURITY_INFORMATION
+        except Exception as _e:
+            detail_logger.debug(f"_apply_security_descriptor: Exception verworfen: {_e!r}")
+
+    # Eigentuemer nur setzen, wenn er wirklich abweicht.
+    if owner is not None:
+        try:
+            akt = win32security.GetNamedSecurityInfo(
+                p, win32security.SE_FILE_OBJECT,
+                win32security.OWNER_SECURITY_INFORMATION
+            ).GetSecurityDescriptorOwner()
+            if (win32security.ConvertSidToStringSid(akt)
+                    == win32security.ConvertSidToStringSid(owner)):
+                owner = None
+        except Exception as _e:
+            detail_logger.debug(f"_apply_security_descriptor: Owner-Vergleich verworfen: {_e!r}")
+
+    if owner is not None:
+        info |= win32security.OWNER_SECURITY_INFORMATION
+    if group is not None:
+        info |= win32security.GROUP_SECURITY_INFORMATION
+    if not info:
+        return
+
+    nur_dacl = info & ~(win32security.OWNER_SECURITY_INFORMATION
+                        | win32security.GROUP_SECURITY_INFORMATION)
+
+    try:
+        win32security.SetNamedSecurityInfo(
+            p, win32security.SE_FILE_OBJECT, info, owner, group, dacl, None)
+        detail_logger.debug(f"Sicherheitsinfo wiederhergestellt: {path}")
+        return
     except Exception as e:
+        if owner is None and group is None:
+            detail_logger.warning(f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e}")
+            return
         if _restore_privileges_enabled:
-            detail_logger.warning(
-                f"Owner-Wiederherstellung fehlgeschlagen ({path}): {e}")
+            detail_logger.warning(f"Owner-Wiederherstellung fehlgeschlagen ({path}): {e}")
         else:
-            detail_logger.debug(
-                f"Owner nicht gesetzt (kein Admin-Privileg – im "
-                f"Nutzer-Kontext unkritisch): {path} – {e}")
+            detail_logger.debug(f"Owner nicht gesetzt (kein Admin-Privileg - im Nutzer-Kontext unkritisch): {path} - {e}")
+
+    # Rueckfall: wenigstens die DACL setzen.
+    if dacl is not None and nur_dacl:
+        try:
+            win32security.SetNamedSecurityInfo(
+                p, win32security.SE_FILE_OBJECT, nur_dacl, None, None, dacl, None)
+            detail_logger.debug(f"DACL wiederhergestellt (ohne Owner): {path}")
+        except Exception as e2:
+            detail_logger.warning(f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e2}")
 
 
 # ==================================================================
@@ -1523,6 +1624,24 @@ def sanitize_path(raw: str) -> str:
         path = path + "\\"
     return path
 
+
+
+def _utime_rueckfall(pfad: str, zeiten) -> bool:
+    """Rueckfall, wenn win32file.SetFileTime scheitert.
+
+    Erhaelt Zugriffs- und Aenderungszeit - nicht die Erstellungszeit,
+    aber das ist deutlich besser als der vollstaendige Verlust des
+    Datums. Diesen Rueckfall hatte bisher nur 5_OCR_PDF.py; ohne ihn
+    verloren die uebrigen Skripte die Zeitstempel stillschweigend,
+    sobald pywin32 fehlte oder der Handle nicht zu oeffnen war.
+    """
+    try:
+        zugriff, geaendert = zeiten[1], zeiten[2]
+        os.utime(prepare_long_path(pfad),
+                 (zugriff.timestamp(), geaendert.timestamp()))
+        return True
+    except Exception:
+        return False
 
 def prepare_long_path(path: str) -> str:
     if path.startswith("\\\\?\\"):
@@ -1860,43 +1979,43 @@ def file_generator(directory: str):
 def _set_chart_fonts(chart, font_name: str, depth: int = 0) -> None:
     try:
         chart.ChartArea.Format.TextFrame2.TextRange.Font.Name = font_name
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     try:
         if chart.HasTitle:
             chart.ChartTitle.Font.Name = font_name
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     try:
         for axis in chart.Axes():
             try:
                 axis.TickLabels.Font.Name = font_name
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
             try:
                 if axis.HasTitle:
                     axis.AxisTitle.Font.Name = font_name
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _e:
+                detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     try:
         if chart.HasLegend:
             chart.Legend.Font.Name = font_name
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     try:
         if chart.HasDataTable:
             try:
                 chart.DataTable.Font.Name = font_name
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _e:
+                detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     try:
         for series in chart.SeriesCollection():
@@ -1904,8 +2023,8 @@ def _set_chart_fonts(chart, font_name: str, depth: int = 0) -> None:
                 if series.HasDataLabels:
                     try:
                         series.DataLabels().Font.Name = font_name
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
                     try:
                         pts_coll = series.Points()
                         pt_count = pts_coll.Count
@@ -1915,37 +2034,37 @@ def _set_chart_fonts(chart, font_name: str, depth: int = 0) -> None:
                                     pt = pts_coll.Item(j)
                                     if pt.HasDataLabel:
                                         pt.DataLabel.Font.Name = font_name
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                                except Exception as _e:
+                                    detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
+                    except Exception as _e:
+                        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
+            except Exception as _e:
+                detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
             try:
                 for tl in series.Trendlines():
                     try:
                         if tl.DisplayEquation or tl.DisplayRSquared:
                             tl.DataLabel.Font.Name = font_name
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-    except Exception:
-        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
+            except Exception as _e:
+                detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     try:
         chart.PlotArea.Format.TextFrame2.TextRange.Font.Name = font_name
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     try:
         for shp in chart.Shapes:
             try:
                 _process_sheet_shape(shp, font_name, depth + 1)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _e:
+                detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
 
 def _process_sheet_shape(shape, font_name: str, depth: int = 0) -> None:
@@ -1964,17 +2083,17 @@ def _process_sheet_shape(shape, font_name: str, depth: int = 0) -> None:
             for item in shape.GroupItems:
                 try:
                     _process_sheet_shape(item, font_name, depth + 1)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as _e:
+                    detail_logger.debug(f"_process_sheet_shape: Exception verworfen: {_e!r}")
+        except Exception as _e:
+            detail_logger.debug(f"_process_sheet_shape: Exception verworfen: {_e!r}")
         return
 
     if shape_type == MSO_CHART:
         try:
             _set_chart_fonts(shape.Chart, font_name, depth)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_process_sheet_shape: Exception verworfen: {_e!r}")
         return
 
     try:
@@ -1984,20 +2103,20 @@ def _process_sheet_shape(shape, font_name: str, depth: int = 0) -> None:
             except Exception:
                 try:
                     shape.TextFrame.Characters().Font.Name = font_name
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                except Exception as _e:
+                    detail_logger.debug(f"_process_sheet_shape: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_process_sheet_shape: Exception verworfen: {_e!r}")
 
     try:
         if getattr(shape, "HasSmartArt", False):
             for node in shape.SmartArt.AllNodes:
                 try:
                     node.TextFrame2.TextRange.Font.Name = font_name
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                except Exception as _e:
+                    detail_logger.debug(f"_process_sheet_shape: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_process_sheet_shape: Exception verworfen: {_e!r}")
 
 
 _HEADER_FONT_RE = re.compile(r'&"([^",]+)(?:,([^"]+))?"')
@@ -2035,31 +2154,35 @@ def _replace_header_footer_fonts(sheet, font_name: str) -> None:
             if new_value != value:
                 try:
                     setattr(ps, attr, new_value)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as _e:
+                    detail_logger.debug(f"_replace_header_footer_fonts: Exception verworfen: {_e!r}")
+        except Exception as _e:
+            detail_logger.debug(f"_replace_header_footer_fonts: Exception verworfen: {_e!r}")
 
 # ==================================================================
 # Conditional Formatting / Tabellen / Pivot
 # ==================================================================
-def _set_conditional_formatting_fonts(sheet, font_name: str) -> None:
-    try:
-        ur = sheet.UsedRange
-        fcs = ur.FormatConditions
-        count = fcs.Count
-    except Exception:
-        return
+def _hat_bedingte_formatierung(sheet) -> bool:
+    """Traegt das Blatt bedingte Formatierung?
 
-    for i in range(1, count + 1):
-        try:
-            fc = fcs.Item(i)
-            try:
-                fc.Font.Name = font_name
-            except Exception:
-                pass
-        except Exception:
-            pass
+    Die Schriftart laesst sich dort NICHT umstellen: das Font-Objekt einer
+    FormatCondition unterstuetzt nur Schriftschnitt, Unterstreichung, Farbe
+    und Durchstreichung. Mit echtem Excel geprueft - 'Name' und 'Size' werfen
+    'Die Name-Eigenschaft des Font-Objektes kann nicht festgelegt werden',
+    waehrend Bold/Italic/Underline/Strikethrough anstandslos durchgehen. Es
+    ist dieselbe Einschraenkung, die im Dialog 'Zellen formatieren' fuer
+    bedingte Formatierung sichtbar ist (Feld 'Schriftart' ausgegraut); das
+    zugrunde liegende dxf-Format kennt schlicht keinen Schriftnamen.
+
+    Frueher versuchte _set_conditional_formatting_fonts genau das und
+    verschluckte den Fehler still - das Blatt galt als vollstaendig
+    umgestellt, obwohl bedingt formatierte Zellen die alte Schrift behielten.
+    Statt es weiter zu versuchen, wird der Umstand jetzt gemeldet.
+    """
+    try:
+        return sheet.UsedRange.FormatConditions.Count > 0
+    except Exception:
+        return False
 
 
 def _set_list_object_fonts(sheet, font_name: str) -> None:
@@ -2074,10 +2197,10 @@ def _set_list_object_fonts(sheet, font_name: str) -> None:
             lo = los.Item(i)
             try:
                 lo.Range.Font.Name = font_name
-            except Exception:
-                pass
-        except Exception:
-            pass
+            except Exception as _e:
+                detail_logger.debug(f"_set_list_object_fonts: Exception verworfen: {_e!r}")
+        except Exception as _e:
+            detail_logger.debug(f"_set_list_object_fonts: Exception verworfen: {_e!r}")
 
 
 def _set_pivot_table_fonts(sheet, font_name: str) -> None:
@@ -2095,10 +2218,10 @@ def _set_pivot_table_fonts(sheet, font_name: str) -> None:
             except Exception:
                 try:
                     pt.TableRange1.Font.Name = font_name
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as _e:
+                    detail_logger.debug(f"_set_pivot_table_fonts: Exception verworfen: {_e!r}")
+        except Exception as _e:
+            detail_logger.debug(f"_set_pivot_table_fonts: Exception verworfen: {_e!r}")
 
 # ==================================================================
 # Blattschutz temporär aufheben
@@ -2157,8 +2280,8 @@ def _remove_excel_metadata(workbook, selected: dict) -> bool:
                 try:
                     ct_props(i).Delete()
                     any_removed = True
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"_remove_excel_metadata: Exception verworfen: {_e!r}")
             detail_logger.debug("ContentTypeProperties geleert")
         except Exception as e:
             detail_logger.debug(f"ContentTypeProperties nicht verfügbar: {e}")
@@ -2188,8 +2311,8 @@ def _remove_excel_metadata(workbook, selected: dict) -> bool:
                     try:
                         tc(i).Delete()
                         any_removed = True
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"_remove_excel_metadata: Exception verworfen: {_e!r}")
                 detail_logger.debug(f"Thread-Kommentare geleert: {sheet.Name}")
             except Exception as e:
                 detail_logger.debug(f"CommentsThreaded auf {sheet.Name} nicht verfügbar: {e}")
@@ -2248,6 +2371,17 @@ def replace_fonts_in_workbook(
 ) -> str:
     pbar.write(f"Prüfe: {os.path.basename(file_path)}")
     detail_logger.info(f"=== Starte: {file_path} ===")
+
+    # Sperrpruefung wie im Probelauf. is_locked_by_other wurde bisher
+    # AUSSCHLIESSLICH von dry_run_directory aufgerufen: der Probelauf meldete
+    # geoeffnete Mappen als 'wuerde uebersprungen', der Echtlauf pruefte die
+    # Office-Owner-Datei '~$<name>' an keiner Stelle und griff die Datei
+    # trotzdem an. Damit sagte der Probelauf etwas anderes voraus, als der
+    # Echtlauf tat - und genau dafuer ist er da.
+    if is_locked_by_other(file_path):
+        pbar.write("  → ÜBERSPRUNGEN: Datei ist in Excel geöffnet (~$-Datei vorhanden).")
+        detail_logger.warning(f"Uebersprungen (geoeffnet): {file_path}")
+        return "SKIPPED"
 
     original_path       = file_path
     is_temp_copy        = False
@@ -2319,8 +2453,8 @@ def replace_fonts_in_workbook(
             # ausgefuehrt wird.
             try:
                 os.chmod(temp_path, os.stat(temp_path).st_mode | stat.S_IWRITE)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
             if not _wait_file_released(temp_path, timeout=AV_POST_COPY_WAIT_SECONDS):
                 detail_logger.warning(
                     f"Temp-Datei nach {AV_POST_COPY_WAIT_SECONDS}s noch gesperrt "
@@ -2365,13 +2499,13 @@ def replace_fonts_in_workbook(
         try:
             _orig_calc = excel_app.Calculation
             excel_app.Calculation = XL_CALC_MANUAL
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
 
         try:
             excel_app.DisplayAlerts = COM_FALSE
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
 
         # ── STAGE 1: Alte Formate konvertieren ────────────────────────
         if ext in (".xls", ".xlt"):
@@ -2388,10 +2522,10 @@ def replace_fonts_in_workbook(
                                     f"Excel 4.0-Makroblatt erkannt (Typ {sht.Type}): "
                                     f"'{sht.Name}' → Speichere als Makro-Format")
                                 break
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                        except Exception as _e:
+                            detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
+                except Exception as _e:
+                    detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
 
             if ext == ".xlt":
                 new_format = XL_FORMAT_XLTM if has_macros else XL_FORMAT_XLTX
@@ -2439,8 +2573,8 @@ def replace_fonts_in_workbook(
                 if os.path.exists(file_path):
                     try:
                         _av_safe_remove(file_path)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
                 file_path    = temp_stage1_path
                 is_temp_copy = False
             else:
@@ -2460,8 +2594,8 @@ def replace_fonts_in_workbook(
             for style in workbook.Styles:
                 try:
                     style.Font.Name = font_name
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
         except Exception as e:
             detail_logger.debug(f"Styles nicht änderbar: {e}")
 
@@ -2474,8 +2608,8 @@ def replace_fonts_in_workbook(
                 _sheet_protected = False
                 try:
                     _sheet_protected = sheet.ProtectContents
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
 
                 if _sheet_protected:
                     _was_unprotected = _unprotect_sheet_if_possible(sheet)
@@ -2508,7 +2642,14 @@ def replace_fonts_in_workbook(
                     detail_logger.debug(
                         f"UsedRange.Font.Name fehlgeschlagen auf '{sheet.Name}': {e}")
 
-                _set_conditional_formatting_fonts(sheet, font_name)
+                # Bedingte Formatierung traegt technisch keinen Schriftnamen
+                # (siehe _hat_bedingte_formatierung). Nur vermerken, nicht
+                # vergeblich setzen.
+                if _hat_bedingte_formatierung(sheet):
+                    detail_logger.info(
+                        f"Blatt '{sheet.Name}': bedingte Formatierung vorhanden – "
+                        f"deren Schriftart bleibt unveraendert (von Excel nicht "
+                        f"aenderbar).")
                 _set_list_object_fonts(sheet, font_name)
                 _set_pivot_table_fonts(sheet, font_name)
 
@@ -2517,19 +2658,19 @@ def replace_fonts_in_workbook(
                         for comment in sheet.Comments:
                             try:
                                 comment.Shape.TextFrame.Characters().Font.Name = font_name
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
+                            except Exception as _e:
+                                detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
+                    except Exception as _e:
+                        detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
 
                 try:
                     for shape in sheet.Shapes:
                         try:
                             _process_sheet_shape(shape, font_name, 0)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                        except Exception as _e:
+                            detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
+                except Exception as _e:
+                    detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
 
                 _replace_header_footer_fonts(sheet, font_name)
 
@@ -2541,8 +2682,8 @@ def replace_fonts_in_workbook(
             for chart_sheet in workbook.Charts:
                 try:
                     _set_chart_fonts(chart_sheet, font_name)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
         except Exception as e:
             detail_logger.debug(f"Charts-Collection nicht verfügbar: {e}")
 
@@ -2560,8 +2701,8 @@ def replace_fonts_in_workbook(
         # ── 4. SPEICHERN ──────────────────────────────────────────────
         try:
             excel_app.Calculation = _orig_calc
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
         excel_app.DisplayAlerts = COM_FALSE
 
         # DATENVERLUST-SCHUTZ:
@@ -2618,6 +2759,13 @@ def replace_fonts_in_workbook(
         # (Long-Path-Restore) den Move.
         if temp_stage2_path is not None:
             bak_orig = None
+            # Die Stage-2-Datei traegt die fertigen Aenderungen und ist bis zum
+            # bestaetigten Move die einzige Quelle dafuer. Ein Strg+C in diesem
+            # Fenster laesst den Signal-Handler _safe_cleanup_temp() aufrufen,
+            # der TEMP_PROCESS_PATH per rmtree abraeumt - 'stage2_*' war weder
+            # RESCUE_ noch geschuetzt und damit weg. Deshalb ab hier als
+            # geschuetzt fuehren; nach erfolgreichem Move wieder freigeben.
+            _preserved_temp_files.add(temp_stage2_path)
             try:
                 safe_orig = prepare_long_path(original_path)
                 if not (os.path.exists(temp_stage2_path)
@@ -2641,8 +2789,8 @@ def replace_fonts_in_workbook(
                     try:
                         current_mode = os.stat(safe_orig).st_mode
                         os.chmod(safe_orig, current_mode | stat.S_IWRITE)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
                     bak_orig = prepare_long_path(
                         original_path + f"_{uuid.uuid4().hex[:6]}.bak")
                     _av_safe_replace(safe_orig, bak_orig)
@@ -2650,6 +2798,8 @@ def replace_fonts_in_workbook(
                 if not verify_saved_file(safe_orig):
                     raise RuntimeError(
                         f"Zurueckgeschobene Datei nicht valide: {original_path}")
+                # Move bestaetigt - der Schutz wird nicht mehr gebraucht.
+                _preserved_temp_files.discard(temp_stage2_path)
                 temp_stage2_path = None
                 if bak_orig and os.path.exists(bak_orig):
                     try:
@@ -2659,7 +2809,16 @@ def replace_fonts_in_workbook(
                             f"Backup-Datei nicht löschbar: {bak_orig} ({e_bak_del})")
                 detail_logger.debug(
                     f"Stage-2-Tempdatei -> Original verschoben: {original_path}")
-            except Exception as e_s2_move:
+            # BaseException, nicht Exception: Der Signal-Handler endet mit
+            # sys.exit(130), und das loest SystemExit aus - eine BaseException.
+            # Bei Strg+C mitten im Move lief die Wiederherstellung aus dem
+            # .bak deshalb NIE, obwohl das Original oben bereits auf den
+            # .bak-Namen umbenannt war. Zurueck blieb nur
+            # 'Datei.xlsx_9f3a1c.bak' - ein Name, der unter
+            # SKIP_FILE_SUFFIXES faellt und damit auch von jedem Folgelauf
+            # ignoriert wird. Das Fenster ist nicht schmal: _av_safe_move
+            # wiederholt bei AV-Sperren bis zu AV_MAX_RETRIES-mal.
+            except BaseException as e_s2_move:
                 # Move fehlgeschlagen - Original aus dem .bak-Backup
                 # wiederherstellen, falls der Move es bereits angetastet
                 # hat. Stage-2-Tempdatei zusaetzlich als RESCUE_-Datei
@@ -2708,6 +2867,12 @@ def replace_fonts_in_workbook(
                 pbar.write(
                     f"  ✗  FEHLER (Stage-2-Move): "
                     f"{os.path.basename(original_path)}")
+                # SystemExit/KeyboardInterrupt nach der Rettung UNVERAENDERT
+                # weiterreichen. Sonst wuerde der Abbruch zu einem blossen
+                # 'ERROR' fuer diese eine Datei und der Lauf liefe weiter -
+                # das Gegenteil dessen, was Strg+C bedeutet.
+                if not isinstance(e_s2_move, Exception):
+                    raise
                 return "ERROR"
 
         # ── 6. TEMP-STAGE1 → ZIELDATEI verschieben ────────────────────
@@ -2751,6 +2916,21 @@ def replace_fonts_in_workbook(
         # ── 7. ORIGINAL LÖSCHEN (normale Konvertierung) ───────────────
         elif was_converted and not is_temp_copy and not _lp_cleanup_handled \
                 and os.path.exists(prepare_long_path(original_path)):
+            # Die neue Datei PRUEFEN, bevor das Original geloescht wird.
+            # Dieser Zweig ist der haeufigste Produktionsfall (kurzer Pfad,
+            # .xls -> .xlsx) und war als einziger Ersetzungspfad ohne
+            # Integritaetspruefung - Block 5.5, 6 und 8 haben je einen
+            # verify_saved_file-Aufruf, Block 7 hatte keinen. Geschrieben
+            # wurde new_path direkt auf die Freigabe (SaveAs + Save); liefert
+            # ein Netzwerk-Aussetzer oder ein AV-Eingriff dort eine
+            # trunkierte Datei zurueck, ohne dass COM eine Ausnahme wirft,
+            # wurde anschliessend das intakte Original geloescht und der Lauf
+            # meldete Erfolg. verify_saved_file prueft Existenz, Mindestgroesse
+            # und bei OOXML zusaetzlich die ZIP-Struktur.
+            if not verify_saved_file(new_path):
+                raise RuntimeError(
+                    f"Konvertierte Datei nicht valide oder leer: {new_path} "
+                    f"– Original bleibt erhalten.")
             safe_orig = prepare_long_path(original_path)
             try:
                 os.chmod(safe_orig, stat.S_IWRITE)
@@ -2806,7 +2986,9 @@ def replace_fonts_in_workbook(
                     except Exception as e_bak_del:
                         detail_logger.warning(
                             f"Backup-Datei nicht löschbar: {bak_path} ({e_bak_del})")
-            except Exception as e_move:
+            # BaseException wie in Block 5.5: sonst ueberspringt ein Strg+C
+            # mitten im Move die Wiederherstellung aus dem .bak.
+            except BaseException as e_move:
                 if bak_created and not os.path.exists(safe_orig):
                     try:
                         _av_safe_replace(bak_path, safe_orig)
@@ -2837,6 +3019,9 @@ def replace_fonts_in_workbook(
                         f"  → Datei manuell prüfen und sichern!")
                 log_error(original_path, Exception(f"Zurückschieben fehlgeschlagen: {e_move}"))
                 pbar.write(f"  ✗  FEHLER (move): {os.path.basename(original_path)}")
+                # Abbruch nach der Rettung unveraendert weiterreichen.
+                if not isinstance(e_move, Exception):
+                    raise
                 return "ERROR"
 
         # ── 8.5. ACL/OWNER WIEDERHERSTELLEN ───────────────────────────
@@ -2868,8 +3053,18 @@ def replace_fonts_in_workbook(
                         break
                     except Exception as e_utime:
                         if av_retry == 4:
-                            detail_logger.warning(
-                                f"Zeitstempel nicht wiederherstellbar: {e_utime}")
+                            # Rueckfall auf os.utime: erhaelt Zugriffs- und
+                            # Aenderungszeit (nicht die Erstellungszeit),
+                            # aber das ist deutlich besser als der
+                            # vollstaendige Verlust des Datums. Bisher
+                            # hatte nur 5_OCR_PDF.py diesen Rueckfall.
+                            if not _utime_rueckfall(ts_target, orig_times):
+                                detail_logger.warning(
+                                    f"Zeitstempel nicht wiederherstellbar: {e_utime}")
+                            else:
+                                detail_logger.info(
+                                    "Zeitstempel über os.utime-Rückfall gesetzt "
+                                    "(ohne Erstellungszeit).")
                         else:
                             time.sleep(0.5)
 
@@ -2904,6 +3099,31 @@ def replace_fonts_in_workbook(
             detail_logger.info(f"Übersprungen (Passwort): {original_path}")
             return "SKIPPED"
 
+        # Bereits geschriebene, aber nie gepruefte Zieldatei entfernen.
+        # Bei .xls/.xlt schreibt Stage 1 new_path auf die Freigabe, BEVOR
+        # irgendeine Schriftersetzung stattgefunden hat. Bricht der Lauf
+        # danach ab, blieb diese Datei liegen - ungeprueft, mit alten
+        # Schriftarten oder trunkiert. Der Wiederholungslauf
+        # (FILE_PROCESSING_ATTEMPTS) fand sie vor, wich auf '<name>_1.xlsx'
+        # aus und loeschte am Ende das Original: der Anwender hatte zwei
+        # Zieldateien, von denen nur eine brauchbar war, und die verwaiste
+        # stand in keinem Protokoll. Das Original wird hier NICHT angetastet.
+        if (was_converted and new_path and not is_temp_copy
+                and new_path.lower() != original_path.lower()
+                and os.path.exists(prepare_long_path(new_path))):
+            try:
+                _av_safe_remove(new_path)
+            except Exception as _e_del:
+                detail_logger.debug(f"Zieldatei-Aufraeumen: {_e_del!r}")
+            if os.path.exists(prepare_long_path(new_path)):
+                detail_logger.error(
+                    f"Unfertige Zieldatei NICHT entfernbar - bitte pruefen: {new_path}")
+                pbar.write(f"  ⚠  Unfertige Zieldatei bitte prüfen: {os.path.basename(new_path)}")
+            else:
+                detail_logger.warning(
+                    f"Unfertige Zieldatei nach Abbruch entfernt: {new_path}")
+                pbar.write(f"  ↺  Unfertige Zieldatei entfernt: {os.path.basename(new_path)}")
+
         log_error(original_path, e)
         pbar.write(f"  ✗  FEHLER: {os.path.basename(original_path)}")
         return "ERROR"
@@ -2912,12 +3132,12 @@ def replace_fonts_in_workbook(
         if workbook is not None:
             try:
                 excel_app.Calculation = _orig_calc
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
             try:
                 workbook.Close(SaveChanges=COM_FALSE)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
         if is_temp_copy and os.path.exists(file_path):
             if file_path in _preserved_temp_files:
                 detail_logger.debug(
@@ -2925,21 +3145,21 @@ def replace_fonts_in_workbook(
             else:
                 try:
                     _av_safe_remove(file_path)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
         if (temp_stage1_path is not None
                 and os.path.exists(temp_stage1_path)):
             try:
                 _av_safe_remove(temp_stage1_path)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
         if (temp_stage2_path is not None
                 and os.path.exists(temp_stage2_path)
                 and temp_stage2_path not in _preserved_temp_files):
             try:
                 _av_safe_remove(temp_stage2_path)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
 
 # ==================================================================
 # Verzeichnis-Verarbeitung
@@ -3001,8 +3221,8 @@ def process_directory(
                 p.pid for p in psutil.process_iter(["name"])
                 if p.info["name"] and p.info["name"].lower() == "excel.exe"
             }
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_start_excel: Exception verworfen: {_e!r}")
 
         excel            = win32com.client.DispatchEx("Excel.Application")
         excel_app_global = excel
@@ -3043,8 +3263,8 @@ def process_directory(
         excel.AutomationSecurity = 3
         try:
             excel.Interactive = COM_FALSE
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_start_excel: Exception verworfen: {_e!r}")
 
         _disable_com_addins(excel)
 
@@ -3057,8 +3277,8 @@ def process_directory(
                 detail_logger.warning(
                     f"Excel-Speicher {mem_mb:.0f}MB > Limit {EXCEL_MEMORY_LIMIT_MB}MB – Neustart")
                 return True
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_check_excel_memory: Exception verworfen: {_e!r}")
         return False
 
     # ── Hauptschleife ─────────────────────────────────────────────────
@@ -3077,8 +3297,8 @@ def process_directory(
                         f"Geplanter Excel-Neustart nach {file_counter} Dateien")
                     try:
                         excel.Quit()
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
                     # Excel garantiert toetscheckpoint - Cache-Cleanup
                     # analog 3a/3b/3c/4a (Excel tot vor Neustart).
                     # _kill_specific_excel ist idempotent; _start_excel
@@ -3086,12 +3306,12 @@ def process_directory(
                     _kill_specific_excel()
                     try:
                         _cleanup_excel_inetcache()
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
                     try:
                         _cleanup_user_recent()
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
                     try:
                         _start_excel()
                     except Exception as e_planned:
@@ -3109,12 +3329,12 @@ def process_directory(
                     _kill_specific_excel()
                     try:
                         _cleanup_excel_inetcache()
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
                     try:
                         _cleanup_user_recent()
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
                     try:
                         _start_excel()
                     except Exception as e_restart:
@@ -3202,27 +3422,27 @@ def process_directory(
                 addins_restored = False
             try:
                 excel.Quit()
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
         _kill_specific_excel()
         excel_app_global = None
         if not addins_restored:
             try:
                 _restore_com_addins_fallback()
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
         time.sleep(2)
         _safe_cleanup_temp()
         # Office-INetCache (Content.MSO) und Windows-Recent (.lnk) ebenfalls
         # aufraeumen - analog zu 3a/3b/3c/4a. Beide best effort.
         try:
             _cleanup_excel_inetcache()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
         try:
             _cleanup_user_recent()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
 
     return stats, run_completed
 
@@ -3414,7 +3634,10 @@ if __name__ == "__main__":
     print("  Verarbeitungsumfang:")
     print("    * Formatvorlagen (Styles)")
     print("    * Tabellenblätter: UsedRange (Zellen), Kommentare")
-    print("    * Bedingte Formatierung, Tabellen (ListObjects), PivotTables")
+    print("    * Tabellen (ListObjects), PivotTables")
+    print("  NICHT umstellbar:")
+    print("    * Bedingte Formatierung – trägt technisch keinen Schriftnamen")
+    print("      (Excel lässt dort nur Schnitt, Unterstreichung, Farbe zu)")
     print("    * Kopf- und Fußzeilen (mit & ohne Font-Code)")
     print("    * Eingebettete Diagramme + Diagrammblätter (inkl. DataTable, Point-Labels)")
     print("    * Shapes: Textfelder, Formen, Gruppen (rekursiv), SmartArts")
@@ -3506,6 +3729,21 @@ if __name__ == "__main__":
         signal.signal(signal.SIGTERM, _signal_handler)
     except Exception:
         pass
+
+    # --- Einzelinstanz-Schutz ---
+    # Diese Sperre gab es bisher nur in 3a-3c. Ohne sie konnten zwei
+    # Laeufe gleichzeitig ueber denselben Bestand gehen und sich
+    # gegenseitig die Temp-Kopien und Zieldateien wegziehen.
+    # Freigabe ueber atexit, damit sie auch bei sys.exit greift.
+    _sperre = None
+    if gem is not None:
+        _sperre = gem.Einzelinstanz("4b_ersetze_font_in_excel")
+        if not _sperre.belegen():
+            print(_sperre.hinweis())
+            sys.exit(1)
+        import atexit
+        atexit.register(_sperre.freigeben)
+
     pythoncom.CoInitialize()
 
     # Restore-Privilegien (Admin-Kontext) für ACL/Owner-Erhalt aktivieren.

@@ -37,10 +37,24 @@ empfohlene Reihenfolge, keine Zwangsfolge — jedes Skript läuft für sich.
 | 10 | `10_dateinamen_bereinigen.py` | Repariert Mojibake und entfernt Zeichen, die Google Drive nicht mag |
 | 11 | `11_Typo_Dateinamen_korrigieren.ps1` | Rechtschreibprüfung für Dateinamen (Hunspell), mit interaktiver Bestätigung |
 
+## Gemeinsame Teile
+
+| Datei | Wozu |
+|---|---|
+| `_gemeinsam.py`, `_gemeinsam.psm1` | Grundfunktionen, die vorher in jedem Skript einzeln standen: Konsolen-Encoding, Einzelinstanz-Sperre, Langpfade, Zeitstempel, Office-Sitzungswarnung, CSV-Maskierung. Die Skripte binden sie **mit Rückfall** ein — fehlt die Datei, arbeiten sie mit ihrer eingebauten Kopie weiter, und die ps2exe-Übersetzung funktioniert unverändert. |
+| `pfade.json` | Verzeichnis-Presets und Bezugsquellen an einer Stelle statt in acht Skripten. Fehlt sie, gelten die eingebauten Vorgaben. |
+| `pruefe_syntax.ps1` | Parser-Lauf über alle `.ps1`. |
+| `pruefe_alles.ps1` | Sammelprüfung über beide Sprachen: Syntax, `py_compile`, optional PSScriptAnalyzer und ruff — plus Musterprüfungen auf die Fallen, die in dieser Sammlung schon einmal aufgetreten sind. **Vor jedem Einsatz laufen lassen.** |
+| `migration.jsonl` | Gemeinsames Laufprotokoll über alle Schritte, eine Zeile je Datei und Aktion. Ergänzt die skripteigenen Protokolle, ersetzt sie nicht. |
+
 ## Bevor Sie anfangen
 
 **Erst `0_Vorab-Check.py`.** Es sagt Ihnen, was fehlt, bevor ein anderes
 Skript auf halber Strecke stehenbleibt.
+
+**Dann `pruefe_alles.ps1`.** Ein reiner Syntaxlauf hätte den
+schwerwiegendsten Fehler dieser Sammlung nicht gefunden — der Ausdruck war
+syntaktisch einwandfrei und tat trotzdem das Gegenteil des Gemeinten.
 
 **Und dann ein Probelauf.** Die Skripte, die schreiben, haben einen
 Trockenlauf; `10_dateinamen_bereinigen.py` etwa `--dry-run`. Auf einem

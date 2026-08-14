@@ -73,7 +73,7 @@ if os.name == "nt":
 if sys.stdout is not None and getattr(sys.stdout, "encoding", None) \
         and sys.stdout.encoding.lower() != "utf-8":
     try:
-        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except AttributeError:
         pass
 if sys.stderr is not None and getattr(sys.stderr, "encoding", None) \
@@ -108,9 +108,34 @@ class RenameStatus(Enum):
     EXCLUDED      = auto()   # in einem ausgeschlossenen Verzeichnis
 
 
+# Nur diese Ergebnisse gehoeren in die Fortschrittsdatei: sie sind dauerhaft.
+# ERROR (z. B. WinError 32 durch AV-Scanner) und SKIPPED (alle Ausweichnamen
+# belegt) koennen sich beim naechsten Lauf aufloesen - wer sie vermerkt,
+# ueberspringt sie fuer immer.
+_RESUME_STATUSES = frozenset({
+    RenameStatus.RENAMED,
+    RenameStatus.CLEAN,
+    RenameStatus.EXCLUDED,
+    RenameStatus.WOULD_RENAME,
+})
+
+
 # ==================================================================
 # Konfiguration
 # ==================================================================
+
+# ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Fehlt _gemeinsam.py, laeuft alles unveraendert weiter.
+try:
+    _eigener_ordner = os.path.dirname(os.path.abspath(__file__))
+    if _eigener_ordner not in sys.path:
+        sys.path.insert(0, _eigener_ordner)
+    import _gemeinsam as gem
+except Exception:
+    gem = None
+
 MAX_PATH_LEN = 259
 MAX_NAME_LEN = 255
 HASH_LEN     = 8
@@ -213,8 +238,15 @@ _rename_log_handle = None
 def open_rename_log() -> None:
     global _rename_log_handle
     try:
+        # errors="surrogatepass": Dateinamen koennen halbe Surrogatpaar-
+        # Haelften enthalten (\udc80 & Co.) - Windows laesst solche Namen zu,
+        # und das Skript behandelt sie weiter unten ausdruecklich. Mit der
+        # strikten Vorgabe warf schon das Schreiben der Protokollzeile einen
+        # UnicodeEncodeError, und genau fuer diese Umbenennung fehlte danach
+        # die einzige Ruecknahmequelle.
         _rename_log_handle = open(
-            RENAME_LOG_FILE, "w", encoding="utf-8-sig", newline=""
+            RENAME_LOG_FILE, "w", encoding="utf-8-sig", newline="",
+            errors="surrogatepass"
         )
         _rename_log_handle.write("Status;Typ;Verzeichnis;AlterName;NeuerName\n")
     except OSError as e:
@@ -239,8 +271,34 @@ def _csv_field(value: str) -> str:
     return v
 
 
+# ==================================================================
+# Gemeinsames Laufprotokoll (migration.jsonl)
+# ==================================================================
+# Jedes Skript schreibt sein eigenes Format. Der Gesamtfortschritt ueber
+# die elf Schritte liess sich damit nicht auswerten. Diese Zeile
+# ERGAENZT das bestehende Protokoll, ersetzt es nicht.
+_laufprotokoll = None
+
+
+def _protokoll(pfad: str, aktion: str, status: str, detail: str = "") -> None:
+    global _laufprotokoll
+    if gem is None:
+        return
+    try:
+        if _laufprotokoll is None:
+            _laufprotokoll = gem.Laufprotokoll(
+                os.path.splitext(os.path.basename(__file__))[0])
+        _laufprotokoll.schreibe(pfad, aktion, status, detail)
+    except Exception:
+        pass
+
+
 def log_rename(status: str, is_dir: bool, directory: str,
                old_name: str, new_name: str) -> None:
+    _protokoll(os.path.join(directory, old_name),
+               "umbenannt" if new_name else "geprueft",
+               status,
+               f"neu: {new_name}" if new_name else "")
     if _rename_log_handle is None:
         return
     row = ";".join(_csv_field(x) for x in (
@@ -252,8 +310,12 @@ def log_rename(status: str, is_dir: bool, directory: str,
     ))
     try:
         _rename_log_handle.write(row + "\n")
-    except OSError:
-        pass
+    except Exception as e:
+        # Bewusst 'Exception', nicht 'OSError': ein UnicodeEncodeError ist
+        # eine Unterklasse von ValueError und lief hier frueher vorbei - bis
+        # hinauf in den Umbenennungs-try, der die bereits ausgefuehrte
+        # Umbenennung dann als Fehler meldete.
+        logger.warning(f"Protokollzeile nicht schreibbar: {e!r}")
 
 
 # ==================================================================
@@ -266,7 +328,11 @@ def setup_logging() -> None:
     )
     logger.setLevel(logging.DEBUG)
     try:
-        fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+        # errors="surrogatepass" aus demselben Grund wie beim CSV: Dateinamen
+        # mit halben Surrogatpaar-Haelften duerfen die Protokollierung nicht
+        # sprengen.
+        fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8",
+                                 errors="surrogatepass")
         fh.setFormatter(fmt)
         logger.addHandler(fh)
     except OSError as e:
@@ -717,8 +783,15 @@ _POST_REPAIR_TOKENS = {
     # Mutation). Im Bestand systematisch am Wortanfang (─nderungen,
     # ─NDERUNGEN). Token mit Buchstaben-Kontext, weil U+2500 theoretisch
     # auch in ASCII-Art-Dateinamen legitim sein könnte.
-    "_─": "_Ä",   # _─nderungen → _Änderungen
-    " ─": " Ä",   # mit Leerzeichen davor
+    # '_─' und ' ─' hatten entgegen dem Kommentar KEINEN Buchstaben-Kontext:
+    # sie trafen jedes U+2500 nach Unterstrich oder Leerzeichen, also auch
+    # eine reine Trennlinie ('Bericht ───── Anhang.pdf' wurde zu
+    # 'Bericht Ä──── Anhang.pdf'). Deshalb den folgenden Buchstaben
+    # mitfordern - genau wie bei den Tokens darunter.
+    "_─n": "_Än",   # _─nderungen → _Änderungen
+    "_─N": "_ÄN",
+    " ─n": " Än",   # mit Leerzeichen davor
+    " ─N": " ÄN",
     "─n": "Än",   # ─nderungen am Stringanfang
     "─N": "ÄN",   # ─NDERUNGEN
     "─ä": "Ää",   # falls am Anfang vor Wortteil — sehr unwahrscheinlich aber harmlos
@@ -821,16 +894,32 @@ def _pre_substitute_plus(text: str) -> str:
     text2 = "".join(chars)
 
     # Phase B: ++ zwischen ASCII-Buchstaben → ├╝ (= ü in cp437→utf-8)
-    text2 = re.sub(
-        r"(?<=[A-Za-z])\+\+(?=[A-Za-z])",
-        "\u251C\u255D",  # ├╝
-        text2,
-    )
+    #
+    # Eigener, STRENGERER Torwaechter als der Gate am Funktionsanfang: dort
+    # steht _MOJIBAKE_HINT_RE, dessen Zeichenklasse laut eigenem Kommentar
+    # bewusst auch legitime deutsche Umlaute umfasst. Damit war der Gate bei
+    # praktisch jedem deutschen Dateinamen mit Umlaut offen, und Phase B
+    # wandelte jedes '++' zwischen zwei ASCII-Buchstaben um - obwohl der
+    # Docstring das Gegenteil zusichert. Nachgestellt: 'Ausflug++Gruesse.pdf'
+    # und 'Oel++Wasser.txt' wurden beide veraendert, nur weil anderswo im
+    # Namen ein Umlaut stand. _MOJIBAKE_RESULT_HINT_RE nimmt die legitimen
+    # Umlaute ausdruecklich aus und verlangt damit einen echten Beleg.
+    if _MOJIBAKE_RESULT_HINT_RE.search(text2):
+        text2 = re.sub(
+            r"(?<=[A-Za-z])\+\+(?=[A-Za-z])",
+            "\u251C\u255D",  # ├╝
+            text2,
+        )
 
     return text2
 
 
-def _repair_mojibake(text: str) -> str:
+# Box-Drawing (U+2500-257F) und Blockelemente (U+2580-259F): ─ bis ▟.
+# Bleibt eines davon nach dem Heilen stehen, war der Durchlauf erfolglos.
+_BOXDRAW_RE = re.compile(r"[─-▟]")
+
+
+def _repair_mojibake_core(text: str, plus_substitution: bool = True) -> str:
     if not _MOJIBAKE_HINT_RE.search(text):
         return text
 
@@ -878,7 +967,9 @@ def _repair_mojibake(text: str) -> str:
         prev = current
 
         # Stufe 0: Plus-Substitution für Box-Drawing-ASCII-Substitute
-        current = _pre_substitute_plus(current)
+        # (spekulativ - siehe _repair_mojibake unten)
+        if plus_substitution:
+            current = _pre_substitute_plus(current)
 
         # Stufe 1: Cluster-für-Cluster heilen (verkraftet Mixed-Strings,
         # weil saubere Zeichen wie ein bereits korrektes 'ü' nicht mit-encodet
@@ -899,6 +990,37 @@ def _repair_mojibake(text: str) -> str:
             break  # Konvergenz erreicht
 
     return current
+
+
+def _repair_mojibake(text: str) -> str:
+    """Mojibake heilen; die Plus-Substitution dabei nur SPEKULATIV anwenden.
+
+    _pre_substitute_plus ersetzt '+' durch '├' und ist laut eigenem Docstring
+    ausdruecklich nur eine Vorstufe fuer den Heiler. Sie wurde aber
+    unbedingt vorgenommen und nie zurueckgenommen, wenn danach keine Heilung
+    zustande kam - das '├' blieb dann endgueltiger Bestandteil des neuen
+    Namens und wurde so auf die Platte umbenannt.
+
+    Betroffen sind legitime Namen mit einem Akzentzeichen neben einem Plus:
+    _is_mojibake_neighbor haelt JEDES Nicht-ASCII-Zeichen ausser aeoeueAEOEUEss
+    fuer einen Mojibake-Indikator, also auch e-Akut, a-Grave, ©, €, ° und µ,
+    die in Archivbestaenden massenhaft legitim vorkommen. Nachgestellt:
+    'André+Partner.pdf' -> 'André├Partner.pdf', 'Größe 10€+MwSt.pdf' ->
+    'Größe 10€├MwSt.pdf'.
+
+    Deshalb: erst mit Substitution heilen. Bleibt danach ein Box-Drawing-
+    Zeichen stehen, hat sie nicht geheilt, sondern nur zerstoert - dann zaehlt
+    der Durchlauf OHNE Substitution, in dem das '+' unangetastet bleibt.
+    Da die Substitution Box-Drawing-Zeichen nur hinzufuegen kann, ist dieser
+    zweite Durchlauf nie schlechter.
+    """
+    if not _MOJIBAKE_HINT_RE.search(text):
+        return text
+
+    mit = _repair_mojibake_core(text, plus_substitution=True)
+    if "+" not in text or not _BOXDRAW_RE.search(mit):
+        return mit
+    return _repair_mojibake_core(text, plus_substitution=False)
 
 
 # Anführungszeichen-Strip am Komponent-Anfang/-Ende. Entfernt typografische
@@ -1102,14 +1224,24 @@ def sanitize_entry_on_disk(
         log_rename("WUERDE_UMBENENNEN", is_dir, directory, basename, new_name)
         return RenameStatus.WOULD_RENAME
 
+    # Umbenennung und Protokollierung strikt trennen: frueher standen
+    # log_rename() und logger.info() im selben try wie _rename_with_retry.
+    # Ein Dateiname mit halber Surrogatpaar-Haelfte (\udc80) - deren Existenz
+    # dieses Skript weiter oben selbst dokumentiert - loeste beim Schreiben
+    # der Protokollzeile einen UnicodeEncodeError aus. Der ist eine
+    # Unterklasse von ValueError, nicht von OSError, lief also am 'except
+    # OSError' in log_rename vorbei und wurde unten von 'except Exception'
+    # gefangen. Ergebnis: os.rename war bereits gelaufen, die Datei trug den
+    # neuen Namen - gemeldet wurde 'Umbenennung fehlgeschlagen', gezaehlt
+    # ERROR statt RENAMED, und die CSV-Zeile fehlte. Damit fehlte fuer genau
+    # diese Umbenennung die einzige Ruecknahmequelle, die das Skript dem
+    # Anwender zusichert.
+    erfolg_status = None
+    erfolg_name   = None
+    erfolg_pfad   = None
     try:
         _rename_with_retry(_lp(entry_path), _lp(new_path))
-        pbar.write(f"  📝 [{entry_type}] '{basename}' → '{new_name}'")
-        logger.info(
-            f"Umbenannt: {_display_path(entry_path)} → {_display_path(new_path)}"
-        )
-        log_rename("UMBENANNT", is_dir, directory, basename, new_name)
-        return RenameStatus.RENAMED
+        erfolg_status, erfolg_name, erfolg_pfad = "UMBENANNT", new_name, new_path
     except FileExistsError:
         # TOCTOU-Race: Zwischen der safe_exists-Kollisionsprüfung oben und
         # dem os.rename hat ein Dritter (paralleler Drive-Sync, AV-Scanner)
@@ -1127,12 +1259,7 @@ def sanitize_entry_on_disk(
         race_path = os.path.join(directory, race_name)
         try:
             _rename_with_retry(_lp(entry_path), _lp(race_path))
-            pbar.write(f"  📝 [{entry_type}] '{basename}' → '{race_name}' (Kollision aufgelöst)")
-            logger.info(
-                f"Umbenannt (Race-Auflösung): {_display_path(entry_path)} → {_display_path(race_path)}"
-            )
-            log_rename("UMBENANNT_RACE", is_dir, directory, basename, race_name)
-            return RenameStatus.RENAMED
+            erfolg_status, erfolg_name, erfolg_pfad = "UMBENANNT_RACE", race_name, race_path
         except Exception as e2:
             pbar.write(f"  ✗  Umbenennung fehlgeschlagen: '{basename}' – {e2}")
             logger.warning(
@@ -1145,6 +1272,25 @@ def sanitize_entry_on_disk(
             f"Umbenennung fehlgeschlagen: {_display_path(entry_path)} – {e}"
         )
         return RenameStatus.ERROR
+
+    # Ab hier steht der neue Name auf der Platte. Alles Folgende ist reine
+    # Protokollierung und darf den Erfolg nicht mehr umdeuten.
+    try:
+        zusatz = " (Kollision aufgelöst)" if erfolg_status == "UMBENANNT_RACE" else ""
+        pbar.write(f"  📝 [{entry_type}] '{basename}' → '{erfolg_name}'{zusatz}")
+        logger.info(
+            f"Umbenannt{zusatz}: {_display_path(entry_path)} → {_display_path(erfolg_pfad)}"
+        )
+    except Exception as e_log:
+        try:
+            logger.warning(f"Umbenennung erfolgt, Meldung fehlgeschlagen: {e_log!r}")
+        except Exception:
+            pass
+    # log_rename faengt seine Fehler selbst ab und ist die Ruecknahmequelle -
+    # bewusst ausserhalb des obigen try, damit es auch dann laeuft, wenn
+    # schon die Bildschirmausgabe scheitert.
+    log_rename(erfolg_status, is_dir, directory, basename, erfolg_name)
+    return RenameStatus.RENAMED
 
 
 # ==================================================================
@@ -1190,6 +1336,61 @@ def count_entries(directory: str) -> int:
 
 
 # ==================================================================
+# Wiederaufnahme nach Abbruch
+# ==================================================================
+# Das Skript laeuft ueber Bestaende in Millionenhoehe und fing nach
+# einem Abbruch bisher von vorne an - besonders aergerlich, weil der
+# optionale Zaehldurchlauf den Baum bereits einmal komplett abgeht.
+# Muster uebernommen aus 3a bis 3c (append_resume / load_resume_set).
+#
+# Vermerkt wird der Pfad VOR der Umbenennung. Damit ueberspringt ein
+# zweiter Lauf genau die Eintraege, die schon geprueft wurden - die
+# Analyse je Eintrag (Mojibake-Erkennung, Normalisierung, Kollisions-
+# pruefung) faellt dann weg.
+def get_resume_file_path(directory: str) -> str:
+    kennung = hashlib.sha1(os.path.abspath(directory).encode("utf-8",
+                                                             "surrogatepass")).hexdigest()[:12]
+    basis = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or "."
+    ordner = os.path.join(basis, "Dateinamen-Bereinigung")
+    try:
+        os.makedirs(ordner, exist_ok=True)
+    except Exception:
+        ordner = basis
+    return os.path.join(ordner, f"resume_{kennung}.txt")
+
+
+def load_resume_set(pfad: str) -> set:
+    if not pfad or not os.path.exists(pfad):
+        return set()
+    try:
+        with open(pfad, "r", encoding="utf-8", errors="replace") as fh:
+            return {z.rstrip("\n") for z in fh if z.strip()}
+    except Exception as e:
+        logger.warning(f"Resume-Datei nicht lesbar ({e}) - beginne von vorne.")
+        return set()
+
+
+def append_resume(pfad: str, eintrag: str) -> None:
+    if not pfad:
+        return
+    try:
+        with open(pfad, "a", encoding="utf-8") as fh:
+            fh.write(eintrag + "\n")
+    except Exception as _e:
+        # Ein nicht schreibbarer Fortschrittsvermerk darf den Lauf nicht
+        # anhalten - er kostet dann nur die Wiederaufnahme.
+        logger.debug(f"append_resume: Exception verworfen: {_e!r}")
+
+
+def delete_resume_file(pfad: str) -> None:
+    try:
+        if pfad and os.path.exists(pfad):
+            os.remove(pfad)
+    except Exception as _e:
+        logger.debug(f"delete_resume_file: Exception verworfen: {_e!r}")
+
+
+# ==================================================================
 # Verzeichnis-Verarbeitung
 # ==================================================================
 def process_directory(
@@ -1197,6 +1398,7 @@ def process_directory(
     count_files_first: bool,
     truncate_long: bool,
     dry_run: bool = False,
+    resume_path: Optional[str] = None,
 ) -> Counter:
     if count_files_first:
         total = count_entries(directory)
@@ -1210,13 +1412,31 @@ def process_directory(
 
     stats: Counter = Counter({s: 0 for s in RenameStatus})
 
+    # Im Probelauf wird nichts vermerkt: er aendert nichts, also gibt es
+    # auch nichts fortzusetzen.
+    erledigt = load_resume_set(resume_path) if (resume_path and not dry_run) else set()
+    if erledigt:
+        print(f"  ♻  Wiederaufnahme: {len(erledigt):,} bereits geprüfte Einträge werden übersprungen\n")
+
     with tqdm(total=total, desc="Prüfe", unit="Eintrag", bar_format=bar_fmt) as pbar:
         for entry_path, is_dir in entry_generator(directory):
+            if erledigt and entry_path in erledigt:
+                pbar.update(1)
+                continue
             try:
                 status = sanitize_entry_on_disk(
                     entry_path, pbar, is_dir, truncate_long, dry_run
                 )
                 stats[status] += 1
+                # NUR dauerhaft erledigte Eintraege vermerken. Frueher lief
+                # append_resume ohne jede Statusabfrage: ein Eintrag, dessen
+                # Umbenennung an WinError 32 gescheitert war (AV-Scanner,
+                # Indexer - genau der Fall, fuer den RENAME_RETRIES ueberhaupt
+                # existiert), galt danach als erledigt und wurde in JEDEM
+                # Folgelauf uebersprungen. Dasselbe fuer SKIPPED, wo alle
+                # Ausweichnamen belegt waren - auch das kann sich aufloesen.
+                if resume_path and not dry_run and status in _RESUME_STATUSES:
+                    append_resume(resume_path, entry_path)
             except Exception as e:
                 stats[RenameStatus.ERROR] += 1
                 msg = f"Unerwarteter Fehler bei {_display_path(entry_path)}: {e}"
@@ -1261,6 +1481,8 @@ if __name__ == "__main__":
                         help="Namen > 255 Zeichen kürzen (Google-Drive-Limit)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Probelauf: nur anzeigen, was umbenannt würde – nichts ändern")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Fortschrittsvermerk ignorieren und von vorne beginnen")
     args = parser.parse_args()
 
     setup_logging()
@@ -1363,14 +1585,23 @@ if __name__ == "__main__":
     print(f"\nVerarbeite: '{start_dir}'")
     print("-" * 66)
 
+    resume_path = None if (args.no_resume or dry_run) else get_resume_file_path(start_dir)
+
     try:
         stats_result = process_directory(
-            start_dir, count_first, truncate_long, dry_run
+            start_dir, count_first, truncate_long, dry_run, resume_path
         )
+        # Nur ein vollstaendig durchgelaufener Durchgang loescht den
+        # Vermerk. Nach einem Abbruch bleibt er liegen - genau dafuer
+        # ist er da.
+        delete_resume_file(resume_path)
     except KeyboardInterrupt:
         print("\n\n*** ABBRUCH durch Benutzer.")
         close_rename_log()
         print(f"    Bisherige Umbenennungen: {RENAME_LOG_FILE}")
+        if resume_path:
+            print(f"    Fortschritt vermerkt in: {resume_path}")
+            print("    Ein erneuter Start setzt dort fort (--no-resume beginnt neu).")
         sys.exit(1)
     finally:
         close_rename_log()

@@ -132,6 +132,20 @@ except Exception:
     pass
 
 # ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Fehlt _gemeinsam.py - etwa weil nur dieses eine Skript weitergegeben
+# wurde -, laeuft alles unveraendert weiter; die daraus bedienten
+# Zusatzfunktionen schalten sich dann still ab.
+try:
+    _eigener_ordner = os.path.dirname(os.path.abspath(__file__))
+    if _eigener_ordner not in sys.path:
+        sys.path.insert(0, _eigener_ordner)
+    import _gemeinsam as gem
+except Exception:
+    gem = None
+
+# ==================================================================
 # COM-Konstanten
 # ==================================================================
 COM_TRUE  = -1
@@ -311,8 +325,8 @@ def _rmtree_onerror(func, path, exc_info):
     try:
         os.chmod(path, stat.S_IWRITE)
         func(path)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_rmtree_onerror: Exception verworfen: {_e!r}")
 
 
 # Whitelist fuer den Windows-Temp-Cleanup: NUR Word-eigene Reste
@@ -352,24 +366,24 @@ def _cleanup_windows_temp() -> None:
                 try:
                     os.remove(entry.path)
                     removed_files += 1
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"_cleanup_windows_temp: Exception verworfen: {_e!r}")
             elif entry.is_dir():
                 try:
                     shutil.rmtree(entry.path, ignore_errors=True)
                     if not os.path.exists(entry.path):
                         removed_dirs += 1
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as _e:
+                    detail_logger.debug(f"_cleanup_windows_temp: Exception verworfen: {_e!r}")
+        except Exception as _e:
+            detail_logger.debug(f"_cleanup_windows_temp: Exception verworfen: {_e!r}")
     try:
         detail_logger.info(
             f"Windows-Temp-Cleanup (Whitelist): {removed_files} Dateien, "
             f"{removed_dirs} Ordner aus {win_temp} entfernt, "
             f"{skipped} fremde Einträge unangetastet.")
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_cleanup_windows_temp: Exception verworfen: {_e!r}")
 
 
 def _safe_cleanup_temp_process() -> None:
@@ -398,8 +412,8 @@ def _safe_cleanup_temp_process() -> None:
                     f"  Dateien ({len(all_protected)}):\n"
                     + "\n".join(f"    * {f}" for f in all_protected)
                     + "\n  → Bitte manuell sichern, dann Ordner löschen.")
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_safe_cleanup_temp_process: Exception verworfen: {_e!r}")
             print("\n  GESCHÜTZTE DATEIEN vorhanden – Temp-Ordner NICHT gelöscht:")
             print(f"   {TEMP_PROCESS_PATH}")
             for f in all_protected:
@@ -410,8 +424,8 @@ def _safe_cleanup_temp_process() -> None:
     except Exception as e:
         try:
             detail_logger.warning(f"Aufräumen fehlgeschlagen: {e}")
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_safe_cleanup_temp_process: Exception verworfen: {_e!r}")
 
 
 def _cleanup_word_inetcache() -> None:
@@ -463,8 +477,8 @@ def _cleanup_word_inetcache() -> None:
                     try:
                         try:
                             os.chmod(fpath, stat.S_IWRITE)
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"_cleanup_word_inetcache: Exception verworfen: {_e!r}")
                         os.remove(fpath)
                         files_deleted += 1
                         bytes_freed   += fsize
@@ -548,8 +562,8 @@ def _cleanup_user_recent() -> None:
             try:
                 try:
                     os.chmod(fpath, stat.S_IWRITE)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"_cleanup_user_recent: Exception verworfen: {_e!r}")
                 os.remove(fpath)
                 files_deleted += 1
                 bytes_freed   += fsize
@@ -713,8 +727,8 @@ def _is_rpc_dead_error(exc: Exception) -> bool:
             hresult = exc.args[0] if exc.args else None
             if hresult in _RPC_DEAD_HRESULTS:
                 return True
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_is_rpc_dead_error: Exception verworfen: {_e!r}")
     msg = str(exc).lower()
     if "0x800706ba" in msg or "0x80010108" in msg:
         return True
@@ -770,8 +784,8 @@ def _word_call_with_watchdog(call_label: str, timeout: float, word_pid,
                         proc.kill()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"_watchdog: Exception verworfen: {_e!r}")
 
     wd_thread = threading.Thread(target=_watchdog, daemon=True)
     wd_thread.start()
@@ -829,8 +843,8 @@ def _build_minimal_docx(target_path: str) -> None:
     if os.path.exists(target_path):
         try:
             os.remove(target_path)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_build_minimal_docx: Exception verworfen: {_e!r}")
 
     with zipfile.ZipFile(target_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml", content_types)
@@ -896,15 +910,20 @@ def test_trust_center_smoke(timeout: float = 25.0) -> Tuple[bool, str, str]:
 
         # Word lautlos konfigurieren.
         try: word.Visible = False
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try: word.DisplayAlerts = 0   # wdAlertsNone
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try: word.AutomationSecurity = 3   # msoAutomationSecurityForceDisable
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try: word.Options.UpdateLinksAtOpen   = False
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try: word.Options.DoNotPromptForConvert = True
-        except Exception: pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
 
         # --- Open mit Watchdog ---
         def _do_open():
@@ -936,10 +955,12 @@ def test_trust_center_smoke(timeout: float = 25.0) -> Tuple[bool, str, str]:
     finally:
         if doc is not None:
             try: doc.Close(SaveChanges=COM_FALSE)
-            except Exception: pass
+            except Exception as _e:
+                detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         if word is not None:
             try: word.Quit(SaveChanges=COM_FALSE)
-            except Exception: pass
+            except Exception as _e:
+                detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
             # Falls Quit nicht greift: harter Kill ueber gemerkte PID.
             if word_pid:
                 try:
@@ -951,17 +972,17 @@ def test_trust_center_smoke(timeout: float = 25.0) -> Tuple[bool, str, str]:
                         p.kill()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try:
             if os.path.exists(test_path):
                 os.remove(test_path)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try:
             pythoncom.CoUninitialize()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
 
 
 def _restore_word_settings(
@@ -976,34 +997,34 @@ def _restore_word_settings(
 ) -> None:
     try:
         word.ScreenUpdating = original_screen_updating
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_restore_word_settings: Exception verworfen: {_e!r}")
     try:
         word.Options.Pagination = original_pagination
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_restore_word_settings: Exception verworfen: {_e!r}")
     try:
         word.Options.CheckSpellingAsYouType = original_spell_check
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_restore_word_settings: Exception verworfen: {_e!r}")
     try:
         word.Options.CheckGrammarAsYouType = original_grammar_check
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_restore_word_settings: Exception verworfen: {_e!r}")
     try:
         word.Options.BackgroundSave = original_background_save
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_restore_word_settings: Exception verworfen: {_e!r}")
     # Word-Options sind profil-persistent - die beiden Dialog-
     # Unterdrueckungen daher ebenfalls auf den Ausgangswert zuruecksetzen.
     try:
         word.Options.UpdateLinksAtOpen = original_update_links
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_restore_word_settings: Exception verworfen: {_e!r}")
     try:
         word.Options.DoNotPromptForConvert = original_no_prompt_convert
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_restore_word_settings: Exception verworfen: {_e!r}")
 
 
 # ==================================================================
@@ -1024,17 +1045,17 @@ def _signal_handler(sig, frame) -> None:
     # einen Signal-Handler-Kontext (nur lokale Datei-Loeschungen).
     try:
         _cleanup_word_inetcache()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
     try:
         _cleanup_user_recent()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
 
     try:
         pythoncom.CoUninitialize()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
 
     sys.exit(1)
 
@@ -1082,8 +1103,8 @@ def _enable_restore_privileges() -> None:
             try:
                 luid = win32security.LookupPrivilegeValue(None, name)
                 privs.append((luid, win32security.SE_PRIVILEGE_ENABLED))
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_enable_restore_privileges: Exception verworfen: {_e!r}")
         if not privs:
             return
         win32security.AdjustTokenPrivileges(htoken, 0, privs)
@@ -1116,6 +1137,27 @@ def _get_security_descriptor(path: str):
 
 
 def _apply_security_descriptor(path: str, sd) -> None:
+    """Eigentuemer, Gruppe und DACL einer ersetzten Datei wiederherstellen.
+
+    Alles wird in EINEM SetNamedSecurityInfo-Aufruf gesetzt. Frueher liefen
+    zwei getrennte Aufrufe (erst DACL, dann Owner) - und das Setzen des
+    Eigentuemers ordnet die Vererbung neu. Nachgestellt: eine Datei verlor
+    dabei die Kennzeichnung ihrer geerbten ACEs, und eine geerbte
+    EIGENTUEMERRECHTE-ACE (S-1-3-4) bekam zusaetzlich INHERIT_ONLY - damit galt
+    sie fuer die Datei selbst nicht mehr. Wer seinen Zugriff allein daraus
+    bezog, konnte die eigene Datei anschliessend nicht mehr oeffnen
+    (PermissionError). Das ist das Gegenteil dessen, was diese Funktion
+    bezweckt. Ein gemeinsamer Aufruf laesst Windows die Rechte in einem Zug
+    berechnen; der schaedliche Zwischenzustand entsteht gar nicht erst.
+
+    Der Eigentuemer wird ausserdem nur gesetzt, wenn er tatsaechlich abweicht -
+    ein privilegierter Schreibvorgang ohne Wirkung entfaellt damit.
+
+    Schlaegt der gemeinsame Aufruf fehl (typisch: kein SeRestorePrivilege im
+    Nutzer-Kontext, dann verweigert bereits das Owner-Feld), wird die DACL
+    einzeln nachgezogen. Damit bleibt das bisherige Verhalten erhalten, dass
+    wenigstens die Rechte ankommen.
+    """
     if sd is None:
         return
     try:
@@ -1128,48 +1170,72 @@ def _apply_security_descriptor(path: str, sd) -> None:
         dacl = sd.GetSecurityDescriptorDacl()
     except Exception:
         dacl = None
-    if dacl is not None:
-        try:
-            dacl_flags = win32security.DACL_SECURITY_INFORMATION
-            try:
-                ctrl, _rev = sd.GetSecurityDescriptorControl()
-                if ctrl & win32security.SE_DACL_PROTECTED:
-                    dacl_flags |= win32security.PROTECTED_DACL_SECURITY_INFORMATION
-                else:
-                    dacl_flags |= win32security.UNPROTECTED_DACL_SECURITY_INFORMATION
-            except Exception:
-                pass
-            win32security.SetNamedSecurityInfo(
-                p, win32security.SE_FILE_OBJECT, dacl_flags,
-                None, None, dacl, None)
-            detail_logger.debug(f"DACL wiederhergestellt: {path}")
-        except Exception as e:
-            detail_logger.warning(
-                f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e}")
-
     try:
         owner = sd.GetSecurityDescriptorOwner()
+    except Exception:
+        owner = None
+    try:
+        group = sd.GetSecurityDescriptorGroup()
+    except Exception:
         group = None
+
+    info = 0
+    if dacl is not None:
+        info |= win32security.DACL_SECURITY_INFORMATION
         try:
-            group = sd.GetSecurityDescriptorGroup()
-        except Exception:
-            pass
-        if owner is not None:
-            sec_flags = win32security.OWNER_SECURITY_INFORMATION
-            if group is not None:
-                sec_flags |= win32security.GROUP_SECURITY_INFORMATION
-            win32security.SetNamedSecurityInfo(
-                p, win32security.SE_FILE_OBJECT, sec_flags,
-                owner, group, None, None)
-            detail_logger.debug(f"Owner wiederhergestellt: {path}")
+            ctrl, _rev = sd.GetSecurityDescriptorControl()
+            if ctrl & win32security.SE_DACL_PROTECTED:
+                info |= win32security.PROTECTED_DACL_SECURITY_INFORMATION
+            else:
+                info |= win32security.UNPROTECTED_DACL_SECURITY_INFORMATION
+        except Exception as _e:
+            detail_logger.debug(f"_apply_security_descriptor: Exception verworfen: {_e!r}")
+
+    # Eigentuemer nur setzen, wenn er wirklich abweicht.
+    if owner is not None:
+        try:
+            akt = win32security.GetNamedSecurityInfo(
+                p, win32security.SE_FILE_OBJECT,
+                win32security.OWNER_SECURITY_INFORMATION
+            ).GetSecurityDescriptorOwner()
+            if (win32security.ConvertSidToStringSid(akt)
+                    == win32security.ConvertSidToStringSid(owner)):
+                owner = None
+        except Exception as _e:
+            detail_logger.debug(f"_apply_security_descriptor: Owner-Vergleich verworfen: {_e!r}")
+
+    if owner is not None:
+        info |= win32security.OWNER_SECURITY_INFORMATION
+    if group is not None:
+        info |= win32security.GROUP_SECURITY_INFORMATION
+    if not info:
+        return
+
+    nur_dacl = info & ~(win32security.OWNER_SECURITY_INFORMATION
+                        | win32security.GROUP_SECURITY_INFORMATION)
+
+    try:
+        win32security.SetNamedSecurityInfo(
+            p, win32security.SE_FILE_OBJECT, info, owner, group, dacl, None)
+        detail_logger.debug(f"Sicherheitsinfo wiederhergestellt: {path}")
+        return
     except Exception as e:
+        if owner is None and group is None:
+            detail_logger.warning(f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e}")
+            return
         if _restore_privileges_enabled:
-            detail_logger.warning(
-                f"Owner-Wiederherstellung fehlgeschlagen ({path}): {e}")
+            detail_logger.warning(f"Owner-Wiederherstellung fehlgeschlagen ({path}): {e}")
         else:
-            detail_logger.debug(
-                f"Owner nicht gesetzt (kein Admin-Privileg – im "
-                f"Nutzer-Kontext unkritisch): {path} – {e}")
+            detail_logger.debug(f"Owner nicht gesetzt (kein Admin-Privileg - im Nutzer-Kontext unkritisch): {path} - {e}")
+
+    # Rueckfall: wenigstens die DACL setzen.
+    if dacl is not None and nur_dacl:
+        try:
+            win32security.SetNamedSecurityInfo(
+                p, win32security.SE_FILE_OBJECT, nur_dacl, None, None, dacl, None)
+            detail_logger.debug(f"DACL wiederhergestellt (ohne Owner): {path}")
+        except Exception as e2:
+            detail_logger.warning(f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e2}")
 
 
 # ==================================================================
@@ -1277,8 +1343,8 @@ def _replace_file_atomic(src: str, dst: str,
             dst_mode = os.stat(dst).st_mode
             if not (dst_mode & stat.S_IWRITE):
                 os.chmod(dst, dst_mode | stat.S_IWRITE)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_replace_file_atomic: Exception verworfen: {_e!r}")
     try:
         last_exc: Optional[Exception] = None
         for attempt, delay in enumerate([0.0, *AV_RETRY_DELAYS]):
@@ -1301,16 +1367,21 @@ def _replace_file_atomic(src: str, dst: str,
                     f"{op_name}: os.replace Versuch {attempt + 1} blockiert ({e}), warte ...")
         if last_exc is not None:
             raise last_exc
-    except Exception:
+    # BaseException, nicht Exception: Der Signal-Handler beendet sich mit
+    # sys.exit(), und SystemExit erbt von BaseException. Bei Strg+C mitten im
+    # Ersetzen blieb die Staging-Kopie '<name>.docx.tmp_new' sonst in der
+    # Ablage liegen - kein Aufraeumpfad des Skripts erfasst sie je wieder.
+    # Das abschliessende 'raise' reicht den Abbruch unveraendert weiter.
+    except BaseException:
         try:
             if os.path.exists(stage):
                 try:
                     os.chmod(stage, stat.S_IWRITE)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"_replace_file_atomic: Exception verworfen: {_e!r}")
                 _robust_remove(stage, op_name=f"{op_name}-Staging-Cleanup")
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_replace_file_atomic: Exception verworfen: {_e!r}")
         raise
     try:
         os.remove(src)
@@ -1331,6 +1402,24 @@ def sanitize_path(raw: str) -> str:
         path = path + "\\"
     return path
 
+
+
+def _utime_rueckfall(pfad: str, zeiten) -> bool:
+    """Rueckfall, wenn win32file.SetFileTime scheitert.
+
+    Erhaelt Zugriffs- und Aenderungszeit - nicht die Erstellungszeit,
+    aber das ist deutlich besser als der vollstaendige Verlust des
+    Datums. Diesen Rueckfall hatte bisher nur 5_OCR_PDF.py; ohne ihn
+    verloren die uebrigen Skripte die Zeitstempel stillschweigend,
+    sobald pywin32 fehlte oder der Handle nicht zu oeffnen war.
+    """
+    try:
+        zugriff, geaendert = zeiten[1], zeiten[2]
+        os.utime(prepare_long_path(pfad),
+                 (zugriff.timestamp(), geaendert.timestamp()))
+        return True
+    except Exception:
+        return False
 
 def prepare_long_path(path: str) -> str:
     if path.startswith("\\\\?\\"):
@@ -1390,16 +1479,16 @@ def append_resume(resume_path: str, file_path: str) -> None:
     try:
         with open(resume_path, "a", encoding="utf-8") as fh:
             fh.write(file_path + "\n")
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"append_resume: Exception verworfen: {_e!r}")
 
 
 def delete_resume_file(resume_path: str) -> None:
     try:
         if os.path.exists(resume_path):
             os.remove(resume_path)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"delete_resume_file: Exception verworfen: {_e!r}")
 
 
 # Statuswerte, die in die Resume-Datei eingetragen werden: dauerhaft
@@ -1413,7 +1502,33 @@ RESUME_STATUSES = ("SUCCESS", "UNCHANGED", "SKIPPED_ENCRYPTED", "SKIPPED_PASSWOR
 # Konvertierungs-CSV (Nachweisliste .doc/.dot -> .docx/.dotx)
 # ==================================================================
 
+
+# ==================================================================
+# Gemeinsames Laufprotokoll (migration.jsonl)
+# ==================================================================
+# Jedes Skript schreibt sein eigenes Format: CSV mit Semikolon, CSV mit
+# Komma, .log, XLSX, teils mit BOM, teils ohne. Der Gesamtfortschritt
+# ueber die elf Schritte liess sich damit nicht auswerten - etwa die
+# Frage, welche Dateien in Schritt 2 liegen blieben und in Schritt 7
+# wieder auftauchen. Diese Zeile ERGAENZT die bestehenden Protokolle.
+_laufprotokoll = None
+
+
+def _protokoll(pfad: str, aktion: str, status: str, detail: str = "") -> None:
+    global _laufprotokoll
+    if gem is None:
+        return
+    try:
+        if _laufprotokoll is None:
+            _laufprotokoll = gem.Laufprotokoll(
+                os.path.splitext(os.path.basename(__file__))[0])
+        _laufprotokoll.schreibe(pfad, aktion, status, detail)
+    except Exception:
+        pass
+
 def _log_conversion(old_path: str, new_path: str) -> None:
+    _protokoll(new_path or old_path, "konvertiert", "OK",
+               f"aus {old_path}")
     try:
         needs_header = not os.path.exists(CONVERSIONS_CSV)
         with open(CONVERSIONS_CSV, "a", encoding="utf-8-sig", newline="") as fh:
@@ -1524,7 +1639,7 @@ def ask_directory() -> str:
     while True:
         try:
             choice = input("Auswahl [1-8]: ").strip()
-        except EOFError:
+        except (EOFError, RuntimeError, OSError):
             print("\nKeine Eingabe möglich (EOF) – Abbruch.")
             sys.exit(1)
         if choice == "1":
@@ -1550,7 +1665,7 @@ def ask_directory() -> str:
         elif choice == "8":
             try:
                 raw = input("Pfad eingeben: ")
-            except EOFError:
+            except (EOFError, RuntimeError, OSError):
                 print("\nKeine Eingabe möglich (EOF) – Abbruch.")
                 sys.exit(1)
             path = sanitize_path(raw)
@@ -1580,9 +1695,36 @@ def ask_directory() -> str:
 def ask_font() -> str:
     try:
         val = input(f"\nZiel-Schriftart [Standard: {NEW_FONT_NAME}]: ").strip()
-    except EOFError:
+    except (EOFError, RuntimeError, OSError):
         return NEW_FONT_NAME
     return val if val else NEW_FONT_NAME
+
+
+def _is_tty() -> bool:
+    """Haengt stdin an einer echten Konsole? (wie in 4b)"""
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def _warte_auf_taste(auto_mode: bool = False) -> None:
+    """Abschliessendes 'Beliebige Taste' - nur wenn wirklich jemand zusieht.
+
+    Ohne Konsole (pythonw, Taskplaner 'Unabhaengig von der Benutzeranmeldung')
+    ist sys.stdin None und input() wirft RuntimeError('lost sys.stdin') - KEIN
+    EOFError, der frueher allein abgefangen wurde. Das Skript endete dann nach
+    vollstaendig geleisteter Arbeit mit einem Traceback und Exit-Code 1.
+    Haengt stdin an einer offenen Pipe, blockierte der Prozess dauerhaft - und
+    weil die Einzelinstanz-Sperre erst per atexit faellt, blockierte er damit
+    auch jeden weiteren geplanten Lauf.
+    """
+    if auto_mode or not _is_tty():
+        return
+    try:
+        input("\nBeliebige Taste drücken, um das Fenster zu schließen ...")
+    except (EOFError, RuntimeError, OSError):
+        pass
 
 
 def ask_yes_no(prompt: str, default_yes: bool = True) -> bool:
@@ -1590,7 +1732,7 @@ def ask_yes_no(prompt: str, default_yes: bool = True) -> bool:
     while True:
         try:
             answer = input(f"{prompt} [{hint}]: ").strip().lower()
-        except EOFError:
+        except (EOFError, RuntimeError, OSError):
             return default_yes
         if not answer:
             return default_yes
@@ -1622,7 +1764,7 @@ def ask_progress_mode() -> tuple:
     while True:
         try:
             choice = input("Auswahl [1-3]: ").strip()
-        except EOFError:
+        except (EOFError, RuntimeError, OSError):
             return (False, False)
         if choice in ("", "1"):
             return (False, False)
@@ -1717,36 +1859,36 @@ def _set_all_font_names(font, font_name: str) -> None:
     try:
         if font.Name != font_name:
             font.Name = font_name
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_set_all_font_names: Exception verworfen: {_e!r}")
     for attr in ("NameAscii", "NameOther", "NameBi", "NameFarEast"):
         try:
             if getattr(font, attr) != font_name:
                 setattr(font, attr, font_name)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_set_all_font_names: Exception verworfen: {_e!r}")
 
 
 def _set_font_on_range(rng, font_name: str) -> None:
     try:
         _set_all_font_names(rng.Font, font_name)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_set_font_on_range: Exception verworfen: {_e!r}")
 
 
 def _apply_smartart_node(node, font_name: str) -> None:
     try:
         _set_all_font_names(node.TextFrame2.TextRange.Font, font_name)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_apply_smartart_node: Exception verworfen: {_e!r}")
     try:
         for child in node.ChildNodes:
             try:
                 _apply_smartart_node(child, font_name)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _e:
+                detail_logger.debug(f"_apply_smartart_node: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_apply_smartart_node: Exception verworfen: {_e!r}")
 
 
 def _set_font_on_shape(shape, font_name: str) -> None:
@@ -1760,10 +1902,10 @@ def _set_font_on_shape(shape, font_name: str) -> None:
             for item in shape.GroupItems:
                 try:
                     _set_font_on_shape(item, font_name)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as _e:
+                    detail_logger.debug(f"_set_font_on_shape: Exception verworfen: {_e!r}")
+        except Exception as _e:
+            detail_logger.debug(f"_set_font_on_shape: Exception verworfen: {_e!r}")
         return
 
     if shape_type == MSO_SMARTART:
@@ -1771,24 +1913,24 @@ def _set_font_on_shape(shape, font_name: str) -> None:
             for node in shape.SmartArt.Nodes:
                 try:
                     _apply_smartart_node(node, font_name)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as _e:
+                    detail_logger.debug(f"_set_font_on_shape: Exception verworfen: {_e!r}")
+        except Exception as _e:
+            detail_logger.debug(f"_set_font_on_shape: Exception verworfen: {_e!r}")
         return
 
     try:
         tef = shape.TextEffect
         if tef is not None:
             tef.FontName = font_name
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_set_font_on_shape: Exception verworfen: {_e!r}")
 
     try:
         if shape.HasTextFrame:
             _set_font_on_range(shape.TextFrame.TextRange, font_name)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_set_font_on_shape: Exception verworfen: {_e!r}")
 
 
 def _process_footnotes_endnotes(doc, font_name: str) -> None:
@@ -1796,18 +1938,18 @@ def _process_footnotes_endnotes(doc, font_name: str) -> None:
         for fn in doc.Footnotes:
             try:
                 _set_font_on_range(fn.Range, font_name)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _e:
+                detail_logger.debug(f"_process_footnotes_endnotes: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_process_footnotes_endnotes: Exception verworfen: {_e!r}")
     try:
         for en in doc.Endnotes:
             try:
                 _set_font_on_range(en.Range, font_name)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _e:
+                detail_logger.debug(f"_process_footnotes_endnotes: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_process_footnotes_endnotes: Exception verworfen: {_e!r}")
 
 
 def _process_content_controls(doc, font_name: str) -> None:
@@ -1815,10 +1957,10 @@ def _process_content_controls(doc, font_name: str) -> None:
         for cc in doc.ContentControls:
             try:
                 _set_font_on_range(cc.Range, font_name)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _e:
+                detail_logger.debug(f"_process_content_controls: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_process_content_controls: Exception verworfen: {_e!r}")
 
 
 def _process_revisions(doc, font_name: str) -> None:
@@ -1826,10 +1968,10 @@ def _process_revisions(doc, font_name: str) -> None:
         for rev in doc.Revisions:
             try:
                 _set_font_on_range(rev.Range, font_name)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _e:
+                detail_logger.debug(f"_process_revisions: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_process_revisions: Exception verworfen: {_e!r}")
 
 
 # ==================================================================
@@ -1859,10 +2001,10 @@ def is_locked_by_other(path: str) -> bool:
                 try:
                     if os.path.exists(prepare_long_path(owner)):
                         return True
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                except Exception as _e:
+                    detail_logger.debug(f"is_locked_by_other: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"is_locked_by_other: Exception verworfen: {_e!r}")
 
     try:
         h = win32file.CreateFile(
@@ -1878,15 +2020,15 @@ def is_locked_by_other(path: str) -> bool:
         )
         try:
             h.Close()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"is_locked_by_other: Exception verworfen: {_e!r}")
         return False
     except pywintypes.error as e:
         try:
             if e.winerror == ERROR_SHARING_VIOLATION:
                 return True
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"is_locked_by_other: Exception verworfen: {_e!r}")
         return False
     except Exception:
         return False
@@ -1995,8 +2137,8 @@ def replace_fonts_in_document_com(
             try:
                 current_mode = os.stat(temp_path).st_mode
                 os.chmod(temp_path, current_mode | stat.S_IWRITE)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
             file_path    = temp_path
             is_temp_copy = True
             detail_logger.debug(f"Temp-Kopie: {temp_path}")
@@ -2009,8 +2151,8 @@ def replace_fonts_in_document_com(
                     safe_ro = prepare_long_path(original_path)
                     current_mode = os.stat(safe_ro).st_mode
                     os.chmod(safe_ro, current_mode & ~stat.S_IWRITE)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
             return "ERROR"
 
     try:
@@ -2119,8 +2261,8 @@ def replace_fonts_in_document_com(
             if is_temp_copy and os.path.exists(file_path):
                 try:
                     os.remove(file_path)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
                 is_temp_copy = False
 
             file_path     = temp_stage1_path
@@ -2162,15 +2304,15 @@ def replace_fonts_in_document_com(
 
         try:
             doc.RemovePersonalInformation = False
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
 
         orig_track_revisions = False
         try:
             orig_track_revisions = doc.TrackRevisions
             doc.TrackRevisions   = False
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
 
         # Setup-Aenderungen (RemovePersonalInformation=False,
         # TrackRevisions=False) neutralisieren: Ab hier zaehlt das
@@ -2179,8 +2321,8 @@ def replace_fonts_in_document_com(
         # fuer die Unveraendert-Erkennung vor dem Speichern.
         try:
             doc.Saved = True
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
 
         if 2 in metadata_types:
             try:
@@ -2215,8 +2357,8 @@ def replace_fonts_in_document_com(
         for style in doc.Styles:
             try:
                 _set_all_font_names(style.Font, font_name)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
 
         # ── 2. Story Ranges + ShapeRange + InlineShapes ───────────────────
         for story in doc.StoryRanges:
@@ -2228,10 +2370,10 @@ def replace_fonts_in_document_com(
                     for shape in current.ShapeRange:
                         try:
                             _set_font_on_shape(shape, font_name)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                        except Exception as _e:
+                            detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
+                except Exception as _e:
+                    detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
 
                 try:
                     for ishape in current.InlineShapes:
@@ -2240,23 +2382,23 @@ def replace_fonts_in_document_com(
                                 for node in ishape.SmartArt.Nodes:
                                     try:
                                         _apply_smartart_node(node, font_name)
-                                    except Exception:
-                                        pass
+                                    except Exception as _e:
+                                        detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
                             else:
                                 try:
                                     if ishape.HasTextFrame:
                                         _set_font_on_range(
                                             ishape.TextFrame.TextRange, font_name)
-                                except Exception:
-                                    pass
+                                except Exception as _e:
+                                    detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
                                 try:
                                     _set_font_on_range(ishape.Range, font_name)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                                except Exception as _e:
+                                    detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
+                        except Exception as _e:
+                            detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
+                except Exception as _e:
+                    detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
 
                 try:
                     current = current.NextStoryRange
@@ -2267,8 +2409,8 @@ def replace_fonts_in_document_com(
         for table in doc.Tables:
             try:
                 _set_font_on_range(table.Range, font_name)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
 
         # ── 4. Fuß- und Endnoten ──────────────────────────────────────────
         _process_footnotes_endnotes(doc, font_name)
@@ -2285,8 +2427,8 @@ def replace_fonts_in_document_com(
             for comment in doc.Comments:
                 try:
                     _set_font_on_range(comment.Range, font_name)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
 
         detail_logger.debug("Schriftarten ersetzt")
 
@@ -2301,8 +2443,8 @@ def replace_fonts_in_document_com(
         # ── 9. TrackRevisions zurücksetzen (NACH Metadaten, VOR Save) ─────
         try:
             doc.TrackRevisions = orig_track_revisions
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
 
         # ── 9.5. Unveraendert-Erkennung ───────────────────────────────────
         # Word pflegt das Dirty-Flag selbst: Ist nach Font-Pass und
@@ -2421,8 +2563,8 @@ def replace_fonts_in_document_com(
                     try:
                         current_mode = os.stat(safe_orig).st_mode
                         os.chmod(safe_orig, current_mode | stat.S_IWRITE)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
                 # Atomare Ersetzung: Staging-Kopie auf dem Zielvolume +
                 # os.replace. Das Original bleibt bei jedem Fehlschlag
                 # unveraendert erhalten.
@@ -2502,8 +2644,8 @@ def replace_fonts_in_document_com(
                         try:
                             current_mode = os.stat(safe_orig).st_mode
                             os.chmod(safe_orig, current_mode | stat.S_IWRITE)
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
                         _robust_remove(safe_orig, op_name="Alte-doc-Loeschung")
                         detail_logger.debug(f"Alte Datei gelöscht: {original_path}")
                     except Exception as e_del:
@@ -2560,8 +2702,8 @@ def replace_fonts_in_document_com(
                     try:
                         current_mode = os.stat(safe_orig).st_mode
                         os.chmod(safe_orig, current_mode | stat.S_IWRITE)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
                 # Atomare Ersetzung: das Original bleibt auch bei einem
                 # Abbruch mitten im Kopiervorgang unveraendert erhalten.
                 _replace_file_atomic(file_path, safe_orig,
@@ -2627,8 +2769,18 @@ def replace_fonts_in_document_com(
                         if not _is_av_lock_error(e_utime):
                             break
                 if ts_last_exc is not None:
-                    detail_logger.warning(
-                        f"Zeitstempel nicht wiederherstellbar: {ts_last_exc}")
+                    # Rueckfall auf os.utime: erhaelt Zugriffs- und
+                    # Aenderungszeit (nicht die Erstellungszeit), aber das
+                    # ist deutlich besser als der vollstaendige Verlust
+                    # des Datums. Bisher hatte nur 5_OCR_PDF.py diesen
+                    # Rueckfall.
+                    if not _utime_rueckfall(ts_target, orig_times):
+                        detail_logger.warning(
+                            f"Zeitstempel nicht wiederherstellbar: {ts_last_exc}")
+                    else:
+                        detail_logger.info(
+                            "Zeitstempel über os.utime-Rückfall gesetzt "
+                            "(ohne Erstellungszeit).")
 
         _flags = []
         if was_converted:
@@ -2671,27 +2823,27 @@ def replace_fonts_in_document_com(
         if doc is not None:
             try:
                 doc.Close(SaveChanges=COM_FALSE)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
         if is_temp_copy and os.path.exists(file_path):
             try:
                 os.remove(file_path)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
         if (temp_stage1_path is not None
                 and os.path.exists(temp_stage1_path)
                 and temp_stage1_path not in _preserved_temp_files):
             try:
                 os.remove(temp_stage1_path)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
         if (temp_stage2_path is not None
                 and os.path.exists(temp_stage2_path)
                 and temp_stage2_path not in _preserved_temp_files):
             try:
                 os.remove(temp_stage2_path)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
         if was_read_only:
             ro_candidates = []
             if was_converted and new_path:
@@ -2873,32 +3025,32 @@ def process_directory(
 
         try:
             _original_screen_updating = word.ScreenUpdating
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_start_word: Exception verworfen: {_e!r}")
         try:
             _original_pagination = word.Options.Pagination
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_start_word: Exception verworfen: {_e!r}")
         try:
             _original_spell_check = word.Options.CheckSpellingAsYouType
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_start_word: Exception verworfen: {_e!r}")
         try:
             _original_grammar_check = word.Options.CheckGrammarAsYouType
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_start_word: Exception verworfen: {_e!r}")
         try:
             _original_background_save = word.Options.BackgroundSave
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_start_word: Exception verworfen: {_e!r}")
         try:
             _original_update_links = word.Options.UpdateLinksAtOpen
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_start_word: Exception verworfen: {_e!r}")
         try:
             _original_no_prompt_convert = word.Options.DoNotPromptForConvert
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_start_word: Exception verworfen: {_e!r}")
 
         word.Visible            = COM_FALSE
         word.DisplayAlerts      = COM_FALSE
@@ -2907,20 +3059,20 @@ def process_directory(
 
         try:
             word.Options.Pagination = False
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_start_word: Exception verworfen: {_e!r}")
         try:
             word.Options.CheckSpellingAsYouType = False
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_start_word: Exception verworfen: {_e!r}")
         try:
             word.Options.CheckGrammarAsYouType = False
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_start_word: Exception verworfen: {_e!r}")
         try:
             word.Options.BackgroundSave = False
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_start_word: Exception verworfen: {_e!r}")
         # Dialog-Quellen deaktivieren, vor denen der Watchdog schuetzt:
         # automatisches Verknuepfungs-Update und der Konvertierungs-Dialog
         # beim Oeffnen alter Formate. Bisher setzte das nur der Smoke-Test
@@ -2928,12 +3080,12 @@ def process_directory(
         # Word-Neustart. Restore via _restore_word_settings.
         try:
             word.Options.UpdateLinksAtOpen = False
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_start_word: Exception verworfen: {_e!r}")
         try:
             word.Options.DoNotPromptForConvert = True
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_start_word: Exception verworfen: {_e!r}")
 
     try:
         _start_word()
@@ -2960,8 +3112,8 @@ def process_directory(
                         )
                         try:
                             word.Quit()
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
                     _kill_specific_word()
                     word = None
                     word_app_global = None
@@ -3059,20 +3211,20 @@ def process_directory(
             try:
                 word.Quit()
                 time.sleep(1)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
         _kill_specific_word()
         _safe_cleanup_temp_process()
         # Office-INetCache (Content.Word/MSO) und Windows-Recent (.lnk)
         # aufraeumen - analog zu 3a/3b/3c. Beide best effort, fehlertolerant.
         try:
             _cleanup_word_inetcache()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
         try:
             _cleanup_user_recent()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
 
     return stats
 
@@ -3260,10 +3412,7 @@ if __name__ == "__main__":
             log_error("GLOBAL", e)
         print(f"\n  Dauer:       {str(datetime.now() - dr_start).split('.')[0]}")
         print(f"  Detail-Log:  {os.path.abspath(DETAILED_LOG_FILE)}")
-        try:
-            input("\nBeliebige Taste drücken, um das Fenster zu schließen ...")
-        except EOFError:
-            pass
+        _warte_auf_taste(auto_mode)
         sys.exit(0)
 
     # --- Word Smoke-Test (nach Bestaetigung, vor Hauptlauf) ---
@@ -3308,6 +3457,21 @@ if __name__ == "__main__":
             log_warn_text = "Abbruch durch Benutzer nach Smoke-Test-Warnung."
             log_ignore_text = "Smoke-Test-Warnung vom Benutzer ignoriert – Fortsetzung."
 
+        # Im Automatikmodus darf hier NICHT gefragt werden. ask_yes_no()
+        # blockiert an input(): bei einem geplanten Task mit geschlossenem
+        # stdin lieferte es default_yes=False und beendete den Lauf mit
+        # sys.exit(0) - der Taskplaner meldete Erfolg, obwohl keine einzige
+        # Datei angefasst wurde. Haengt stdin dagegen an einer Konsole oder
+        # Pipe, blieb der Task unbegrenzt an der Rueckfrage stehen. Beides
+        # widerspricht der eigenen Hilfe zu --auto ('Trust-Center-Check und
+        # interaktive Rueckfragen ueberspringen'). Die Schwesterskripte
+        # machen es richtig: 3a steigt mit exit 2 aus, 4b kapselt den Block.
+        # Exit-Code 2 (nicht 0), damit der Taskplaner den Fehlschlag sieht.
+        if auto_mode:
+            print("\n❌  Abbruch im AUTO-Modus nach fehlgeschlagenem Trust-Center-Test.")
+            file_logger.error("Abbruch (auto_mode) nach fehlgeschlagenem Trust-Center-Test.")
+            sys.exit(2)
+
         if not ask_yes_no("\nTrotzdem fortfahren? (Timeout-Risiko pro Datei!)",
                           default_yes=False):
             print("Abgebrochen.")
@@ -3320,6 +3484,21 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGINT,  _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
+
+    # --- Einzelinstanz-Schutz ---
+    # Diese Sperre gab es bisher nur in 3a-3c. Ohne sie konnten zwei
+    # Laeufe gleichzeitig ueber denselben Bestand gehen und sich
+    # gegenseitig die Temp-Kopien und Zieldateien wegziehen.
+    # Freigabe ueber atexit, damit sie auch bei sys.exit greift.
+    _sperre = None
+    if gem is not None:
+        _sperre = gem.Einzelinstanz("4a_ersetze_font_in_word")
+        if not _sperre.belegen():
+            print(_sperre.hinweis())
+            sys.exit(1)
+        import atexit
+        atexit.register(_sperre.freigeben)
+
     pythoncom.CoInitialize()
 
     # Restore-Privilegien (Admin-Kontext) für ACL/Owner-Erhalt aktivieren.
@@ -3403,7 +3582,4 @@ if __name__ == "__main__":
 
     _safe_cleanup_temp_process()
     _cleanup_windows_temp()
-    try:
-        input("\nBeliebige Taste drücken, um das Fenster zu schließen ...")
-    except EOFError:
-        pass
+    _warte_auf_taste(auto_mode)

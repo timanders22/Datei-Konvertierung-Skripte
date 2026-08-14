@@ -1,4 +1,25 @@
-﻿# ==================================================================
+﻿
+# ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Bindet _gemeinsam.psm1 ein, wenn vorhanden. Die eingebauten Kopien der
+# Helfer bleiben bestehen und ueberschreiben das Modul absichtlich - so
+# bleibt jedes Skript einzeln lauffaehig und die ps2exe-Uebersetzung
+# funktioniert unveraendert. Genutzt wird das Modul fuer das gemeinsame
+# Laufprotokoll (migration.jsonl) und die zentralen Verzeichnis-Presets
+# aus pfade.json.
+$script:GemeinsamGeladen = $false
+try {
+    $gemModul = Join-Path $PSScriptRoot '_gemeinsam.psm1'
+    if (Test-Path -LiteralPath $gemModul) {
+        Import-Module $gemModul -Force -DisableNameChecking -ErrorAction Stop
+        $script:GemeinsamGeladen = $true
+    }
+} catch {
+    # Ohne Modul laeuft das Skript mit seinen eingebauten Helfern weiter.
+}
+
+# ==================================================================
 # VERSCHIEBEN VON VERZEICHNISSEN UND DATEIEN AUF GOOGLE DRIVE (G:)
 # ------------------------------------------------------------------
 # Stand   : 12.06.2026
@@ -362,10 +383,13 @@ function Invoke-WithRetry {
     }
 }
 
-function Test-FileLock {
-    param([string]$LongPath)
+function Test-FileIsLocked {
+    # Parameter heisst -Path wie in 2a, 2b und 2c. Vorher -LongPath:
+    # derselbe Zweck unter anderem Namen, was den Vergleich zwischen den
+    # Skripten unnoetig erschwerte.
+    param([string]$Path)
     try {
-        $fs = [System.IO.File]::Open($LongPath,
+        $fs = [System.IO.File]::Open($Path,
             [System.IO.FileMode]::Open,
             [System.IO.FileAccess]::Read,
             [System.IO.FileShare]::None)
@@ -376,14 +400,15 @@ function Test-FileLock {
     }
 }
 
-function Wait-ForFileUnlock {
+function Wait-FileAvailable {
+    # Ebenfalls -Path statt -LongPath (siehe Test-FileIsLocked).
     param(
-        [string]$LongPath,
+        [string]$Path,
         [int]$MaxWaitSeconds = 30
     )
     $waited = 0
     $delay  = 1
-    while (Test-FileLock -LongPath $LongPath) {
+    while (Test-FileIsLocked -Path $Path) {
         if ($waited -ge $MaxWaitSeconds) { return $false }
         Start-Sleep -Seconds $delay
         $waited += $delay
@@ -477,6 +502,41 @@ function Get-FilesStreaming {
             } catch { continue }
         }
     }
+}
+
+function Get-RemainingExcludedDir {
+    <#
+    .SYNOPSIS
+        Noch vorhandene ausgeschlossene Verzeichnisse unterhalb von RootPath.
+    .DESCRIPTION
+        Wird nach dem /MIR-Purge gebraucht. Was dort stehen geblieben ist,
+        wurde per /XD bewusst NICHT kopiert (NAS-Schattenkopien, Papierkorb,
+        Systemordner) und darf deshalb auch nicht geloescht werden -- es ist
+        aber der Grund, warum der Quellordner nicht leer ist, und gehoert
+        darum ins Protokoll statt in ein rekursives Force-Delete.
+    #>
+    param([string]$RootPath)
+
+    $found = New-Object System.Collections.Generic.List[string]
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push((Add-LongPathPrefix $RootPath))
+    while ($stack.Count -gt 0) {
+        $current = $stack.Pop()
+        $subs = $null
+        try { $subs = [System.IO.Directory]::EnumerateDirectories($current) } catch { continue }
+        foreach ($sub in $subs) {
+            try {
+                if ($script:ExcludedDirNames -contains ([System.IO.Path]::GetFileName($sub))) {
+                    $found.Add((Remove-LongPathPrefix $sub))
+                    continue   # nicht hineinsteigen: der Inhalt bleibt ohnehin
+                }
+                # Reparse-Punkte nicht betreten (Schleifengefahr).
+                if (Test-IsReparsePoint (New-Object System.IO.DirectoryInfo($sub))) { continue }
+                $stack.Push($sub)
+            } catch { continue }
+        }
+    }
+    return $found
 }
 
 function ConvertTo-CsvField {
@@ -1073,7 +1133,7 @@ function Compare-FileExistence {
     $srcRoot  = $SourceRoot.TrimEnd('\')
     $dstRoot  = $DestRoot.TrimEnd('\')
     $okPaths  = New-Object System.Collections.Generic.List[string]
-    $counters = @{ Match = 0; Mismatch = 0; Missing = 0; Error = 0; Total = 0; Bytes = [long]0 }
+    $counters = @{ Match = 0; Mismatch = 0; Missing = 0; Error = 0; Total = 0; Bytes = [long]0; Placeholder = 0 }
 
     Write-Host "  Sammle Quelldateien (gestreamt) ..."
 
@@ -1132,6 +1192,32 @@ function Compare-FileExistence {
                     return
                 }
 
+                # Cloud-Platzhalter erkennen, BEVOR die Datei als geprueft
+                # gilt. Google Drive for Desktop (und OneDrive) legen
+                # Platzhalter an, die die volle Groesse melden, obwohl der
+                # Inhalt noch nicht oben ist. Der Light-Check haette solche
+                # Dateien als "OK" gewertet - und die Quelle wird auf genau
+                # dieser Grundlage geloescht. Beim CRC-Verfahren faellt das
+                # nicht an, weil das Lesen den Download erzwingt.
+                #   0x00400000 FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+                #   0x00040000 FILE_ATTRIBUTE_RECALL_ON_OPEN
+                #   0x00001000 FILE_ATTRIBUTE_OFFLINE
+                $placeholderMask = 0x00400000 -bor 0x00040000 -bor 0x00001000
+                $isPlaceholder   = $false
+                try {
+                    $isPlaceholder = ((([int]$dstInfo.Attributes) -band $placeholderMask) -ne 0)
+                } catch { }
+
+                if ($isPlaceholder) {
+                    $writer.WriteLine("{0},{1},{2},{3}" -f `
+                        (ConvertTo-CsvField $rel), `
+                        (ConvertTo-CsvField 'PLATZHALTER'), `
+                        (ConvertTo-CsvField $srcItem.Length), `
+                        (ConvertTo-CsvField "$dstSize (nur Platzhalter - Inhalt nicht lokal verfuegbar)"))
+                    $counters.Placeholder++
+                    return
+                }
+
                 if ($srcItem.Length -eq $dstSize) {
                     $writer.WriteLine("{0},{1},{2},{3}" -f `
                         (ConvertTo-CsvField $rel), `
@@ -1163,7 +1249,8 @@ function Compare-FileExistence {
         return @{ Counters = $counters; OkPaths = $okPaths }
     }
 
-    $allOk = ($counters.Mismatch -eq 0 -and $counters.Missing -eq 0 -and $counters.Error -eq 0)
+    $allOk = ($counters.Mismatch -eq 0 -and $counters.Missing -eq 0 -and
+              $counters.Error -eq 0 -and $counters.Placeholder -eq 0)
     if ($allOk) {
         Write-Host "  Light-Check: Alle $($counters.Match) Dateien im Ziel vorhanden (Groesse identisch)." -ForegroundColor Green
     } else {
@@ -1172,6 +1259,13 @@ function Compare-FileExistence {
         if ($counters.Mismatch -gt 0) { Write-Host "    GROESSE ABWEICHEND:    $($counters.Mismatch)" -ForegroundColor Red }
         if ($counters.Missing  -gt 0) { Write-Host "    FEHLT IM ZIEL:         $($counters.Missing)"  -ForegroundColor Red }
         if ($counters.Error    -gt 0) { Write-Host "    LESEFEHLER:            $($counters.Error)"    -ForegroundColor Yellow }
+        if ($counters.Placeholder -gt 0) {
+            Write-Host "    NUR PLATZHALTER:       $($counters.Placeholder)" -ForegroundColor Yellow
+            Write-Host "      Diese Dateien melden zwar die richtige Groesse, ihr Inhalt ist aber" -ForegroundColor DarkYellow
+            Write-Host "      noch nicht in der Cloud. Sie gelten als NICHT verifiziert und werden" -ForegroundColor DarkYellow
+            Write-Host "      in der Quelle behalten. Entweder spaeter erneut pruefen oder das" -ForegroundColor DarkYellow
+            Write-Host "      CRC-Verfahren waehlen - dessen Lesevorgang erzwingt den Abgleich." -ForegroundColor DarkYellow
+        }
         Write-Host "    Details: $ReportFile"
     }
 
@@ -2070,6 +2164,12 @@ if ($MethodChoice -eq "1") {
                 Write-Warning "Fehler beim Ersetzen der Log-Datei: $_"
             }
         }
+        # Zwischendatei bei Fehlschlag entfernen. Sie blieb sonst als
+        # '<log>.log.tmp' neben dem Protokoll liegen und wurde von keinem
+        # Aufraeumpfad erfasst - bei jedem gescheiterten Lauf eine weitere.
+        if (Test-Path -LiteralPath $tmpFile) {
+            Remove-Item -LiteralPath $tmpFile -Force -ErrorAction SilentlyContinue
+        }
     }
 
     # --- Probelauf: hier ist Schluss ---
@@ -2169,6 +2269,8 @@ if ($MethodChoice -eq "1") {
     Write-Host "  [2] Light-Check (Existenz + Dateigroesse, schnell)"
     Write-Host "      -- prueft fuer jede Quelldatei, ob sie im Ziel liegt"
     Write-Host "      -- vergleicht nur die Dateigroesse, nicht den Inhalt"
+    Write-Host "      -- Cloud-Platzhalter werden erkannt und gelten als NICHT geprueft"
+    Write-Host "         (sie melden die volle Groesse, obwohl der Inhalt fehlt)"
     Write-Host "      -- empfohlen, wenn der CRC-Check zu lange dauern wuerde"
     Write-Host ""
     Write-Host "  [3] Keine Verifikation (nur bei RoboExit < 4 erlaubtes Komplett-Loeschen)"
@@ -2190,7 +2292,10 @@ if ($MethodChoice -eq "1") {
             $csData     = Compare-FileChecksums -SourceRoot $SourcePath -DestRoot $FinalDest -ReportFile $ChecksumFile -LogFile $LogFile -SkipReparsePoints $SkipReparsePoints
             $csCounters = $csData.Counters
             $csOkPaths  = $csData.OkPaths
-            $csProblems = $csCounters.Mismatch + $csCounters.Missing + $csCounters.Error
+            # Platzhalter zaehlen als Problem: nur so bleiben sie beim
+            # partiellen Loeschen in der Quelle erhalten.
+            $csPlaceholder = if ($null -ne $csCounters.Placeholder) { $csCounters.Placeholder } else { 0 }
+            $csProblems = $csCounters.Mismatch + $csCounters.Missing + $csCounters.Error + $csPlaceholder
         }
         "2" {
             $verifyMode = "LIGHT"
@@ -2199,7 +2304,10 @@ if ($MethodChoice -eq "1") {
             $csData     = Compare-FileExistence -SourceRoot $SourcePath -DestRoot $FinalDest -ReportFile $LightCheckFile -LogFile $LogFile -SkipReparsePoints $SkipReparsePoints
             $csCounters = $csData.Counters
             $csOkPaths  = $csData.OkPaths
-            $csProblems = $csCounters.Mismatch + $csCounters.Missing + $csCounters.Error
+            # Platzhalter zaehlen als Problem: nur so bleiben sie beim
+            # partiellen Loeschen in der Quelle erhalten.
+            $csPlaceholder = if ($null -ne $csCounters.Placeholder) { $csCounters.Placeholder } else { 0 }
+            $csProblems = $csCounters.Mismatch + $csCounters.Missing + $csCounters.Error + $csPlaceholder
         }
         "3" {
             $verifyMode = "NONE"
@@ -2311,15 +2419,75 @@ if ($MethodChoice -eq "1") {
 
             $srcLong = Add-LongPathPrefix (Join-Path $SourcePath $rel)
             try {
-                if (Test-FileLock -LongPath $srcLong) {
-                    [void](Wait-ForFileUnlock -LongPath $srcLong -MaxWaitSeconds 30)
+                if (Test-FileIsLocked -Path $srcLong) {
+                    [void](Wait-FileAvailable -Path $srcLong -MaxWaitSeconds 30)
                 }
+                # [System.IO.File]::Delete statt Remove-Item: die
+                # Provider-Cmdlets von PowerShell 5.1 behandeln
+                # '\\?\'-Praefixe unzuverlaessig. Hier waere die Folge,
+                # dass eine bereits ins Ziel kopierte Datei in der Quelle
+                # liegenbleibt und der Lauf sie als Fehler meldet -
+                # ausgerechnet bei den langen Pfaden, fuer die der
+                # Praefix ueberhaupt eingefuehrt wurde.
+                # Schreibschutz VOR dem Loeschen abraeumen. Auf einer Datei mit
+                # gesetztem ReadOnly-Attribut wirft [System.IO.File]::Delete
+                # eine UnauthorizedAccessException (nachgestellt). Test-
+                # FileIsLocked schlaegt nicht an, weil es nur mit
+                # FileAccess::Read oeffnet - schreibgeschuetzte Dateien gelten
+                # dort korrekt als 'nicht gesperrt'. Invoke-WithRetry
+                # wiederholte den Aufruf dann fuenfmal mit 1+2+4+8 Sekunden
+                # Pause, obwohl ein Attributproblem durch Warten nicht
+                # verschwindet: rund 15 s Leerlauf je Datei, danach 'Zugriff
+                # verweigert', und die im Ziel nachweislich angekommene Datei
+                # blieb in der Quelle liegen. Der Vollloesch-Zweig ueber
+                # robocopy /MIR ist davon nicht betroffen - beide Wege
+                # verhielten sich also unterschiedlich, obwohl beide 'Quelle
+                # loeschen' heissen. Import-Timestamps macht es an anderer
+                # Stelle bereits genauso vor.
+                try {
+                    $srcAttr = [System.IO.File]::GetAttributes($srcLong)
+                    if ($srcAttr -band [System.IO.FileAttributes]::ReadOnly) {
+                        [System.IO.File]::SetAttributes(
+                            $srcLong,
+                            ($srcAttr -band (-bnot [System.IO.FileAttributes]::ReadOnly)))
+                    }
+                } catch {
+                    Write-Verbose "Schreibschutz nicht abraeumbar: $srcLong - $_"
+                }
+                # MaxAttempts bewusst niedrig: Nachdem der Schreibschutz oben
+                # abgeraeumt ist, deutet eine verbleibende
+                # UnauthorizedAccessException auf ein echtes Rechteproblem hin,
+                # das durch Warten nicht besser wird. Ein Versuch Wiederholung
+                # bleibt fuer den kurzlebigen Fall (AV-Scanner haelt die Datei
+                # noch); die vollen fuenf Versuche kosteten je Datei rund 15 s
+                # Leerlauf - bei 5.000 betroffenen Dateien ueber 20 Stunden,
+                # in denen nichts geloescht wird.
                 Invoke-WithRetry -ScriptBlock {
-                    Remove-Item -LiteralPath $srcLong -Force -ErrorAction Stop
-                } | Out-Null
+                    [System.IO.File]::Delete($srcLong)
+                } -MaxAttempts 2 | Out-Null
                 $delOk++
+                # Gemeinsames Laufprotokoll: bewusst NUR die Loeschungen
+                # und Fehler, nicht jede gepruefte Datei. Bei einem
+                # Bestand in Millionenhoehe waere ein Eintrag je Pruefung
+                # eine Protokolldatei von hunderten Megabyte - der
+                # Loeschvorgang dagegen ist der Schritt, den man
+                # spaeter tatsaechlich nachvollziehen will.
+                if ($script:GemeinsamGeladen) {
+                    try {
+                        Write-Laufprotokoll -Skript '8_verschieben_auf_Google_Drive' `
+                            -Pfad $srcLong -Aktion 'Quelle geloescht' `
+                            -Status 'OK' -Detail "verifiziert per $verifyMode"
+                    } catch { }
+                }
             } catch {
                 $DeleteErrors.Add("Dateifehler: $_")
+                if ($script:GemeinsamGeladen) {
+                    try {
+                        Write-Laufprotokoll -Skript '8_verschieben_auf_Google_Drive' `
+                            -Pfad $srcLong -Aktion 'Quelle geloescht' `
+                            -Status 'FEHLER' -Detail ([string]$_)
+                    } catch { }
+                }
             }
         }
 
@@ -2327,9 +2495,19 @@ if ($MethodChoice -eq "1") {
         $allDirs = New-Object System.Collections.Generic.List[string]
         Get-FilesStreaming -RootPath $SourcePath -SkipReparsePoints $SkipReparsePoints -IncludeDirectories |
             ForEach-Object { $allDirs.Add($_.FullName) }
+        # Nach VERZEICHNISTIEFE absteigend, nicht nach Pfadlaenge. Die
+        # Laenge korreliert meist mit der Tiefe, garantiert sie aber nicht:
+        # ein tiefer Ordner mit kurzen Namen kam sonst vor seinem
+        # flacheren Geschwister mit langem Namen an die Reihe. Da
+        # Directory.Delete(...,$false) nur leere Ordner entfernt und
+        # Fehler verschluckt werden, blieben in solchen Faellen einzelne
+        # leere Ordner zurueck.
         $allDirs.Sort([System.Collections.Generic.Comparer[string]]::Create({
             param($a, $b)
-            $b.Length.CompareTo($a.Length)
+            $da = ($a -split '\\').Count
+            $db = ($b -split '\\').Count
+            if ($da -ne $db) { return $db.CompareTo($da) }
+            return $b.CompareTo($a)
         }))
         foreach ($dirFull in $allDirs) {
             if (Test-ShouldStop) { break }
@@ -2409,21 +2587,92 @@ if ($MethodChoice -eq "1") {
                 $DeleteErrors.Add("Kein Arbeitsverzeichnis fuer den Loeschvorgang verfuegbar (alle Kandidaten liegen in der Quelle oder sind nicht beschreibbar).")
             }
             if ($DeleteErrors.Count -eq 0) {
-                $mirrorArgs = @($emptyDir, $SourcePath, "/MIR", "/R:5", "/W:5", "/NP", "/NFL", "/NDL", "/NJH", "/NJS", "/XD") + $ExcludedDirNames
-                if ($SkipReparsePoints) { $mirrorArgs += "/XJ" }
-                & robocopy $mirrorArgs | Out-Null
-                if ($LASTEXITCODE -ge 8) {
-                    $label = if ($isRootPath) { "Root" } else { "Unterordner" }
-                    $DeleteErrors.Add("Robocopy Mirror-Fehler bei $label-Loeschen (Exit-Code $LASTEXITCODE)")
+                # robocopy /MIR beachtet /XD beim Purge NUR fuer Verzeichnisse
+                # unmittelbar in der Wurzel. Liegt ein ausgeschlossenes
+                # Verzeichnis tiefer (z. B. Q:\Abteilung\Unterordner\~snapshot),
+                # gilt der ganze Ast 'Unterordner' als ueberzaehlig und wird
+                # samt Snapshot geloescht -- auch wenn der Vollpfad zusaetzlich
+                # in /XD steht (beides nachgestellt). Diese Verzeichnisse wurden
+                # per /XD nie kopiert, tauchen in keiner Verifikation auf und
+                # waeren damit endgueltig verloren. Darum vorher pruefen und in
+                # diesem Fall ueber die skripteigene Aufzaehlung loeschen, die
+                # die Ausschlussliste auf JEDER Ebene beachtet.
+                $srcRoot = $SourcePath.TrimEnd('\')
+                $nestedExcluded = @(
+                    Get-RemainingExcludedDir -RootPath $SourcePath |
+                        Where-Object { (Split-Path $_ -Parent).TrimEnd('\') -ne $srcRoot }
+                )
+                if ($nestedExcluded.Count -gt 0) {
+                    Write-Host "  $($nestedExcluded.Count) ausgeschlossene(r) Systemordner liegt/liegen unterhalb der Wurzel." -ForegroundColor Yellow
+                    Write-Host "  Der schnelle Robocopy-Purge wuerde sie mitloeschen -- es wird stattdessen" -ForegroundColor Yellow
+                    Write-Host "  dateiweise geloescht. Das dauert laenger, verschont sie aber zuverlaessig." -ForegroundColor Yellow
+                    Add-LogLine -Path $LogFile -Message "[$(Get-Date)] HINWEIS: Robocopy-Purge uebersprungen, $($nestedExcluded.Count) verschachtelte(r) ausgeschlossene(r) Ordner: $($nestedExcluded -join '; ')" `
+                                -Encoding ([System.Text.Encoding]::Unicode)
+                    $purgeErrors = 0
+                    Get-FilesStreaming -RootPath $SourcePath -SkipReparsePoints $SkipReparsePoints -IncludeFiles |
+                        ForEach-Object {
+                            if (Test-ShouldStop) { return }
+                            try {
+                                [System.IO.File]::Delete((Add-LongPathPrefix (Remove-LongPathPrefix $_.FullName)))
+                            } catch { $purgeErrors++ }
+                        }
+                    if ($purgeErrors -gt 0) {
+                        $DeleteErrors.Add("$purgeErrors Datei(en) konnten beim Loeschen der Quelle nicht entfernt werden.")
+                    }
+                } else {
+                    $mirrorArgs = @($emptyDir, $SourcePath, "/MIR", "/R:5", "/W:5", "/NP", "/NFL", "/NDL", "/NJH", "/NJS", "/XD") + $ExcludedDirNames
+                    if ($SkipReparsePoints) { $mirrorArgs += "/XJ" }
+                    & robocopy $mirrorArgs | Out-Null
+                    if ($LASTEXITCODE -ge 8) {
+                        $label = if ($isRootPath) { "Root" } else { "Unterordner" }
+                        $DeleteErrors.Add("Robocopy Mirror-Fehler bei $label-Loeschen (Exit-Code $LASTEXITCODE)")
+                    }
                 }
                 if (-not $isRootPath) {
                     # Kurz auf Filesystem-Cache-Release warten (DFS/Netzwerk haben Handle-Latenz nach robocopy /MIR).
                     Start-Sleep -Milliseconds 750
+
+                    # KEIN 'Remove-Item -Recurse -Force': der Purge oben hat die
+                    # Verzeichnisse aus $ExcludedDirNames per /XD bewusst
+                    # verschont. Ein rekursives Force-Delete wuerde genau diesen
+                    # Bestand vernichten -- Daten, die nie ins Ziel kopiert
+                    # wurden (Zeile mit /XD beim Kopieren) und die deshalb in
+                    # keiner Verifikation auftauchen koennen. Stattdessen wie im
+                    # selektiven Zweig tiefenzuerst nur LEERE Verzeichnisse
+                    # entfernen; was uebrig bleibt, ist absichtlich uebrig.
+                    $restDirs = New-Object System.Collections.Generic.List[string]
                     try {
-                        Invoke-WithRetry -ScriptBlock {
-                            Remove-Item -LiteralPath (Add-LongPathPrefix $SourcePath) -Recurse -Force -ErrorAction Stop
-                        } | Out-Null
-                    } catch { $DeleteErrors.Add("$_") }
+                        Get-FilesStreaming -RootPath $SourcePath -SkipReparsePoints $SkipReparsePoints -IncludeDirectories |
+                            ForEach-Object { $restDirs.Add($_.FullName) }
+                    } catch { $DeleteErrors.Add("Aufraeumen der Quellstruktur: $_") }
+                    $restDirs.Sort([System.Collections.Generic.Comparer[string]]::Create({
+                        param($a, $b)
+                        $da = ($a -split '\\').Count
+                        $db = ($b -split '\\').Count
+                        if ($da -ne $db) { return $db.CompareTo($da) }
+                        return $b.CompareTo($a)
+                    }))
+                    foreach ($dirFull in $restDirs) {
+                        if (Test-ShouldStop) { break }
+                        try {
+                            [System.IO.Directory]::Delete((Add-LongPathPrefix (Remove-LongPathPrefix $dirFull)), $false)
+                        } catch { }
+                    }
+
+                    try {
+                        [System.IO.Directory]::Delete((Add-LongPathPrefix $SourcePath), $false)
+                    } catch {
+                        $keptDirs = Get-RemainingExcludedDir -RootPath $SourcePath
+                        if ($keptDirs.Count -gt 0) {
+                            Write-Host "  $($keptDirs.Count) Systemordner absichtlich behalten (nie kopiert):" -ForegroundColor Yellow
+                            foreach ($k in $keptDirs) { Write-Host "    $k" -ForegroundColor Yellow }
+                            Write-Host "  Der Quellordner '$SourcePath' bleibt deshalb bestehen." -ForegroundColor Yellow
+                            Add-LogLine -Path $LogFile -Message "[$(Get-Date)] HINWEIS: $($keptDirs.Count) ausgeschlossene(r) Systemordner absichtlich behalten: $($keptDirs -join '; '). Quellordner '$SourcePath' bleibt bestehen." `
+                                        -Encoding ([System.Text.Encoding]::Unicode)
+                        } else {
+                            $DeleteErrors.Add("Quellordner konnte nicht entfernt werden: $_")
+                        }
+                    }
                 }
             }
             if ($emptyDir) {
@@ -2573,6 +2822,12 @@ if ($MethodChoice -eq "1") {
             } catch {
                 Write-Warning "Fehler beim Ersetzen der Log-Datei: $_"
             }
+        }
+        # Zwischendatei bei Fehlschlag entfernen. Sie blieb sonst als
+        # '<log>.log.tmp' neben dem Protokoll liegen und wurde von keinem
+        # Aufraeumpfad erfasst - bei jedem gescheiterten Lauf eine weitere.
+        if (Test-Path -LiteralPath $tmpFile) {
+            Remove-Item -LiteralPath $tmpFile -Force -ErrorAction SilentlyContinue
         }
     }
 

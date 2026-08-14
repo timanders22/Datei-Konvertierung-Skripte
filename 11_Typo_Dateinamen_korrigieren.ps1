@@ -39,6 +39,27 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 try { $OutputEncoding            = [System.Text.Encoding]::UTF8 } catch {}
 
+
+# ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Bindet _gemeinsam.psm1 ein, wenn vorhanden. Die eingebauten Kopien der
+# Helfer bleiben bestehen und ueberschreiben das Modul absichtlich - so
+# bleibt jedes Skript einzeln lauffaehig und die ps2exe-Uebersetzung
+# funktioniert unveraendert. Genutzt wird das Modul fuer das gemeinsame
+# Laufprotokoll (migration.jsonl) und die zentralen Verzeichnis-Presets
+# aus pfade.json.
+$script:GemeinsamGeladen = $false
+try {
+    $gemModul = Join-Path $PSScriptRoot '_gemeinsam.psm1'
+    if (Test-Path -LiteralPath $gemModul) {
+        Import-Module $gemModul -Force -DisableNameChecking -ErrorAction Stop
+        $script:GemeinsamGeladen = $true
+    }
+} catch {
+    # Ohne Modul laeuft das Skript mit seinen eingebauten Helfern weiter.
+}
+
 # ---------- Konfiguration ----------
 # Ablage der Woerterbuecher und Filterlisten. 'C:\tmp_skripte' war fest
 # verdrahtet - auf einem Rechner ohne Schreibrecht auf C:\ scheiterte
@@ -73,9 +94,32 @@ if (-not $HunspellDir) {
     Write-Host "Bitte eines dieser Verzeichnisse beschreibbar machen." -ForegroundColor Yellow
     exit 1
 }
-$NupkgUrl      = 'https://www.nuget.org/api/v2/package/NHunspell/1.2.5554.16953'
-$DicUrl        = 'https://raw.githubusercontent.com/LibreOffice/dictionaries/master/de/de_DE_frami.dic'
-$AffUrl        = 'https://raw.githubusercontent.com/LibreOffice/dictionaries/master/de/de_DE_frami.aff'
+# Bezugsquellen. Die Woerterbuecher haengen an einem COMMIT, nicht am
+# Zweig 'master': ein Commit-SHA ist unveraenderlich, der Zweig aendert
+# sich jederzeit - und damit aenderte sich unbemerkt, was als Tippfehler
+# gilt und welche Dateien dieses Skript umbenennt.
+# Stand: Commit 31bc2a11 vom 09.12.2024 (letzte Aenderung an de/).
+# Ueberschreibbar ueber pfade.json, damit fuer eine Aktualisierung nicht
+# das Skript editiert werden muss.
+$HunspellCommit = '31bc2a1104a1cd175f900902f994c76dea35c763'
+$NupkgUrl       = 'https://www.nuget.org/api/v2/package/NHunspell/1.2.5554.16953'
+$DicUrl         = "https://raw.githubusercontent.com/LibreOffice/dictionaries/$HunspellCommit/de/de_DE_frami.dic"
+$AffUrl         = "https://raw.githubusercontent.com/LibreOffice/dictionaries/$HunspellCommit/de/de_DE_frami.aff"
+
+# pfade.json hat Vorrang, wenn sie die Schluessel mitbringt.
+try {
+    $konfDatei = Join-Path $PSScriptRoot 'pfade.json'
+    if (Test-Path -LiteralPath $konfDatei) {
+        $konf = Get-Content -LiteralPath $konfDatei -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($konf.hunspell) {
+            if ($konf.hunspell.nupkg) { $NupkgUrl = [string]$konf.hunspell.nupkg }
+            if ($konf.hunspell.dic)   { $DicUrl   = [string]$konf.hunspell.dic }
+            if ($konf.hunspell.aff)   { $AffUrl   = [string]$konf.hunspell.aff }
+        }
+    }
+} catch {
+    # Kaputte oder fehlende Konfiguration: die Vorgaben oben gelten.
+}
 $MaxPathLen    = 259
 
 # Verzeichnis-Praesets fuer die Startauswahl. Leere Eintraege werden im
@@ -118,23 +162,114 @@ $CorpusMaxRareFreq     = 1    # seltenes Wort darf max. 1x vorkommen
 $CorpusMinTokenLength  = 4    # nur Tokens >= 4 Zeichen ins Vokabular
 
 # ---------- Bootstrap Hunspell ----------
+# Dateien, deren Integritaet zwingend geprueft wird. Die drei DLLs werden
+# als NATIVER CODE in den Prozess geladen; die Woerterbuecher steuern, was
+# als Tippfehler gilt und damit, welche Dateien umbenannt werden.
+$IntegrityFiles = @(
+    'NHunspell.dll', 'Hunspellx64.dll', 'Hunspellx86.dll',
+    'de_DE_frami.dic', 'de_DE_frami.aff'
+)
+
 function Test-DownloadHashes {
-    param([string]$dir)
+    <#
+        Integritaetspruefung nach dem Prinzip "beim ersten Mal festnageln"
+        (Trust On First Use).
+
+        Vorher war die Pruefung faktisch wirkungslos: sie stieg bei
+        fehlender hashes.txt sofort wieder aus - und diese Datei ist im
+        Auslieferungszustand nicht vorhanden, der Skriptkopf fuehrt sie
+        ausdruecklich als optional. Damit lief der Regelfall voellig
+        ungeprueft, obwohl anschliessend drei native DLLs per Add-Type in
+        den Prozess geladen werden.
+
+        Jetzt gilt:
+          - Fehlt hashes.txt, werden die Summen der frisch geladenen
+            Dateien EINMALIG erfasst und geschrieben. Bei interaktivem
+            Lauf wird das angezeigt und bestaetigt.
+          - Existiert sie, muss JEDE dort genannte Datei passen. Eine
+            Abweichung bricht ab, statt zu laden.
+          - Eine Datei, die in hashes.txt fehlt, aber auf der Platte
+            liegt, wird ergaenzt und gemeldet.
+
+        Damit faellt jede spaetere Veraenderung auf - der Fall, um den es
+        geht (manipulierte Neu-Ausgabe, ausgetauschte Datei im Cache).
+        Wer feste Sollwerte vorgeben will, legt hashes.txt einfach vorab
+        an: '<SHA256>  <Dateiname>' je Zeile.
+    #>
+    param(
+        [string]$dir,
+        [switch]$NonInteractive
+    )
     $hashFile = Join-Path $dir 'hashes.txt'
-    if (-not (Test-Path $hashFile)) { return }
+
     $expected = @{}
-    Get-Content $hashFile -Encoding UTF8 | Where-Object { $_ -and -not $_.StartsWith('#') } | ForEach-Object {
-        $parts = $_ -split '\s+', 2
-        if ($parts.Count -eq 2) { $expected[$parts[1].Trim()] = $parts[0].Trim().ToUpper() }
+    if (Test-Path -LiteralPath $hashFile) {
+        Get-Content -LiteralPath $hashFile -Encoding UTF8 |
+            Where-Object { $_ -and -not $_.StartsWith('#') } |
+            ForEach-Object {
+                $parts = $_ -split '\s+', 2
+                if ($parts.Count -eq 2) { $expected[$parts[1].Trim()] = $parts[0].Trim().ToUpper() }
+            }
     }
-    foreach ($fname in $expected.Keys) {
+
+    $vorhanden = @{}
+    foreach ($fname in $IntegrityFiles) {
         $full = Join-Path $dir $fname
-        if (-not (Test-Path $full)) { continue }
-        $h = (Get-FileHash -Path $full -Algorithm SHA256).Hash.ToUpper()
-        if ($h -ne $expected[$fname]) {
-            throw "SHA256-Mismatch fuer '$fname'. Erwartet $($expected[$fname]), Ist $h."
+        if (Test-Path -LiteralPath $full) {
+            $vorhanden[$fname] = (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash.ToUpper()
         }
     }
+    if ($vorhanden.Count -eq 0) {
+        throw "Keine der zu pruefenden Dateien liegt in '$dir' - Bootstrap fehlgeschlagen."
+    }
+
+    # 1) Abweichungen sind ein harter Abbruch.
+    $abweichungen = @()
+    foreach ($fname in $vorhanden.Keys) {
+        if ($expected.ContainsKey($fname) -and $expected[$fname] -ne $vorhanden[$fname]) {
+            $abweichungen += ("  {0}`n     erwartet: {1}`n     gefunden: {2}" -f `
+                              $fname, $expected[$fname], $vorhanden[$fname])
+        }
+    }
+    if ($abweichungen.Count -gt 0) {
+        throw ("SHA256-Abweichung - es wird NICHTS geladen:`n" + ($abweichungen -join "`n") +
+               "`n`nWenn die Aenderung beabsichtigt ist (neue Version), '$hashFile' loeschen und neu starten.")
+    }
+
+    # 2) Fehlende Eintraege ergaenzen bzw. erstmalig festnageln.
+    $neu = @($vorhanden.Keys | Where-Object { -not $expected.ContainsKey($_) })
+    if ($neu.Count -eq 0) {
+        Write-Host "  Integritaet geprueft: $($vorhanden.Count) Datei(en) unveraendert." -ForegroundColor DarkGray
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $hashFile)) {
+        Write-Host ""
+        Write-Host "  Erstmalige Integritaets-Festlegung" -ForegroundColor Yellow
+        Write-Host "  Die folgenden Dateien werden als vertrauenswuerdig festgeschrieben." -ForegroundColor Yellow
+        Write-Host "  Ab dem naechsten Lauf bricht jede Abweichung den Start ab." -ForegroundColor Yellow
+        Write-Host ""
+    }
+    foreach ($fname in ($neu | Sort-Object)) {
+        Write-Host ("    {0}  {1}" -f $vorhanden[$fname], $fname) -ForegroundColor DarkGray
+        $expected[$fname] = $vorhanden[$fname]
+    }
+
+    if (-not $NonInteractive -and -not (Test-Path -LiteralPath $hashFile)) {
+        $ok = Read-Host "  Diese Staende festschreiben und fortfahren? [J/n]"
+        if ($ok -and $ok.Trim() -notmatch '^[JjYy]') {
+            throw "Abgebrochen - Integritaets-Festlegung vom Anwender verweigert."
+        }
+    }
+
+    $zeilen = @(
+        "# SHA256-Sollwerte fuer 11_Typo_Dateinamen_korrigieren.ps1",
+        "# Format: <SHA256>  <Dateiname>. Zeilen mit '#' werden ignoriert.",
+        "# Eine Abweichung bricht den Start ab. Bei bewusstem Versionswechsel",
+        "# diese Datei loeschen; sie wird dann neu erzeugt."
+    ) + @($expected.Keys | Sort-Object | ForEach-Object { "{0}  {1}" -f $expected[$_], $_ })
+    Set-Content -LiteralPath $hashFile -Value $zeilen -Encoding UTF8
+    Write-Host "  Sollwerte geschrieben: $hashFile" -ForegroundColor DarkGray
 }
 
 function Initialize-Hunspell {
@@ -174,7 +309,9 @@ function Initialize-Hunspell {
         Invoke-WebRequest -Uri $AffUrl -OutFile $affPath -UseBasicParsing
     }
 
-    Test-DownloadHashes -dir $HunspellDir
+    # Zwingend VOR dem Add-Type: danach ist der native Code bereits im
+    # Prozess und eine Pruefung waere wirkungslos.
+    Test-DownloadHashes -dir $HunspellDir -NonInteractive:(-not $script:InteractiveLaunch)
 
     try { Add-Type -Path $dllNH } catch { throw "NHunspell.dll konnte nicht geladen werden: $($_.Exception.Message)" }
     try { [NHunspell.Hunspell]::NativeDllPath = $HunspellDir } catch {
@@ -523,8 +660,15 @@ function Test-NameValid {
     if ($name.EndsWith('.') -or $name.EndsWith(' '))   { return @{ Ok=$false; Reason='Punkt/Leerzeichen am Ende' } }
     $base = [System.IO.Path]::GetFileNameWithoutExtension($name).ToUpper()
     if ($ReservedNames -contains $base)                { return @{ Ok=$false; Reason='Reservierter Name' } }
+    # Der Zielpfad muss unter der Grenze bleiben - nicht wegen der
+    # Windows-API (dafuer gibt es den '\\?\'-Praefix), sondern weil der
+    # Bestand anschliessend nach Google Drive wandert. Eigener Status
+    # statt 'Fehler': das ist ein bewusst uebersprungener Eintrag, kein
+    # Fehlschlag, und wurde in der Statistik bisher falsch einsortiert.
     $full = Join-Path $parentPath $name
-    if ($full.Length -gt $MaxPathLen)                  { return @{ Ok=$false; Reason="Pfad >$MaxPathLen Zeichen" } }
+    if ($full.Length -gt $MaxPathLen) {
+        return @{ Ok=$false; Status='ZuLang'; Reason="Zielpfad >$MaxPathLen Zeichen" }
+    }
     return @{ Ok=$true }
 }
 
@@ -551,9 +695,17 @@ function Format-NewName {
 # ---------- Rename ----------
 function Invoke-SafeRename {
     param([string]$FullPath, [string]$NewName, [string]$Kind)
-    $parent = Split-Path -Parent $FullPath
-    $check  = Test-NameValid -name $NewName -parentPath $parent
-    if (-not $check.Ok) { return @{ Status='Fehler'; Details=$check.Reason } }
+    # Intern konsequent mit '\\?\'-Praefix arbeiten. Vorher liefen
+    # File.Move/Directory.Move und Test-Path auf den nackten Pfaden -
+    # Eintraege jenseits von 259 Zeichen wurden dadurch gar nicht erst
+    # umbenannt, sondern pauschal als 'Fehler' verbucht.
+    $FullPath = Remove-LongPathPrefix $FullPath
+    $parent   = Split-Path -Parent $FullPath
+    $check    = Test-NameValid -name $NewName -parentPath $parent
+    if (-not $check.Ok) {
+        $st = if ($check.Status) { $check.Status } else { 'Fehler' }
+        return @{ Status=$st; Details=$check.Reason }
+    }
 
     $target = Join-Path $parent $NewName
 
@@ -569,15 +721,20 @@ function Invoke-SafeRename {
     # eindeutigen Zwischennamen umbenennen.
     $isCaseOnly = ($target -ieq $FullPath) -and ($target -cne $FullPath)
 
-    if (-not $isCaseOnly -and (Test-Path -LiteralPath $target)) {
+    # Langpfad-Fassungen fuer alle Dateisystem-Zugriffe.
+    $srcLong    = Add-LongPathPrefix $FullPath
+    $targetLong = Add-LongPathPrefix $target
+
+    if (-not $isCaseOnly -and
+        ([System.IO.File]::Exists($targetLong) -or [System.IO.Directory]::Exists($targetLong))) {
         return @{ Status='Konflikt'; Details='Ziel existiert' }
     }
 
     $restoreRO = $false
     try {
-        $attr = [System.IO.File]::GetAttributes($FullPath)
+        $attr = [System.IO.File]::GetAttributes($srcLong)
         if (($attr -band [System.IO.FileAttributes]::ReadOnly) -ne 0) {
-            [System.IO.File]::SetAttributes($FullPath, $attr -bxor [System.IO.FileAttributes]::ReadOnly)
+            [System.IO.File]::SetAttributes($srcLong, $attr -bxor [System.IO.FileAttributes]::ReadOnly)
             $restoreRO = $true
         }
     } catch {}
@@ -591,32 +748,32 @@ function Invoke-SafeRename {
                 # Pfadlimit reissen. Scheitert der zweite Move, wird
                 # der erste zurueckgerollt - sonst straendete der
                 # Eintrag dauerhaft unter dem GUID-Zwischennamen.
-                $intermediate = Join-Path $parent ("__caserename_" + [Guid]::NewGuid().ToString('N') + [System.IO.Path]::GetExtension($NewName))
+                $intermediate = Add-LongPathPrefix (Join-Path $parent ("__caserename_" + [Guid]::NewGuid().ToString('N') + [System.IO.Path]::GetExtension($NewName)))
                 if ($Kind -eq 'Datei') {
-                    [System.IO.File]::Move($FullPath, $intermediate)
+                    [System.IO.File]::Move($srcLong, $intermediate)
                     try {
-                        [System.IO.File]::Move($intermediate, $target)
+                        [System.IO.File]::Move($intermediate, $targetLong)
                     } catch {
-                        try { [System.IO.File]::Move($intermediate, $FullPath) } catch {}
+                        try { [System.IO.File]::Move($intermediate, $srcLong) } catch {}
                         throw
                     }
                 } else {
-                    [System.IO.Directory]::Move($FullPath, $intermediate)
+                    [System.IO.Directory]::Move($srcLong, $intermediate)
                     try {
-                        [System.IO.Directory]::Move($intermediate, $target)
+                        [System.IO.Directory]::Move($intermediate, $targetLong)
                     } catch {
-                        try { [System.IO.Directory]::Move($intermediate, $FullPath) } catch {}
+                        try { [System.IO.Directory]::Move($intermediate, $srcLong) } catch {}
                         throw
                     }
                 }
             } else {
-                if ($Kind -eq 'Datei') { [System.IO.File]::Move($FullPath, $target) }
-                else                   { [System.IO.Directory]::Move($FullPath, $target) }
+                if ($Kind -eq 'Datei') { [System.IO.File]::Move($srcLong, $targetLong) }
+                else                   { [System.IO.Directory]::Move($srcLong, $targetLong) }
             }
             if ($restoreRO) {
                 try {
-                    $a = [System.IO.File]::GetAttributes($target)
-                    [System.IO.File]::SetAttributes($target, $a -bor [System.IO.FileAttributes]::ReadOnly)
+                    $a = [System.IO.File]::GetAttributes($targetLong)
+                    [System.IO.File]::SetAttributes($targetLong, $a -bor [System.IO.FileAttributes]::ReadOnly)
                 } catch {
                     Write-Warning "ReadOnly-Attribut auf '$target' konnte nicht wiederhergestellt werden: $($_.Exception.Message)"
                 }
@@ -814,6 +971,17 @@ function New-LogWriter {
 
 function Write-LogRow {
     param([System.IO.StreamWriter]$writer, [hashtable]$row)
+
+    # Gemeinsames Laufprotokoll (migration.jsonl) - ergaenzt das
+    # skripteigene Protokoll, ersetzt es nicht. Erst damit laesst sich
+    # der Fortschritt ueber alle elf Schritte hinweg auswerten.
+    if ($script:GemeinsamGeladen) {
+        try {
+            Write-Laufprotokoll -Skript '11_Typo_Dateinamen_korrigieren' `
+                -Pfad ([string]$row.AlterPfad) -Aktion 'Dateiname pruefen' `
+                -Status ([string]$row.Status) -Detail ([string]$row.NeuerName)
+        } catch { }
+    }
     $d = if ($null -ne $row.Details) { [string]$row.Details } else { '' }
     $u = if ($row.ContainsKey('Uebernehmen') -and $null -ne $row.Uebernehmen) { [string]$row.Uebernehmen } else { '' }
 
@@ -1273,6 +1441,7 @@ try {
         Uebersprungen = 0
         ZurPruefung   = 0
         Vorschlag     = 0
+        ZuLang        = 0
     }
 
     Write-Host ""
@@ -1314,6 +1483,7 @@ try {
     Write-Host ("  Uebersprungen  : {0}" -f $stats['Uebersprungen'])
     Write-Host ("  Zur Pruefung   : {0}" -f $stats['ZurPruefung'])   -ForegroundColor DarkYellow
     Write-Host ("  Konflikte      : {0}" -f $stats['Konflikt'])      -ForegroundColor Yellow
+    Write-Host ("  Zielpfad zu lang: {0}" -f $stats['ZuLang'])       -ForegroundColor DarkYellow
     Write-Host ("  Fehler         : {0}" -f $stats['Fehler'])        -ForegroundColor Red
     Write-Host ("  Unveraendert   : {0}" -f $stats['Unveraendert'])
     Write-Host ""

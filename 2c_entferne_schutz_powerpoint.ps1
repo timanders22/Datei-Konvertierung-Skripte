@@ -77,9 +77,86 @@ param(
 )
 
 # ==================================================================
+# Ausfuehrungsumgebung pruefen
+# ==================================================================
+# Dieses Skript setzt Windows PowerShell 5.1 voraus. Unter PowerShell 7
+# (Edition 'Core') fehlen die Methoden FileInfo.GetAccessControl und
+# .SetAccessControl - sie existieren nur im .NET Framework und wurden in
+# .NET Core entfernt. Nachgestellt auf diesem Rechner: unter 5.1.26100.9168
+# vorhanden, unter 7.6.4 nicht. Die Uebernahme von Rechten und Eigentuemer
+# bei der Dateiersetzung faellt dort still aus (der Fehler landete nur als
+# DEBUG im Detail-Log), und auf einer Ablage mit Owner-Mapping kann der
+# Fachnutzer damit den Zugriff auf seine eigene Datei verlieren.
+# Ein stiller Rechteverlust ist schlimmer als ein klarer Abbruch.
+if ($PSVersionTable.PSEdition -eq 'Core') {
+    Write-Host ""
+    Write-Host ("=" * 70) -ForegroundColor Red
+    Write-Host "  FALSCHE POWERSHELL-EDITION" -ForegroundColor Red
+    Write-Host ("=" * 70) -ForegroundColor Red
+    Write-Host "  Laeuft unter: PowerShell $($PSVersionTable.PSVersion) (Edition Core)"
+    Write-Host "  Benoetigt   : Windows PowerShell 5.1 (Edition Desktop)"
+    Write-Host ""
+    Write-Host "  Grund: Unter PowerShell 7 lassen sich NTFS-Rechte und Eigentuemer"
+    Write-Host "  der bearbeiteten Dateien nicht uebernehmen. Der Lauf wuerde die"
+    Write-Host "  Berechtigungen Ihrer Ablage still veraendern."
+    Write-Host ""
+    Write-Host "  Bitte mit 'powershell.exe' starten, nicht mit 'pwsh'." -ForegroundColor Yellow
+    Write-Host ("=" * 70) -ForegroundColor Red
+    Write-Host ""
+    exit 2
+}
+
+
+
+# ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Bindet _gemeinsam.psm1 ein, wenn vorhanden. Die eingebauten Kopien der
+# Helfer bleiben bestehen - so bleibt jedes Skript einzeln lauffaehig und
+# die ps2exe-Uebersetzung funktioniert unveraendert. Genutzt wird das
+# Modul fuer das gemeinsame Laufprotokoll (migration.jsonl).
+$script:GemeinsamGeladen = $false
+try {
+    $gemModul = Join-Path $PSScriptRoot '_gemeinsam.psm1'
+    if (Test-Path -LiteralPath $gemModul) {
+        Import-Module $gemModul -Force -DisableNameChecking -ErrorAction Stop
+        $script:GemeinsamGeladen = $true
+    }
+} catch {
+    # Ohne Modul laeuft das Skript mit seinen eingebauten Helfern weiter.
+}
+
+
+# ==================================================================
 # KONFIGURATION
 # ==================================================================
-$script:scriptDir              = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { $PWD.Path } else { $PSScriptRoot }
+# Logs liegen direkt neben Skript/EXE. PSScriptRoot greift bei direktem
+# Aufruf; bei ps2exe-EXEs ist PSScriptRoot leer - dann liefert die
+# Entry-Assembly das EXE-Verzeichnis. $PWD nur als letzter Fallback.
+#
+# Der frueher hier stehende Einzeiler fiel bei einer ps2exe-EXE sofort auf
+# $PWD zurueck, also auf das aktuelle Arbeitsverzeichnis: bei Doppelklick
+# aus dem Explorer zufaellig, bei einer Verknuepfung frei einstellbar.
+# Haupt-Log, Detail-Log und Ergebnis-CSV landeten damit an wechselnden
+# Orten - und das, obwohl der Skriptkopf die ps2exe-Uebersetzung
+# ausdruecklich dokumentiert. Gleiche Fassung wie in 2a, 6, 7, 8 und 9.
+function Resolve-ScriptDirectory {
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        return $PSScriptRoot
+    }
+    if ($MyInvocation.MyCommand.Path) {
+        return Split-Path -Parent $MyInvocation.MyCommand.Path
+    }
+    try {
+        $entry = [System.Reflection.Assembly]::GetEntryAssembly()
+        if ($entry -and $entry.Location) {
+            return Split-Path -Parent $entry.Location
+        }
+    } catch {}
+    return $PWD.Path
+}
+
+$script:scriptDir              = Resolve-ScriptDirectory
 
 # Log-Verzeichnis: bevorzugt neben dem Skript, sonst LOCALAPPDATA, sonst TEMP.
 # Vorher wurde ungeprueft in $scriptDir geschrieben; auf einer schreibgeschuetzten
@@ -232,10 +309,10 @@ function Invoke-WindowsTempCleanup {
         if (-not $hit) { $skipped++; return }
         try {
             if ($_.PSIsContainer) {
-                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
                 if (-not (Test-Path -LiteralPath $_.FullName)) { $removedDirs++ }
             } else {
-                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
                 if (-not (Test-Path -LiteralPath $_.FullName)) { $removedFiles++ }
             }
         } catch {}
@@ -266,7 +343,7 @@ function Remove-StaleTempFolders {
                     $stillRunning = $true
                 } catch {}
                 if (-not $stillRunning) {
-                    try { Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+                    try { Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false } catch {}
                 }
             }
         } catch {}
@@ -296,6 +373,17 @@ function Write-CsvLog {
         [string]$Path,
         [string]$Details = ''
     )
+
+    # Gemeinsames Laufprotokoll (migration.jsonl) - ergaenzt das
+    # skripteigene Protokoll, ersetzt es nicht. Erst damit laesst sich
+    # der Fortschritt ueber alle elf Schritte hinweg auswerten.
+    if ($script:GemeinsamGeladen) {
+        try {
+            Write-Laufprotokoll -Skript '2c_entferne_schutz_powerpoint' `
+                -Pfad $Path -Aktion 'Schutz entfernen' `
+                -Status $Status -Detail $Details
+        } catch { }
+    }
     if (-not $script:CsvLogWriter) { return }
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $q  = {
@@ -414,7 +502,13 @@ try {
 trap {
     Write-Warning "Unerwarteter Fehler: $_"
     Start-Sleep -Milliseconds 200
-    if ($script:TrackedPptPids -and (Test-Path -LiteralPath $script:TempPath)) {
+    # Die Liste gehoert NICHT in die Bedingung: Sinn dieses Blocks ist es
+    # gerade, die PIDs aus den .pid-Dateien nachzutragen, wenn die Liste noch
+    # LEER ist (Absturz vor dem ersten Add). PowerShell wertet eine leere
+    # System.Collections.Generic.List im booleschen Kontext als $false aus
+    # (nachgestellt unter 5.1) - der Block lief also nie, wenn er gebraucht
+    # wurde, und die verwaisten PowerPoint-Prozesse blieben stehen.
+    if (Test-Path -LiteralPath $script:TempPath) {
         Get-ChildItem -LiteralPath $script:TempPath -Filter "*.pid" -ErrorAction SilentlyContinue |
             ForEach-Object {
                 try {
@@ -426,8 +520,9 @@ trap {
                 } catch {}
             }
     }
-    if ($script:TrackedPptPids) { Clear-TrackedPowerPointInstances }
-    if (Test-Path -LiteralPath $script:TempPath) { Remove-Item -LiteralPath $script:TempPath -Recurse -Force -ErrorAction SilentlyContinue }
+    # .Count statt Auflistungs-Wahrheitswert (siehe oben).
+    if ($script:TrackedPptPids.Count -gt 0) { Clear-TrackedPowerPointInstances }
+    if (Test-Path -LiteralPath $script:TempPath) { Remove-Item -LiteralPath $script:TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
     Close-Loggers
     break
 }
@@ -435,7 +530,7 @@ trap {
 # ==================================================================
 # HELPER: PFADE & UMGEBUNG
 # ==================================================================
-function Get-LongPath {
+function Add-LongPathPrefix {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
     if ($Path -match "^\\\\\?\\")            { return $Path }
@@ -484,7 +579,7 @@ function Test-PowerPointInstalled {
 # ==================================================================
 # HELPER: I/O-ROBUSTHEIT
 # ==================================================================
-function Invoke-WithFileRetry {
+function Invoke-WithRetry {
     param(
         [Parameter(Mandatory=$true)][scriptblock]$Action,
         [int]$MaxRetries     = 10,
@@ -569,7 +664,7 @@ function Wait-FileStable {
 function Test-IsValidZip {
     param([string]$FilePath)
     try {
-        Invoke-WithFileRetry -Action {
+        Invoke-WithRetry -Action {
             $z = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
             $z.Dispose()
         }
@@ -590,7 +685,7 @@ function Test-IsOleEncrypted {
     $bufferSize = 8192
     $fs = $null
     try {
-        $fs = Invoke-WithFileRetry -Action { [System.IO.File]::OpenRead($FilePath) }
+        $fs = Invoke-WithRetry -Action { [System.IO.File]::OpenRead($FilePath) }
     } catch {
         Write-DetailedLog "OLE-Header-Check fehlgeschlagen (Lock): $FilePath - $_" "WARN"
         return $false
@@ -614,7 +709,7 @@ function Test-IsOleEncrypted {
 
 function Test-FileIsLocked {
     param([string]$FilePath)
-    $lp = Get-LongPath $FilePath
+    $lp = Add-LongPathPrefix $FilePath
     $stream = $null
     try {
         if (-not [System.IO.File]::Exists($lp)) { return $false }
@@ -899,9 +994,13 @@ function Remove-OrphanedBackups {
             $fi = [System.IO.FileInfo]::new($bak)
             if (-not $fi.Exists) { continue }
 
-            $origOk = $false
+            $origOk  = $false
+            $origLen = -1
             if ([System.IO.File]::Exists($orig)) {
-                try { $origOk = ([System.IO.FileInfo]::new($orig)).Length -gt 0 } catch { $origOk = $false }
+                try {
+                    $origLen = ([System.IO.FileInfo]::new($orig)).Length
+                    $origOk  = $origLen -gt 0
+                } catch { $origOk = $false; $origLen = -1 }
             }
             if (-not $origOk) {
                 $res.Orphans++
@@ -910,11 +1009,34 @@ function Remove-OrphanedBackups {
                 continue
             }
 
-            if ($fi.LastWriteTime -gt $cutoff) { $res.Kept++; continue }
+            # Das Original muss mindestens so gross sein wie das Backup.
+            # 'Length -gt 0' allein genuegt nicht: [System.IO.File]::Copy
+            # trunkiert die Zieldatei beim Start und schreibt fortlaufend -
+            # ein harter Abbruch hinterlaesst deshalb typischerweise ein
+            # TEILWEISE geschriebenes Original mit Groesse > 0. Genau dieser
+            # Zustand bestand die Pruefung, und das Backup mit der einzigen
+            # vollstaendigen Fassung wurde geloescht. Gleiche Ursache und
+            # gleiche Korrektur wie in 2a und 2b.
+            if ($origLen -lt $fi.Length) {
+                $res.Orphans++
+                $res.OrphanList.Add($bak)
+                Write-Log ("Backup groesser als das Original ({0:N0} statt {1:N0} Bytes) - Original " +
+                           "moeglicherweise abgeschnitten. NICHT geloescht, bitte pruefen: {2}" -f `
+                           $fi.Length, $origLen, $bak) "WARN"
+                continue
+            }
+
+            # Altersfrist an der CreationTime messen, NICHT an der
+            # LastWriteTime: das Backup entsteht per [System.IO.File]::Copy,
+            # und Copy uebertraegt die LastWriteTime der Quelle auf das Ziel.
+            # Auf Ablagen sind Dokumente typischerweise Jahre alt, das Backup
+            # erbt das - ein Sekunden altes .bak galt damit sofort als
+            # verwaist und der Kept-Zweig war praktisch toter Code.
+            if ($fi.CreationTime -gt $cutoff) { $res.Kept++; continue }
 
             if (Confirm-Write $bak 'Verwaistes Backup loeschen') {
                 try {
-                    [System.IO.File]::Delete((Get-LongPath $bak))
+                    [System.IO.File]::Delete((Add-LongPathPrefix $bak))
                     $res.Deleted++
                     Write-DetailedLog "Verwaistes Backup entfernt: $bak" "DEBUG"
                 } catch {
@@ -1119,7 +1241,7 @@ function Remove-PptxProtection {
                    "noAdjustHandles","noEditPoints","noUngrp")
 
     try {
-        $zip = Invoke-WithFileRetry -Context "ZipFile.Open Update" -Action {
+        $zip = Invoke-WithRetry -Context "ZipFile.Open Update" -Action {
             [System.IO.Compression.ZipFile]::Open($FilePath, "Update")
         }
 
@@ -1547,9 +1669,15 @@ if ($tgtItem -and -not $tgtItem.PSIsContainer) {
 Remove-StaleTempFolders
 
 if (Test-Path -LiteralPath $script:TempPath) {
-    Remove-Item -LiteralPath $script:TempPath -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $script:TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
 }
-New-Item -Path $script:TempPath -ItemType Directory -Force | Out-Null
+# Provider-frei anlegen statt per New-Item: Das Skript deklariert
+# SupportsShouldProcess, und unter -WhatIf gehorcht jedes ShouldProcess-faehige
+# Cmdlet dem $WhatIfPreference des Skript-Scopes - auch New-Item. Der
+# Arbeitsordner entstuende dann nicht, der PowerPoint-Smoke-Test darunter
+# schlaegt fehl, und der Lauf endet vor der ersten Datei. Die Protokolle sind
+# hier nicht betroffen, weil Initialize-Loggers StreamWriter verwendet.
+[System.IO.Directory]::CreateDirectory($script:TempPath) | Out-Null
 
 # Restore-Privilegien (Admin-Kontext) fuer ACL/Owner-Erhalt aktivieren.
 Enable-RestorePrivileges
@@ -1583,7 +1711,7 @@ if (-not $smokeTest.Ok) {
         Write-Log "Abbruch (NoInteractive) nach fehlgeschlagenem Smoke-Test." "ERROR"
         Clear-TrackedPowerPointInstances
         Close-Loggers
-        if (Test-Path $script:TempPath) { Remove-Item $script:TempPath -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $script:TempPath) { Remove-Item $script:TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
         exit 2
     }
 
@@ -1593,7 +1721,7 @@ if (-not $smokeTest.Ok) {
         Write-Log "Abbruch durch Benutzer nach Smoke-Test-Warnung." "INFO"
         Clear-TrackedPowerPointInstances
         Close-Loggers
-        if (Test-Path $script:TempPath) { Remove-Item $script:TempPath -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $script:TempPath) { Remove-Item $script:TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
         exit 0
     }
     Write-Log "Smoke-Test-Warnung vom Benutzer ignoriert - Fortsetzung." "WARN"
@@ -1610,7 +1738,7 @@ $allPptExt = "^\.p(pt|ot|ps)[xm]?$"
 $backupCleanup = $null
 if (-not $SkipBackupCleanup) {
     Write-Host "Suche zurueckgebliebene Backups frueherer Laeufe..." -ForegroundColor DarkGray
-    $backupCleanup = Remove-OrphanedBackups -RootPath (Get-LongPath $TargetPath)
+    $backupCleanup = Remove-OrphanedBackups -RootPath (Add-LongPathPrefix $TargetPath)
 
     if ($backupCleanup.Deleted -gt 0 -or $backupCleanup.Orphans -gt 0 -or $backupCleanup.Kept -gt 0) {
         Write-Host ("  Backups: {0} entfernt, {1} behalten, {2} ohne Original" -f `
@@ -1644,7 +1772,7 @@ if (-not $SkipBackupCleanup) {
 if ($script:UseProgress -and -not $script:SkipPreScan) {
     Write-Host "Zaehle Dateien fuer ETA (bitte warten)..." -ForegroundColor DarkGray
     $etaCount = 0
-    Get-PptFilesRobust (Get-LongPath $TargetPath) $allPptExt | ForEach-Object { $etaCount++ }
+    Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt | ForEach-Object { $etaCount++ }
     $script:TotalFiles = $etaCount
     Write-Host "Gefunden: $($script:TotalFiles) PowerPoint-Dateien`n" -ForegroundColor DarkGray
 }
@@ -1659,6 +1787,11 @@ $stats = @{
     Converted   = 0
     Locked      = 0
     Encrypted   = 0
+    # Korrupte Dateien und COM-Timeouts getrennt fuehren - beide
+    # wurden bisher auf 'Encrypted' gebucht und in der
+    # Endstatistik als verschluesselt ausgewiesen.
+    Corrupt     = 0
+    Timeouts    = 0
     AvBlocked   = 0
     WouldChange = 0
 }
@@ -1669,7 +1802,7 @@ $stats = @{
 Write-Host "Starte Verarbeitung..." -ForegroundColor Cyan
 
 try {
-Get-PptFilesRobust (Get-LongPath $TargetPath) $allPptExt |
+Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
     ForEach-Object {
 
     if ($script:ShouldStop) { throw [System.OperationCanceledException]::new() }
@@ -1694,8 +1827,22 @@ Get-PptFilesRobust (Get-LongPath $TargetPath) $allPptExt |
     # '~$'-Dateien sind PowerPoint-SPERRDATEIEN: sie existieren, solange eine
     # Praesentation geoeffnet ist. Sofortiges Loeschen bricht die Sperre.
     if ($fileName.StartsWith("~`$") -or $fileName.StartsWith("._")) {
+        # $srcLong wurde hier frueher BENUTZT, bevor es weiter unten
+        # zugewiesen wurde. In PowerShell ist eine nicht zugewiesene
+        # Variable $null, GetLastWriteTime($null) wirft - und der leere
+        # catch-Block liess $ageHours auf 0.0 stehen. Damit galt JEDE
+        # Sperrdatei als "zu jung" und wurde geschont: das Aufraeumen
+        # verwaister ~$-Dateien hat in diesem Skript nie stattgefunden,
+        # und der Zaehler "Sperrdateien geschont" war entsprechend
+        # aufgeblaeht. 2a und 2b holen das Alter korrekt.
         $ageHours = 0.0
-        try { $ageHours = ((Get-Date) - ([System.IO.File]::GetLastWriteTime($srcLong))).TotalHours } catch {}
+        try {
+            $ageHours = ((Get-Date) - ([System.IO.File]::GetLastWriteTime((Add-LongPathPrefix $filePath)))).TotalHours
+        } catch {
+            # Alter nicht ermittelbar: konservativ schonen (wie bisher),
+            # aber sichtbar machen statt still zu verschlucken.
+            Write-DetailedLog "Alter der Sperrdatei nicht ermittelbar, wird geschont: $filePath - $_" "WARN"
+        }
         if ($ageHours -lt $script:JunkMinAgeHours) {
             $stats.JunkKept++
             $stats.Skipped++
@@ -1711,7 +1858,7 @@ Get-PptFilesRobust (Get-LongPath $TargetPath) $allPptExt |
             Write-CsvLog -Status "WHATIF" -Actions "Wuerde Sperrdatei loeschen" -Path $filePath
             return
         }
-        try { [System.IO.File]::Delete((Get-LongPath $filePath)) } catch {}
+        try { [System.IO.File]::Delete((Add-LongPathPrefix $filePath)) } catch {}
         $stats.Junk++
         if (-not $script:UseProgress) { Write-Host "-> JUNK" -ForegroundColor DarkGray }
         Write-DetailedLog "Junk entfernt: $filePath" "DEBUG"
@@ -1719,7 +1866,7 @@ Get-PptFilesRobust (Get-LongPath $TargetPath) $allPptExt |
         return
     }
 
-    $srcLong = Get-LongPath $filePath
+    $srcLong = Add-LongPathPrefix $filePath
 
     # 2. Schreibschutz-Attribut entfernen
     $fileAttrs = $null
@@ -1780,7 +1927,7 @@ Get-PptFilesRobust (Get-LongPath $TargetPath) $allPptExt |
 
     try {
         # 4. In Temp kopieren (mit Retry gegen AV-Locks)
-        Invoke-WithFileRetry -Context "Copy src->temp" -Action { [System.IO.File]::Copy($srcLong, $tempFile, $true) }
+        Invoke-WithRetry -Context "Copy src->temp" -Action { [System.IO.File]::Copy($srcLong, $tempFile, $true) }
 
         # Priming-Read: AV synchron abschliessen lassen
         Invoke-FilePrimingRead -Path $tempFile
@@ -1839,13 +1986,13 @@ Get-PptFilesRobust (Get-LongPath $TargetPath) $allPptExt |
                 $workFile     = Convert-PptToPptx -SourcePath $tempFile -DestPathBase $tempBase -OriginalExt $ext
                 $wasConverted = $true
                 $stats.Converted++
-                Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
                 Write-DetailedLog "Konvertiert: $filePath -> $workFile" "DEBUG"
             } catch [System.TimeoutException] {
                 Clear-TrackedPowerPointInstances
                 $stats.Skipped++
-                $stats.Encrypted++
-                if (-not $script:UseProgress) { Write-Host "-> SKIP (Timeout/verschluesselt)" -ForegroundColor Magenta }
+                $stats.Timeouts++
+                if (-not $script:UseProgress) { Write-Host "-> SKIP (Timeout)" -ForegroundColor Magenta }
                 Write-Log "Uebersprungen (Timeout): $filePath - $_" "WARN"
                 Write-CsvLog -Status "SKIP" -Actions "Timeout" -Path $filePath -Details $_.Exception.Message
                 return
@@ -1880,7 +2027,12 @@ Get-PptFilesRobust (Get-LongPath $TargetPath) $allPptExt |
                 return
             }
             if ($zipStatus -eq "Invalid") {
-                $stats.Encrypted++
+                # Korrupt, nicht verschluesselt: die Meldung sagt 'korrupt',
+                # gezaehlt wurde bisher aber auf 'Encrypted'. In der
+                # Endstatistik erschienen defekte Dateien damit als
+                # kennwortgeschuetzt - der Betreiber suchte nach Passwoertern
+                # statt die Datei zu ersetzen.
+                $stats.Corrupt++
                 $stats.Skipped++
                 if (-not $script:UseProgress) { Write-Host "-> SKIP (korrupt)" -ForegroundColor Magenta }
                 Write-Log "Uebersprungen (kein gueltiges ZIP-Archiv): $filePath" "WARN"
@@ -1954,13 +2106,17 @@ Get-PptFilesRobust (Get-LongPath $TargetPath) $allPptExt |
                 }
             }
 
-            Invoke-WithFileRetry -Action { [System.IO.File]::Copy($srcLong, $backupPath, $true) }
+            Invoke-WithRetry -Action { [System.IO.File]::Copy($srcLong, $backupPath, $true) }
+            # Erzeugungszeit ausdruecklich stempeln: Remove-OrphanedBackups
+            # misst das Alter daran. Musste ein vorhandenes .bak ueberschrieben
+            # werden, behielte die Datei sonst die ALTE CreationTime.
+            try { [System.IO.File]::SetCreationTime($backupPath, (Get-Date)) } catch {}
 
             try {
                 if ($finalDest -eq $srcLong -and [System.IO.File]::Exists($finalDest)) {
                     [System.IO.File]::Delete($finalDest)
                 }
-                Invoke-WithFileRetry -Action { [System.IO.File]::Copy($workFile, $finalDest, $true) }
+                Invoke-WithRetry -Action { [System.IO.File]::Copy($workFile, $finalDest, $true) }
                 if (-not [System.IO.File]::Exists($finalDest)) { throw "Verifizierung fehlgeschlagen" }
                 $reservedPlaceholder = $null   # Ziel ist real geschrieben
 
@@ -2030,6 +2186,28 @@ Get-PptFilesRobust (Get-LongPath $TargetPath) $allPptExt |
 
         } else {
             if ($hadZoneIdentifier) {
+                # Zentrale Freigabe - MUSS vor der .bak-Behandlung stehen.
+                # Dieser Zweig griff bisher ohne jede Freigabe: er ersetzt das
+                # Original per Delete + Copy ueber [System.IO.File]-Methoden,
+                # die kein ShouldProcess kennen. Damit war die im Skriptkopf
+                # zugesicherte Eigenschaft ('-WhatIf zeigt an, welche Dateien
+                # geaendert wuerden, ohne sie anzufassen') fuer ihn nicht
+                # erfuellt: bei einem Probelauf wurde jede ungeschuetzte .pptx
+                # mit Zone.Identifier - auf Ablagen sehr haeufig, weil einmal
+                # aus Mail oder Internet geladen - tatsaechlich geloescht und
+                # durch die Temp-Kopie ersetzt. Auch das Beiseitelegen eines
+                # vorhandenen .bak gehoert hinter die Freigabe, sonst benennt
+                # schon die Simulation Dateien um.
+                if (-not (Confirm-Write $filePath 'Zone.Identifier entfernen')) {
+                    $stats.WouldChange++
+                    if (-not $script:UseProgress) {
+                        Write-Host "-> WHATIF (Zone.Identifier)" -ForegroundColor DarkCyan
+                    }
+                    Write-Log    "Simulation: wuerde Zone.Identifier entfernen: $filePath" "INFO"
+                    Write-CsvLog -Status "WHATIF" -Actions "Wuerde Zone.Identifier entfernen" -Path $filePath
+                    return
+                }
+
                 $zoneBak = "$srcLong.bak"
 
                 if ([System.IO.File]::Exists($zoneBak)) {
@@ -2045,9 +2223,9 @@ Get-PptFilesRobust (Get-LongPath $TargetPath) $allPptExt |
                 }
 
                 try {
-                    Invoke-WithFileRetry -Action { [System.IO.File]::Copy($srcLong, $zoneBak, $true) }
+                    Invoke-WithRetry -Action { [System.IO.File]::Copy($srcLong, $zoneBak, $true) }
                     [System.IO.File]::Delete($srcLong)
-                    Invoke-WithFileRetry -Action { [System.IO.File]::Copy($workFile, $srcLong, $true) }
+                    Invoke-WithRetry -Action { [System.IO.File]::Copy($workFile, $srcLong, $true) }
                     if (-not [System.IO.File]::Exists($srcLong)) { throw "Verifizierung fehlgeschlagen" }
                     try {
                         [System.IO.File]::SetCreationTimeUtc($srcLong,   $origCreationTimeUtc)
@@ -2080,7 +2258,7 @@ Get-PptFilesRobust (Get-LongPath $TargetPath) $allPptExt |
                     if ([System.IO.File]::Exists($zoneBak)) {
                         $backupSafeToDelete = $false
                         try {
-                            Invoke-WithFileRetry -Action { [System.IO.File]::Copy($zoneBak, $srcLong, $true) }
+                            Invoke-WithRetry -Action { [System.IO.File]::Copy($zoneBak, $srcLong, $true) }
                             if ([System.IO.File]::Exists($srcLong)) {
                                 $backupSafeToDelete = $true
                                 Set-FileSecuritySnapshot -Path $srcLong -Snapshot $origSecurity
@@ -2118,10 +2296,10 @@ Get-PptFilesRobust (Get-LongPath $TargetPath) $allPptExt |
 
     } finally {
         if (-not [string]::IsNullOrWhiteSpace($workFile)) {
-            Remove-Item -LiteralPath $workFile -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $workFile -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
         }
         if (-not [string]::IsNullOrWhiteSpace($tempFile) -and ($tempFile -ne $workFile)) {
-            Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
         }
         # Reservierten Platzhalter nur entfernen, wenn er leer geblieben ist.
         # Bricht z. B. die Backup-Kopie ab, laeuft der aeussere catch an, der
@@ -2148,7 +2326,7 @@ Get-PptFilesRobust (Get-LongPath $TargetPath) $allPptExt |
 if ($script:UseProgress) { Write-Progress -Activity "Fertig" -Completed }
 
 Clear-TrackedPowerPointInstances
-if (Test-Path $script:TempPath) { Remove-Item $script:TempPath -Recurse -Force -ErrorAction SilentlyContinue }
+if (Test-Path $script:TempPath) { Remove-Item $script:TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
 
 $duration = (Get-Date) - $script:ScriptStartTime
 $durStr   = $duration.ToString('hh\:mm\:ss')
@@ -2174,6 +2352,8 @@ if ($stats.JunkKept -gt 0) {
 }
 Write-Host "Uebersprungen:   $($stats.Skipped)"    -ForegroundColor Magenta
 Write-Host "Verschluesselt:  $($stats.Encrypted)"  -ForegroundColor Magenta
+Write-Host "Korrupt/kein ZIP:$($stats.Corrupt)"    -ForegroundColor Magenta
+Write-Host "COM-Timeouts:    $($stats.Timeouts)"   -ForegroundColor Magenta
 Write-Host "AV-blockiert:    $($stats.AvBlocked)"  -ForegroundColor Magenta
 Write-Host "Gesperrt:        $($stats.Locked)"     -ForegroundColor Yellow
 Write-Host "Fehler:          $($stats.Errors)"     -ForegroundColor Red
@@ -2189,7 +2369,7 @@ $footerLines = @(
     "Log Ende:  $(Get-Date)"
     "Dauer:     $durStr"
     "Geprueft:  $($stats.Processed)  |  Entsperrt: $($stats.Unlocked)  |  Fehler: $($stats.Errors)"
-    "Konv:      $($stats.Converted)  |  Skip: $($stats.Skipped)  |  Verschluesselt: $($stats.Encrypted)  |  AV-blockiert: $($stats.AvBlocked)  |  Gesperrt: $($stats.Locked)"
+    "Konv:      $($stats.Converted)  |  Skip: $($stats.Skipped)  |  Verschluesselt: $($stats.Encrypted)  |  Korrupt: $($stats.Corrupt)  |  Timeouts: $($stats.Timeouts)  |  AV-blockiert: $($stats.AvBlocked)  |  Gesperrt: $($stats.Locked)"
     "=================================================================="
 )
 if ($script:LogWriter) {

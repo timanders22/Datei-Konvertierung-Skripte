@@ -46,6 +46,37 @@ param(
     [switch]$SkipBackupCleanup
 )
 
+# ==================================================================
+# Ausfuehrungsumgebung pruefen
+# ==================================================================
+# Dieses Skript setzt Windows PowerShell 5.1 voraus. Unter PowerShell 7
+# (Edition 'Core') fehlen die Methoden FileInfo.GetAccessControl und
+# .SetAccessControl - sie existieren nur im .NET Framework und wurden in
+# .NET Core entfernt. Nachgestellt auf diesem Rechner: unter 5.1.26100.9168
+# vorhanden, unter 7.6.4 nicht. Die Uebernahme von Rechten und Eigentuemer
+# bei der Dateiersetzung faellt dort still aus (der Fehler landete nur als
+# DEBUG im Detail-Log), und auf einer Ablage mit Owner-Mapping kann der
+# Fachnutzer damit den Zugriff auf seine eigene Datei verlieren.
+# Ein stiller Rechteverlust ist schlimmer als ein klarer Abbruch.
+if ($PSVersionTable.PSEdition -eq 'Core') {
+    Write-Host ""
+    Write-Host ("=" * 70) -ForegroundColor Red
+    Write-Host "  FALSCHE POWERSHELL-EDITION" -ForegroundColor Red
+    Write-Host ("=" * 70) -ForegroundColor Red
+    Write-Host "  Laeuft unter: PowerShell $($PSVersionTable.PSVersion) (Edition Core)"
+    Write-Host "  Benoetigt   : Windows PowerShell 5.1 (Edition Desktop)"
+    Write-Host ""
+    Write-Host "  Grund: Unter PowerShell 7 lassen sich NTFS-Rechte und Eigentuemer"
+    Write-Host "  der bearbeiteten Dateien nicht uebernehmen. Der Lauf wuerde die"
+    Write-Host "  Berechtigungen Ihrer Ablage still veraendern."
+    Write-Host ""
+    Write-Host "  Bitte mit 'powershell.exe' starten, nicht mit 'pwsh'." -ForegroundColor Yellow
+    Write-Host ("=" * 70) -ForegroundColor Red
+    Write-Host ""
+    exit 2
+}
+
+
 # $PSCmdlet ist nur im Skript-Scope verfuegbar, nicht in Funktionen.
 $script:ScriptCmdlet = $PSCmdlet
 $script:PreviewOnly  = $ReadOnlyMode.IsPresent
@@ -166,6 +197,27 @@ $script:SkippedPathTooLong = 0
 $script:SkipLogPath = ''
 
 
+
+# ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Bindet _gemeinsam.psm1 ein, wenn vorhanden. Die eingebauten Kopien der
+# Helfer bleiben bestehen und ueberschreiben das Modul absichtlich - so
+# bleibt jedes Skript einzeln lauffaehig und die ps2exe-Uebersetzung
+# funktioniert unveraendert. Genutzt wird das Modul fuer das gemeinsame
+# Laufprotokoll (migration.jsonl) und die zentralen Verzeichnis-Presets
+# aus pfade.json.
+$script:GemeinsamGeladen = $false
+try {
+    $gemModul = Join-Path $PSScriptRoot '_gemeinsam.psm1'
+    if (Test-Path -LiteralPath $gemModul) {
+        Import-Module $gemModul -Force -DisableNameChecking -ErrorAction Stop
+        $script:GemeinsamGeladen = $true
+    }
+} catch {
+    # Ohne Modul laeuft das Skript mit seinen eingebauten Helfern weiter.
+}
+
 # ==============================================================================
 # Grundkonfiguration
 # ==============================================================================
@@ -275,6 +327,17 @@ function Write-SkipLogEntry {
         [string]$Target = '',
         [string]$Reason = ''
     )
+
+    # Gemeinsames Laufprotokoll (migration.jsonl) - ergaenzt das
+    # skripteigene Protokoll, ersetzt es nicht. Erst damit laesst sich
+    # der Fortschritt ueber alle elf Schritte hinweg auswerten.
+    if ($script:GemeinsamGeladen) {
+        try {
+            Write-Laufprotokoll -Skript '7_Dateien_ohne_Makro_finden' `
+                -Pfad $Source -Aktion 'Makropruefung' `
+                -Status 'PRUEFEN' -Detail $Reason
+        } catch { }
+    }
     if ([string]::IsNullOrWhiteSpace($script:SkipLogPath)) { return }
     $q = {
         param($v)
@@ -312,8 +375,15 @@ function Add-LongPathPrefix {
 
 function Get-UniqueTargetPath {
     param ([string]$BasePath)
+    # [System.IO.File]::Exists statt Test-Path: Test-Path liefert bei
+    # '\\?\'-Praefixen unter PowerShell 5.1 nicht zuverlaessig $true.
+    # Ein falsches $false haette hier die schlimmste Folge - die Funktion
+    # meldete dann "Ziel frei" und der Aufrufer ueberschriebe eine
+    # bestehende Datei.
     $baseLong = Add-LongPathPrefix $BasePath
-    if (-not (Test-Path -LiteralPath $baseLong)) { return $BasePath }
+    if (-not ([System.IO.File]::Exists($baseLong) -or [System.IO.Directory]::Exists($baseLong))) {
+        return $BasePath
+    }
     $dir  = Split-Path -Parent $BasePath
     $name = [System.IO.Path]::GetFileNameWithoutExtension($BasePath)
     $ext  = [System.IO.Path]::GetExtension($BasePath)
@@ -321,7 +391,9 @@ function Get-UniqueTargetPath {
     while ($true) {
         $candidate     = Join-Path $dir ($name + "_" + $i + $ext)
         $candidateLong = Add-LongPathPrefix $candidate
-        if (-not (Test-Path -LiteralPath $candidateLong)) { return $candidate }
+        if (-not ([System.IO.File]::Exists($candidateLong) -or [System.IO.Directory]::Exists($candidateLong))) {
+            return $candidate
+        }
         $i++
     }
 }
@@ -393,7 +465,7 @@ function Get-UserShellFolder {
 # ==============================================================================
 # Hilfsfunktionen - Datei-Locks und Retries
 # ==============================================================================
-function Test-FileReady {
+function Wait-FileAvailable {
     param([string]$Path, [int]$MaxAttempts = 10, [int]$DelayMs = 300)
     for ($i = 1; $i -le $MaxAttempts; $i++) {
         try {
@@ -1239,15 +1311,16 @@ $longPath = Add-LongPathPrefix $rootPath
 # Statistik
 # ==============================================================================
 $stats = @{
-    Scanned       = 0
-    Converted     = 0
-    Renamed       = 0
-    KeptMacro     = 0
-    KeptXlm       = 0
-    KeptNoAccess  = 0
-    SkippedLong   = 0
-    Errors        = 0
-    WouldConvert  = 0
+    Scanned        = 0
+    Converted      = 0
+    Renamed        = 0
+    KeptMacro      = 0
+    KeptXlm        = 0
+    KeptXlmUnknown = 0
+    KeptNoAccess   = 0
+    SkippedLong    = 0
+    Errors         = 0
+    WouldConvert   = 0
 }
 
 # ==============================================================================
@@ -1394,6 +1467,7 @@ foreach ($type in $fileTypes) {
 
         $hasCode          = $false
         $noAccessOccurred = $false
+        $xlmHandled       = $false
         $obj              = $null
         $origTimestamp    = $null
 
@@ -1409,15 +1483,18 @@ foreach ($type in $fileTypes) {
             $localCopy = Join-Path $guidDir "work$($type.Ext)"
 
             try {
-                $origTimestamp = (Get-Item -LiteralPath $filePathLong -ErrorAction Stop).LastWriteTime
+                $origTimestamp = [System.IO.File]::GetLastWriteTime($filePathLong)
             } catch {}
 
             # ==============================================================================
             # Lokale Kopie mit Retry und AV-Wartelogik
             # ==============================================================================
+            # [System.IO] statt Copy-Item: die Provider-Cmdlets von
+            # PowerShell 5.1 kommen mit '\\?\'-Praefixen nicht zuverlaessig
+            # zurecht (siehe die gleichlautende Begruendung in Skript 6).
             try {
                 Invoke-WithRetry -Action {
-                    Copy-Item -LiteralPath $filePathLong -Destination $localCopy -Force -ErrorAction Stop
+                    [System.IO.File]::Copy($filePathLong, $localCopy, $true)
                 } -MaxAttempts 4 -DelayMs 500
             } catch {
                 Write-Log "Kopie nach lokal fehlgeschlagen fuer $fileName : $($_.Exception.Message)" -Level "WARN"
@@ -1425,7 +1502,7 @@ foreach ($type in $fileTypes) {
                 continue
             }
 
-            if (-not (Test-FileReady -Path $localCopy -MaxAttempts 12 -DelayMs 300)) {
+            if (-not (Wait-FileAvailable -Path $localCopy -MaxAttempts 12 -DelayMs 300)) {
                 Write-Log "Lokale Kopie nicht freigegeben (AV-Scanner?): $fileName" -Level "WARN"
                 $stats.Errors++
                 continue
@@ -1443,8 +1520,15 @@ foreach ($type in $fileTypes) {
                 $xlm = Test-HasExcel4Macro $localCopy
                 if ($xlm -ne $false) {
                     $hasCode = $true
+                    # Merker fuer den Abschlusszweig weiter unten. Ohne ihn
+                    # wurde die Datei dort ein ZWEITES Mal gezaehlt
+                    # ($stats.KeptMacro) und bekam eine zweite CSV-Zeile mit
+                    # dem Grund "VBA-Projekt vorhanden" - sachlich falsch,
+                    # denn ein XLM-Makroblatt ist gerade KEIN VBA-Projekt.
+                    $xlmHandled = $true
                     if ($null -eq $xlm) {
                         Write-Log "XLM-Pruefung nicht moeglich fuer $fileName - Datei wird zur Sicherheit behalten." -Level "WARN"
+                        $stats.KeptXlmUnknown++
                         $csvGrund = "XLM-Pruefung nicht moeglich - manuell pruefen"
                     } else {
                         Write-Log "EXCEL-4.0-MAKRO (XLM) gefunden: $fileName (Wird beibehalten)" -Level "WARN"
@@ -1503,9 +1587,40 @@ foreach ($type in $fileTypes) {
                     # ==============================================================================
                     # Zielpfad eindeutig machen, lokal speichern, anschliessend zurueckkopieren
                     # ==============================================================================
-                    $networkTargetBase = $filePath -replace [regex]::Escape($type.Ext) + '$', $type.Target
+                    # Klammern um Muster und Ersetzung sind zwingend: der
+                    # Komma-Operator bindet in PowerShell STAERKER als '+'.
+                    # Ohne sie liest der Parser
+                    #   $filePath -replace ($muster + @('$', '.docx'))
+                    # also ein EINARMIGES -replace mit dem Muster
+                    # '\.docm$ .docx', das auf nichts passt. Der Zielname
+                    # behielt dadurch die Makro-Endung, Get-UniqueTargetPath
+                    # machte daraus '<name>_2.docm', und dort landete
+                    # anschliessend docx-Inhalt - waehrend das Original
+                    # geloescht wurde. Das Skript tat damit das Gegenteil
+                    # seiner Aufgabe und meldete es als "KONVERTIERT".
+                    $networkTargetBase = $filePath -replace ([regex]::Escape($type.Ext) + '$'), $type.Target
                     $networkTarget     = Get-UniqueTargetPath $networkTargetBase
                     $wasRenamed        = ($networkTarget -ne $networkTargetBase)
+
+                    # Zentrale Freigabe VOR dem SaveAs. Vorher stand die
+                    # Pruefung erst nach der vollstaendigen COM-Konvertierung:
+                    # der Probelauf liess Office also jede Datei komplett
+                    # umwandeln, nur um das Ergebnis zu verwerfen. Ausserdem
+                    # war $obj an der alten Stelle bereits freigegeben und auf
+                    # $null gesetzt, sodass der Aufraeumcode im Probelauf-Zweig
+                    # wirkungslos war. Hier ist das Dokument noch offen und
+                    # wird regulaer geschlossen.
+                    if (-not (Confirm-Write -Target $filePath `
+                              -Action "Nach $($type.Target) umwandeln")) {
+                        Write-Log "[PROBELAUF] Wuerde umgewandelt: $fileName -> $(Split-Path $networkTarget -Leaf)" -Level "INFO"
+                        $stats.WouldConvert++
+                        Write-SkipLogEntry -Source $filePath -Target $networkTarget `
+                            -Reason 'PROBELAUF - wuerde umgewandelt, nichts geaendert'
+                        Close-OfficeDocument $obj $type.Ext
+                        Release-ComObject $obj
+                        $obj = $null
+                        continue
+                    }
 
                     # Lokales Save-Target unter Kurznamen, damit langer Original-Filename
                     # die 259-Zeichen-Grenze des lokalen Pfades nicht reisst.
@@ -1522,55 +1637,49 @@ foreach ($type in $fileTypes) {
                     $obj = $null
 
                     if ($null -ne $origTimestamp) {
-                        try { (Get-Item -LiteralPath $localTarget).LastWriteTime = $origTimestamp } catch {}
+                        try { [System.IO.File]::SetLastWriteTime($localTarget, $origTimestamp) } catch {}
                     }
 
                     # NTFS-Sicherheitsinfo (Owner/Group/DACL) des Originals
                     # sichern - wird auf die konvertierte Datei uebertragen.
-                    $secSnapshot = Get-FileSecuritySnapshot $filePath
+                    # Langpfad-Fassung, sonst scheitert der Snapshot genau bei
+                    # den Dateien, fuer die das Skript den Praefix ueberhaupt
+                    # eingefuehrt hat.
+                    $secSnapshot = Get-FileSecuritySnapshot $filePathLong
 
                     $backupPath     = Get-UniqueBackupPath $filePath
                     $backupPathLong = Add-LongPathPrefix $backupPath
                     $networkTargetLong = Add-LongPathPrefix $networkTarget
 
-                    # Zentrale Freigabe: ab hier wird das Original angefasst
-                    # (umbenannt, ersetzt, geloescht). Bei -WhatIf endet die
-                    # Verarbeitung hier; die lokale Kopie raeumt der
-                    # finally-Block auf.
-                    if (-not (Confirm-Write -Target $filePath `
-                              -Action "Nach $($type.Target) umwandeln")) {
-                        Write-Log "[PROBELAUF] Wuerde umgewandelt: $fileName -> $(Split-Path $networkTarget -Leaf)" -Level "INFO"
-                        $stats.WouldConvert++
-                        Write-SkipLogEntry -Source $filePath -Target $networkTarget `
-                            -Reason 'PROBELAUF - wuerde umgewandelt, nichts geaendert'
-                        Close-OfficeDocument $obj $type.Ext
-                        Release-ComObject $obj
-                        $obj = $null
-                        continue
-                    }
-
                     Start-Sleep -Milliseconds 200
 
+                    # Die gesamte Ersetzungssequenz laeuft ueber [System.IO]
+                    # statt ueber Rename-Item/Copy-Item/Remove-Item. Das ist
+                    # hier besonders wichtig: scheitert ein Schritt in der
+                    # Mitte, ist das Original bereits umbenannt - und der
+                    # Wiederherstellungspfad benutzte bisher dasselbe
+                    # unzuverlaessige Cmdlet, konnte also aus demselben Grund
+                    # scheitern.
                     try {
                         Invoke-WithRetry -Action {
-                            Rename-Item -LiteralPath $filePathLong -NewName (Split-Path $backupPath -Leaf) -Force -ErrorAction Stop
+                            [System.IO.File]::Move($filePathLong, $backupPathLong)
                         } -MaxAttempts 4 -DelayMs 500
 
                         try {
                             Invoke-WithRetry -Action {
-                                Copy-Item -LiteralPath $localTarget -Destination $networkTargetLong -Force -ErrorAction Stop
+                                [System.IO.File]::Copy($localTarget, $networkTargetLong, $true)
                             } -MaxAttempts 4 -DelayMs 500
 
                             if ($null -ne $origTimestamp) {
-                                try { (Get-Item -LiteralPath $networkTargetLong).LastWriteTime = $origTimestamp } catch {}
+                                try { [System.IO.File]::SetLastWriteTime($networkTargetLong, $origTimestamp) } catch {}
                             }
 
                             # ACL/Owner des Originals auf die konvertierte
                             # Datei uebertragen (Admin: vollstaendig; Nutzer: DACL).
-                            Set-FileSecuritySnapshot $networkTarget $secSnapshot
+                            Set-FileSecuritySnapshot $networkTargetLong $secSnapshot
 
                             Invoke-WithRetry -Action {
-                                Remove-Item -LiteralPath $backupPathLong -Force -ErrorAction Stop
+                                [System.IO.File]::Delete($backupPathLong)
                             } -MaxAttempts 4 -DelayMs 500
 
                             if ($wasRenamed) {
@@ -1586,7 +1695,7 @@ foreach ($type in $fileTypes) {
                             Write-Log "Rueckkopie fehlgeschlagen fuer $fileName - stelle Original wieder her: $($_.Exception.Message)" -Level "ERROR"
                             $stats.Errors++
                             try {
-                                Rename-Item -LiteralPath $backupPathLong -NewName (Split-Path $filePath -Leaf) -Force -ErrorAction Stop
+                                [System.IO.File]::Move($backupPathLong, $filePathLong)
                             } catch {
                                 Write-Log "KRITISCH: Weder Rueckkopie noch Wiederherstellung moeglich fuer $fileName - Backup liegt als $backupPath" -Level "ERROR"
                             }
@@ -1599,7 +1708,11 @@ foreach ($type in $fileTypes) {
                     Close-OfficeDocument $obj $type.Ext
                     Release-ComObject $obj
                     $obj = $null
-                    if ($noAccessOccurred) {
+                    if ($xlmHandled) {
+                        # Bereits oben gezaehlt und protokolliert (Excel-4.0-Makro).
+                        # Hier nichts weiter tun - sonst doppelte Zaehlung und
+                        # eine zweite, inhaltlich falsche CSV-Zeile.
+                    } elseif ($noAccessOccurred) {
                         $stats.KeptNoAccess++
                         Write-SkipLogEntry -Source $filePath `
                             -Reason 'Kein VBA-Zugriff (Trust Center) - Makrostatus unbekannt, manuell pruefen'
@@ -1716,7 +1829,7 @@ if (-not $SkipBackupCleanup -and -not $cancelled -and -not $abortedByException) 
 
                 if (Confirm-Write -Target $bakPlain -Action 'Verwaistes Backup loeschen') {
                     try {
-                        Remove-Item -LiteralPath $fi.FullName -Force -ErrorAction Stop
+                        [System.IO.File]::Delete($fi.FullName)
                         $bakDeleted++
                     } catch {
                         $bakKept++
@@ -1746,9 +1859,15 @@ if ($abortedByException) {
 Write-Log ("Gescannt:                          {0}" -f $stats.Scanned)
 Write-Log ("Konvertiert:                       {0}" -f $stats.Converted)
 Write-Log ("  davon umbenannt (_2, _3, ...):   {0}" -f $stats.Renamed)
-Write-Log ("Beibehalten (Makro vorhanden):     {0}" -f $stats.KeptMacro)
+Write-Log ("Beibehalten (VBA-Projekt):          {0}" -f $stats.KeptMacro)
+# Eigene Zeilen statt "davon": XLM-Dateien werden seit der Korrektur
+# NICHT mehr zusaetzlich als VBA-Makro gezaehlt, sind also keine
+# Teilmenge von KeptMacro mehr.
 if ($stats.KeptXlm -gt 0) {
-    Write-Log ("  davon Excel-4.0-Makro (XLM):     {0}" -f $stats.KeptXlm) -Level "WARN"
+    Write-Log ("Beibehalten (Excel-4.0-Makro/XLM): {0}" -f $stats.KeptXlm) -Level "WARN"
+}
+if ($stats.KeptXlmUnknown -gt 0) {
+    Write-Log ("Beibehalten (XLM nicht pruefbar):  {0}" -f $stats.KeptXlmUnknown) -Level "WARN"
 }
 if ($stats.WouldConvert -gt 0) {
     Write-Log ("Wuerde umwandeln (Probelauf):       {0}" -f $stats.WouldConvert) -Level "WARN"

@@ -99,6 +99,57 @@ param(
 )
 
 # ==================================================================
+# Ausfuehrungsumgebung pruefen
+# ==================================================================
+# Dieses Skript setzt Windows PowerShell 5.1 voraus. Unter PowerShell 7
+# (Edition 'Core') fehlen die Methoden FileInfo.GetAccessControl und
+# .SetAccessControl - sie existieren nur im .NET Framework und wurden in
+# .NET Core entfernt. Nachgestellt auf diesem Rechner: unter 5.1.26100.9168
+# vorhanden, unter 7.6.4 nicht. Die Uebernahme von Rechten und Eigentuemer
+# bei der Dateiersetzung faellt dort still aus (der Fehler landete nur als
+# DEBUG im Detail-Log), und auf einer Ablage mit Owner-Mapping kann der
+# Fachnutzer damit den Zugriff auf seine eigene Datei verlieren.
+# Ein stiller Rechteverlust ist schlimmer als ein klarer Abbruch.
+if ($PSVersionTable.PSEdition -eq 'Core') {
+    Write-Host ""
+    Write-Host ("=" * 70) -ForegroundColor Red
+    Write-Host "  FALSCHE POWERSHELL-EDITION" -ForegroundColor Red
+    Write-Host ("=" * 70) -ForegroundColor Red
+    Write-Host "  Laeuft unter: PowerShell $($PSVersionTable.PSVersion) (Edition Core)"
+    Write-Host "  Benoetigt   : Windows PowerShell 5.1 (Edition Desktop)"
+    Write-Host ""
+    Write-Host "  Grund: Unter PowerShell 7 lassen sich NTFS-Rechte und Eigentuemer"
+    Write-Host "  der bearbeiteten Dateien nicht uebernehmen. Der Lauf wuerde die"
+    Write-Host "  Berechtigungen Ihrer Ablage still veraendern."
+    Write-Host ""
+    Write-Host "  Bitte mit 'powershell.exe' starten, nicht mit 'pwsh'." -ForegroundColor Yellow
+    Write-Host ("=" * 70) -ForegroundColor Red
+    Write-Host ""
+    exit 2
+}
+
+
+
+# ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Bindet _gemeinsam.psm1 ein, wenn vorhanden. Die eingebauten Kopien der
+# Helfer bleiben bestehen - so bleibt jedes Skript einzeln lauffaehig und
+# die ps2exe-Uebersetzung funktioniert unveraendert. Genutzt wird das
+# Modul fuer das gemeinsame Laufprotokoll (migration.jsonl).
+$script:GemeinsamGeladen = $false
+try {
+    $gemModul = Join-Path $PSScriptRoot '_gemeinsam.psm1'
+    if (Test-Path -LiteralPath $gemModul) {
+        Import-Module $gemModul -Force -DisableNameChecking -ErrorAction Stop
+        $script:GemeinsamGeladen = $true
+    }
+} catch {
+    # Ohne Modul laeuft das Skript mit seinen eingebauten Helfern weiter.
+}
+
+
+# ==================================================================
 # KONFIGURATION
 # ==================================================================
 function Resolve-ScriptDirectory {
@@ -352,13 +403,16 @@ function Test-IsOwnWordProcess {
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
-    Add-Content -LiteralPath $LogFilePath -Value $entry -Encoding utf8 -ErrorAction SilentlyContinue
+    # -WhatIf:$false: Protokollieren ist keine simulierbare Fachaktion. Ohne
+    # das schweigt unter -WhatIf das gesamte Log, und der Probelauf laesst
+    # sich hinterher nicht nachlesen.
+    Add-Content -LiteralPath $LogFilePath -Value $entry -Encoding utf8 -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
 }
 
 function Write-DetailedLog {
     param([string]$Message, [string]$Level = "DEBUG")
     $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [$Level] $Message"
-    Add-Content -LiteralPath $DetailedLogPath -Value $entry -Encoding utf8 -ErrorAction SilentlyContinue
+    Add-Content -LiteralPath $DetailedLogPath -Value $entry -Encoding utf8 -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
 }
 
 function Write-CsvLog {
@@ -377,13 +431,24 @@ function Write-CsvLog {
         [string]$Path,
         [string]$Details = ''
     )
+
+    # Gemeinsames Laufprotokoll (migration.jsonl) - ergaenzt das
+    # skripteigene Protokoll, ersetzt es nicht. Erst damit laesst sich
+    # der Fortschritt ueber alle elf Schritte hinweg auswerten.
+    if ($script:GemeinsamGeladen) {
+        try {
+            Write-Laufprotokoll -Skript '2a_entferne_schutz_word' `
+                -Pfad $Path -Aktion 'Schutz entfernen' `
+                -Status $Status -Detail $Details
+        } catch { }
+    }
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $q  = {
         param($v)
         '"' + ((("$v") -replace '"', '""') -replace "`r`n|`r|`n", ' ') + '"'
     }
     $line = "$ts;$Status;$(& $q $Actions);$(& $q $Path);$(& $q $Details)"
-    Add-Content -LiteralPath $CsvLogPath -Value $line -Encoding utf8 -ErrorAction SilentlyContinue
+    Add-Content -LiteralPath $CsvLogPath -Value $line -Encoding utf8 -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
 }
 
 function Cleanup-AllWord {
@@ -435,7 +500,7 @@ trap {
             }
     }
     Cleanup-AllWord
-    if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
     exit 1
 }
 
@@ -443,7 +508,7 @@ trap {
 # PFAD-HELPER
 # ==================================================================
 
-function Get-LongPath {
+function Add-LongPathPrefix {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
     if ($Path -match "^\\\\\?\\")            { return $Path }
@@ -452,7 +517,7 @@ function Get-LongPath {
     return $Path
 }
 
-function Get-ShortPath {
+function Remove-LongPathPrefix {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
     if ($Path.StartsWith('\\?\UNC\')) { return '\\' + $Path.Substring(8) }
@@ -463,7 +528,7 @@ function Get-ShortPath {
 function Test-PathLong {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
-    $lp = Get-LongPath $Path
+    $lp = Add-LongPathPrefix $Path
     return ([System.IO.Directory]::Exists($lp) -or [System.IO.File]::Exists($lp))
 }
 
@@ -593,7 +658,7 @@ function Test-IsOleEncrypted {
 
 function Test-FileIsLocked {
     param([string]$FilePath)
-    $lp = Get-LongPath $FilePath
+    $lp = Add-LongPathPrefix $FilePath
     try {
         $fi = New-Object System.IO.FileInfo $lp
         if (-not $fi.Exists) { return $false }
@@ -898,7 +963,7 @@ function Remove-StaleTempFolders {
                     $stillRunning = $true
                 } catch {}
                 if (-not $stillRunning) {
-                    try { Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+                    try { Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false } catch {}
                 }
             }
         } catch {}
@@ -952,7 +1017,7 @@ function Remove-OrphanedBackups {
 
             # Regel 1: nur unsere eigenen Word-Backups anfassen
             if ($orig -notmatch '\.do[ct][xm]?$') {
-                Write-DetailedLog "Fremde .bak-Datei ignoriert: $(Get-ShortPath $bak)" "DEBUG"
+                Write-DetailedLog "Fremde .bak-Datei ignoriert: $(Remove-LongPathPrefix $bak)" "DEBUG"
                 continue
             }
 
@@ -960,32 +1025,56 @@ function Remove-OrphanedBackups {
             if (-not $fi.Exists) { continue }
 
             # Regel 2: Original muss existieren und Inhalt haben
-            $origOk = $false
+            $origOk  = $false
+            $origLen = -1
             if ([System.IO.File]::Exists($orig)) {
-                try { $origOk = ([System.IO.FileInfo]::new($orig)).Length -gt 0 } catch { $origOk = $false }
+                try {
+                    $origLen = ([System.IO.FileInfo]::new($orig)).Length
+                    $origOk  = $origLen -gt 0
+                } catch { $origOk = $false; $origLen = -1 }
             }
             if (-not $origOk) {
                 $res.Orphans++
-                $res.OrphanList.Add((Get-ShortPath $bak))
-                Write-Log "Backup ohne intaktes Original - NICHT gelöscht, bitte prüfen: $(Get-ShortPath $bak)" "WARN"
+                $res.OrphanList.Add((Remove-LongPathPrefix $bak))
+                Write-Log "Backup ohne intaktes Original - NICHT gelöscht, bitte prüfen: $(Remove-LongPathPrefix $bak)" "WARN"
+                continue
+            }
+
+            # Regel 2b: Das Original muss mindestens so gross sein wie das Backup.
+            # 'Length -gt 0' allein genuegt nicht. [System.IO.File]::Copy
+            # trunkiert die Zieldatei beim Start und schreibt fortlaufend - ein
+            # harter Abbruch (Stromausfall, Kill, BSOD) hinterlaesst deshalb
+            # typischerweise ein TEILWEISE geschriebenes Original mit Groesse
+            # > 0, nicht 0 Byte. Genau dieser Zustand bestand Regel 2, und beim
+            # naechsten Lauf wurde das Backup geloescht, das die einzige intakte
+            # Kopie war (nachgestellt: Original 380 KB, Backup 2,4 MB - 'wird
+            # geloescht'). Diese .bak-Dateien stammen laut Funktionskopf
+            # ohnehin nur aus abgebrochenen Laeufen; ein faelschlich behaltenes
+            # Backup kostet eine Meldung, ein faelschlich geloeschtes die Datei.
+            if ($origLen -lt $fi.Length) {
+                $res.Orphans++
+                $res.OrphanList.Add((Remove-LongPathPrefix $bak))
+                Write-Log ("Backup groesser als das Original ({0:N0} statt {1:N0} Bytes) - " +
+                           "Original moeglicherweise abgeschnitten. NICHT gelöscht, bitte prüfen: {2}" -f `
+                           $fi.Length, $origLen, (Remove-LongPathPrefix $bak)) "WARN"
                 continue
             }
 
             # Regel 3: Mindestalter
             if ($fi.LastWriteTime -gt $cutoff) {
                 $res.Kept++
-                Write-DetailedLog "Backup zu jung, behalten: $(Get-ShortPath $bak)" "DEBUG"
+                Write-DetailedLog "Backup zu jung, behalten: $(Remove-LongPathPrefix $bak)" "DEBUG"
                 continue
             }
 
-            if (Confirm-Write (Get-ShortPath $bak) 'Verwaistes Backup löschen') {
+            if (Confirm-Write (Remove-LongPathPrefix $bak) 'Verwaistes Backup löschen') {
                 try {
-                    [System.IO.File]::Delete((Get-LongPath $bak))
+                    [System.IO.File]::Delete((Add-LongPathPrefix $bak))
                     $res.Deleted++
-                    Write-DetailedLog "Verwaistes Backup entfernt: $(Get-ShortPath $bak)" "DEBUG"
+                    Write-DetailedLog "Verwaistes Backup entfernt: $(Remove-LongPathPrefix $bak)" "DEBUG"
                 } catch {
                     $res.Failed++
-                    Write-DetailedLog "Backup nicht löschbar: $(Get-ShortPath $bak) - $_" "WARN"
+                    Write-DetailedLog "Backup nicht löschbar: $(Remove-LongPathPrefix $bak) - $_" "WARN"
                 }
             } else {
                 $res.Kept++
@@ -1024,9 +1113,9 @@ function Clear-WindowsTempWhitelist {
         if (-not $hit) { continue }
         try {
             if ($e.PSIsContainer) {
-                Remove-Item -LiteralPath $e.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $e.FullName -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
             } else {
-                Remove-Item -LiteralPath $e.FullName -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $e.FullName -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
             }
         } catch {}
     }
@@ -1173,7 +1262,19 @@ function Convert-DocToDocx {
             else { try { $word.Visible = $true } catch {} }
             [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($word) | Out-Null
         }
-    } -ArgumentList $SourcePath, $DestPathBase, (,$Passwords), $pidFile,
+    # KEIN fuehrendes Komma vor $Passwords: (,$Passwords) erzeugt ein
+    # 1-Element-Array, das das string[] umschliesst. Als Element einer
+    # aeusseren Argumentliste wird es NICHT entrollt - der Job-Parameter
+    # empfaengt dann ein Array mit genau einem Element (dem inneren Array),
+    # die foreach-Schleife laeuft einmal, und [string] auf ein string[] ergibt
+    # die leerzeichen-verbundene Darstellung. Bei drei Passwoertern wurde also
+    # nur das Phantom-Passwort 'Ablage1 Archiv2 Depot3' probiert (nachgestellt).
+    # Bei genau EINEM Passwort faellt das nicht auf - deshalb hat der Fehler
+    # jeden Ein-Passwort-Test ueberlebt.
+    # Die Sorge, die das Komma motiviert hat, trifft nicht zu: auch bei LEERER
+    # Liste verschieben sich die Folgeparameter nicht ($pidFile & Co. kommen
+    # korrekt an, ebenfalls nachgestellt).
+    } -ArgumentList $SourcePath, $DestPathBase, $Passwords, $pidFile,
                     $WD_FORMAT_DOCX, $WD_FORMAT_DOCM, $WD_FORMAT_DOTX, $WD_FORMAT_DOTM
 
     if (-not (Wait-Job $job -Timeout $FileOpenTimeoutSeconds)) {
@@ -1296,7 +1397,8 @@ function Remove-OpenPassword {
             else { try { $word.Visible = $true } catch {} }
             [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($word) | Out-Null
         }
-    } -ArgumentList $FilePath, (,$Passwords), $OriginalExtension, $pidFile
+    # Kein fuehrendes Komma - Begruendung siehe Convert-DocToDocx oben.
+    } -ArgumentList $FilePath, $Passwords, $OriginalExtension, $pidFile
 
     if (-not (Wait-Job $job -Timeout $FileOpenTimeoutSeconds)) {
         try { Stop-Job  $job -ErrorAction SilentlyContinue } catch {}
@@ -1693,19 +1795,41 @@ if (-not (Test-PathLong $TargetPath)) {
 Remove-StaleTempFolders
 
 if (Test-Path -LiteralPath $TempPath) {
-    Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
 }
-New-Item -Path $TempPath -ItemType Directory -Force | Out-Null
+# Provider-frei anlegen statt per New-Item: Das Skript deklariert
+# SupportsShouldProcess, und unter -WhatIf setzt PowerShell
+# $WhatIfPreference fuer den gesamten Skript-Scope. JEDES nachgelagerte
+# ShouldProcess-faehige Cmdlet gehorcht dem - auch New-Item und die
+# Set-Content/Add-Content der Protokolle. Der Arbeitsordner entstand dann
+# nicht, der Smoke-Test scheiterte, und mit -NoInteractive brach der Lauf
+# ab; interaktiv scheiterte danach jede einzelne Datei an der Arbeitskopie.
+# Genau der im Kopf empfohlene erste Probelauf lieferte damit 'Wuerde
+# aendern: 0' und 'Fehler: <alle Dateien>' - ohne Log zum Nachlesen.
+# [System.IO.Directory]::CreateDirectory kennt kein ShouldProcess.
+[System.IO.Directory]::CreateDirectory($TempPath) | Out-Null
 
 # Restore-Privilegien (Admin-Kontext) fuer ACL/Owner-Erhalt aktivieren.
 Enable-RestorePrivileges
 
-"Log Start: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  |  Ziel: $TargetPath" |
-    Set-Content -LiteralPath $LogFilePath     -Encoding utf8
-"Debug-Log Start: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" |
-    Set-Content -LiteralPath $DetailedLogPath -Encoding utf8
-"Zeitstempel;Status;Aktionen;Pfad;Details" |
-    Set-Content -LiteralPath $CsvLogPath      -Encoding utf8
+# Protokollkoepfe ebenfalls provider-frei schreiben (siehe oben): unter
+# -WhatIf haette Set-Content sie unterdrueckt, und der Probelauf haette
+# weder Log noch CSV zum Nachlesen hinterlassen. UTF-8 MIT BOM, damit
+# Excel die CSV im deutschen Gebietsschema per Doppelklick korrekt oeffnet
+# - das entspricht dem bisherigen '-Encoding utf8' der Windows-PowerShell.
+$script:LogEncoding = [System.Text.UTF8Encoding]::new($true)
+[System.IO.File]::WriteAllText(
+    $LogFilePath,
+    "Log Start: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  |  Ziel: $TargetPath`r`n",
+    $script:LogEncoding)
+[System.IO.File]::WriteAllText(
+    $DetailedLogPath,
+    "Debug-Log Start: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n",
+    $script:LogEncoding)
+[System.IO.File]::WriteAllText(
+    $CsvLogPath,
+    "Zeitstempel;Status;Aktionen;Pfad;Details`r`n",
+    $script:LogEncoding)
 
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host " WORD DEEP UNPROTECT"
@@ -1733,7 +1857,7 @@ if (-not $smokeTest.Ok) {
     if ($NoInteractive) {
         Write-Log "Abbruch (NoInteractive) nach fehlgeschlagenem Trust-Center-Test." "ERROR"
         Cleanup-AllWord
-        if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
         exit 2
     }
 
@@ -1742,7 +1866,7 @@ if (-not $smokeTest.Ok) {
         Write-Host "Abbruch durch Benutzer." -ForegroundColor Yellow
         Write-Log "Abbruch durch Benutzer nach Trust-Center-Warnung." "INFO"
         Cleanup-AllWord
-        if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
         exit 0
     }
     Write-Log "Trust-Center-Warnung vom Benutzer ignoriert - Fortsetzung." "WARN"
@@ -1757,7 +1881,7 @@ if (-not $smokeTest.Ok) {
 $backupCleanup = $null
 if (-not $SkipBackupCleanup) {
     Write-Host "Suche zurückgebliebene Backups früherer Läufe..." -ForegroundColor DarkGray
-    $backupCleanup = Remove-OrphanedBackups -RootPath (Get-LongPath $TargetPath)
+    $backupCleanup = Remove-OrphanedBackups -RootPath (Add-LongPathPrefix $TargetPath)
 
     if ($backupCleanup.Deleted -gt 0 -or $backupCleanup.Orphans -gt 0 -or $backupCleanup.Kept -gt 0) {
         Write-Host ("  Backups: {0} entfernt, {1} behalten, {2} ohne Original" -f `
@@ -1790,7 +1914,7 @@ if (-not $SkipBackupCleanup) {
 
 if ($script:UseProgress -and -not $script:SkipPreScan) {
     Write-Host "Zähle Dateien für ETA (bitte warten)..." -ForegroundColor DarkGray
-    $script:TotalFiles = (Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" -StringsOnly |
+    $script:TotalFiles = (Get-WordFilesRobust (Add-LongPathPrefix $TargetPath) "^\.do[ct][xm]?$" -StringsOnly |
                           Measure-Object).Count
     Write-Host "Gefunden: $($script:TotalFiles) Word-Dateien`n" -ForegroundColor DarkGray
 }
@@ -1805,6 +1929,12 @@ $stats = @{
     Converted   = 0
     Locked      = 0
     Encrypted   = 0
+    # COM-Timeouts getrennt fuehren: sie wurden bisher auf
+    # 'Encrypted' gebucht und erschienen in der Endstatistik als
+    # verschluesselte Dateien - eine Fehldiagnose, die den
+    # Betreiber nach Passwoertern suchen laesst, obwohl Word
+    # schlicht nicht geantwortet hat.
+    Timeouts    = 0
     WouldChange = 0
     Repaired    = 0
 }
@@ -1815,7 +1945,7 @@ $stats = @{
 Write-Host "Starte Verarbeitung..." -ForegroundColor Cyan
 
 try {
-Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
+Get-WordFilesRobust (Add-LongPathPrefix $TargetPath) "^\.do[ct][xm]?$" |
     ForEach-Object {
 
     if ($script:ShouldStop) { throw [System.OperationCanceledException]::new() }
@@ -1851,8 +1981,8 @@ Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
             Write-CsvLog -Status "SKIP" -Actions "Sperrdatei geschont" -Path $file.FullName -Details ("{0:N1} h alt" -f $ageHours)
             return
         }
-        if (Confirm-Write (Get-ShortPath $file.FullName) 'Verwaiste Sperrdatei löschen') {
-            try { [System.IO.File]::Delete((Get-LongPath $file.FullName)) } catch {}
+        if (Confirm-Write (Remove-LongPathPrefix $file.FullName) 'Verwaiste Sperrdatei löschen') {
+            try { [System.IO.File]::Delete((Add-LongPathPrefix $file.FullName)) } catch {}
             $stats.Junk++
             if (-not $script:UseProgress) { Write-Host "-> JUNK" -ForegroundColor DarkGray }
             Write-DetailedLog "Junk entfernt: $($file.FullName)" "DEBUG"
@@ -1874,7 +2004,7 @@ Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
         return
     }
 
-    $srcLong = Get-LongPath $file.FullName
+    $srcLong = Add-LongPathPrefix $file.FullName
 
     # --- Schreibschutz auf Datei-Ebene ---
     # Nur das ReadOnly-Bit loeschen. Vorher wurde pauschal auf 'Normal' gesetzt
@@ -1882,7 +2012,7 @@ Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
     # ein stiller Nebeneffekt, der z. B. Backup-Werkzeuge und Suchindizes
     # durcheinanderbringt.
     if ($file.IsReadOnly) {
-        if (Confirm-Write (Get-ShortPath $srcLong) 'Schreibschutz-Attribut entfernen') {
+        if (Confirm-Write (Remove-LongPathPrefix $srcLong) 'Schreibschutz-Attribut entfernen') {
             try {
                 $srcAttrs = [System.IO.File]::GetAttributes($srcLong)
                 [System.IO.File]::SetAttributes(
@@ -1940,7 +2070,7 @@ Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
         } | Out-Null
 
         try {
-            $tempLong = Get-LongPath $tempFile
+            $tempLong = Add-LongPathPrefix $tempFile
             $tempAttrs = [System.IO.File]::GetAttributes($tempLong)
             if ($tempAttrs -band [System.IO.FileAttributes]::ReadOnly) {
                 [System.IO.File]::SetAttributes($tempLong, $tempAttrs -band (-bnot [System.IO.FileAttributes]::ReadOnly))
@@ -1954,9 +2084,9 @@ Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
         # Reihenfolge wichtig: Unblock-File triggert ggf. AV-Scan. Wir wollen
         # diesen Trigger VOR Wait-FileAvailable haben, damit Wait-FileAvailable
         # das letzte Gate vor ZipFile.Open ist.
-        try { Unblock-File -LiteralPath (Get-ShortPath $tempFile) -ErrorAction SilentlyContinue } catch {}
+        try { Unblock-File -LiteralPath (Remove-LongPathPrefix $tempFile) -ErrorAction SilentlyContinue } catch {}
 
-        if (-not (Wait-FileAvailable -Path (Get-LongPath $tempFile))) {
+        if (-not (Wait-FileAvailable -Path (Add-LongPathPrefix $tempFile))) {
             $stats.Skipped++
             $stats.Locked++
             if (-not $script:UseProgress) { Write-Host "-> SKIP (Temp-Datei blockiert)" -ForegroundColor Yellow }
@@ -1998,7 +2128,7 @@ Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
                 }
                 $wasConverted = $true
                 $stats.Converted++
-                Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
                 Write-DetailedLog "Konvertiert: $($file.FullName) -> $workFile" "DEBUG"
             } catch {
                 $msg      = $_.Exception.Message
@@ -2006,7 +2136,7 @@ Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
                 if ($category -in @("Timeout", "Passwort")) {
                     Cleanup-AllWord
                     $stats.Skipped++
-                    $stats.Encrypted++
+                    if ($category -eq 'Passwort') { $stats.Encrypted++ } else { $stats.Timeouts++ }
                     if (-not $script:UseProgress) { Write-Host "-> SKIP ($category)" -ForegroundColor Magenta }
                     Write-Log "Übersprungen ($category): $($file.FullName) - $_" "WARN"
                     Write-CsvLog -Status "SKIP" -Actions $category -Path $file.FullName -Details $msg
@@ -2025,6 +2155,9 @@ Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
         }
 
         # --- OOXML-Verschlüsselungs-Check + Passwort-Entfernung ---
+        # Muss VOR dem if stehen: der Wert geht unten in die
+        # Rueckschreib-Bedingung ein und darf dort nicht undefiniert sein.
+        $pwRemoved  = $false
         $isOoxmlExt = ($file.Extension -match "^\.do[ct][xm]$") -and (-not $wasConverted)
         if ($isOoxmlExt -and -not (Test-IsValidZip -FilePath $workFile)) {
             if ($script:Passwords.Count -eq 0) {
@@ -2057,17 +2190,31 @@ Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
         Write-DetailedLog "Aktionen ($($file.Name)): $($actions -join ', ')" "DEBUG"
 
         # --- Rückschreiben ---
-        if (@($actions).Count -gt 0 -or $wasConverted) {
+        # $pwRemoved MUSS mit in die Bedingung: Remove-OpenPassword hat die
+        # Entschluesselung nur auf der Temp-Kopie ($workFile) vorgenommen.
+        # Findet Remove-WordProtection danach keinen XML-Schutz - der Normalfall,
+        # denn die Datei war ja nur mit einem Oeffnen-Passwort verschluesselt und
+        # nicht zusaetzlich formulargeschuetzt -, ist $actions leer und
+        # $wasConverted fuer .docx/.docm ohnehin $false. Ohne $pwRemoved lief
+        # dann der else-Zweig: die entschluesselte Temp-Datei wurde im finally
+        # geloescht, die Datei auf der Ablage blieb verschluesselt, und
+        # protokolliert wurde 'Kein Schutz gefunden'. Der Betreiber hielt die
+        # Ablage danach fuer passwortfrei, obwohl sie es nicht war.
+        if (@($actions).Count -gt 0 -or $wasConverted -or $pwRemoved) {
 
-            $actionStrPre = @($actions) -join ', '
-            if ($wasConverted) {
-                $actionStrPre = (@('Konvertierung') + @($actions)) -join ', '
-            }
+            # Vorspann zusammensetzen statt sequentiell ueberschreiben, damit
+            # keine Aktion verlorengeht (Konvertierung und Passwort schliessen
+            # sich derzeit aus, weil $isOoxmlExt '-not $wasConverted' verlangt -
+            # darauf soll sich die Meldung aber nicht verlassen muessen).
+            $vorspann = @()
+            if ($wasConverted) { $vorspann += 'Konvertierung' }
+            if ($pwRemoved)    { $vorspann += 'Öffnen-Passwort' }
+            $actionStrPre = (@($vorspann) + @($actions)) -join ', '
 
             # Zentrale Freigabe: ab hier wird das Original angefasst. Bei
             # -WhatIf bzw. im Simulationsmodus endet die Verarbeitung hier,
             # die Temp-Kopie raeumt der finally-Block auf.
-            if (-not (Confirm-Write (Get-ShortPath $srcLong) "Schutz entfernen ($actionStrPre)")) {
+            if (-not (Confirm-Write (Remove-LongPathPrefix $srcLong) "Schutz entfernen ($actionStrPre)")) {
                 if ($wasConverted) { $stats.Converted-- }
                 $stats.WouldChange++
                 if (-not $script:UseProgress) {
@@ -2099,7 +2246,7 @@ Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
                 if (-not $script:UseProgress) {
                     Write-Host -NoNewline "[Ziel: $([System.IO.Path]::GetFileName($finalDest))] " -ForegroundColor Yellow
                 }
-                Write-Log "Namenskollision gelöst: $($file.FullName) -> $(Get-ShortPath $finalDest)" "WARN"
+                Write-Log "Namenskollision gelöst: $($file.FullName) -> $(Remove-LongPathPrefix $finalDest)" "WARN"
             }
 
             $backupPath = "$srcLong.bak"
@@ -2112,7 +2259,7 @@ Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
                 $staleBak = "$srcLong.bak_$([Guid]::NewGuid().ToString('N').Substring(0,6))"
                 try {
                     [System.IO.File]::Move($backupPath, $staleBak)
-                    Write-Log "Veraltetes Backup beiseite gelegt (nicht gelöscht): $(Get-ShortPath $staleBak)" "WARN"
+                    Write-Log "Veraltetes Backup beiseite gelegt (nicht gelöscht): $(Remove-LongPathPrefix $staleBak)" "WARN"
                 } catch {
                     Write-DetailedLog "Veraltetes Backup nicht verschiebbar (wird überschrieben): $_" "WARN"
                 }
@@ -2132,7 +2279,7 @@ Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
 
                 # --- Zone.Identifier entfernen ---
                 try {
-                    $unblockPath = Get-ShortPath $finalDest
+                    $unblockPath = Remove-LongPathPrefix $finalDest
                     Remove-Item -LiteralPath $unblockPath -Stream Zone.Identifier -ErrorAction Stop
                 } catch {
                     try { Unblock-File -LiteralPath $unblockPath -ErrorAction SilentlyContinue } catch {}
@@ -2167,7 +2314,7 @@ Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
                     Write-Host "-> OK ($actionStr)" -ForegroundColor Green
                 }
                 Write-Log "Erledigt: $($file.FullName)  [$actionStr]" "INFO"
-                $csvDetails = Get-ShortPath $finalDest
+                $csvDetails = Remove-LongPathPrefix $finalDest
                 if ($convRepaired) { $csvDetails += "  [mit OpenAndRepair geoeffnet]" }
                 Write-CsvLog -Status "OK" -Actions $actionStr -Path $file.FullName -Details $csvDetails
 
@@ -2250,7 +2397,7 @@ Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
 
     } finally {
         if (-not [string]::IsNullOrWhiteSpace($workFile)) {
-            Remove-Item -LiteralPath $workFile -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $workFile -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
         }
         # Reservierten Platzhalter nur entfernen, wenn er leer geblieben ist -
         # eine Datei mit Inhalt wird niemals angefasst.
@@ -2276,7 +2423,7 @@ Get-WordFilesRobust (Get-LongPath $TargetPath) "^\.do[ct][xm]?$" |
 if ($script:UseProgress) { Write-Progress -Activity "Fertig" -Completed }
 
 Cleanup-AllWord
-if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue }
+if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
 Clear-WindowsTempWhitelist
 
 $duration = (Get-Date) - $ScriptStartTime
@@ -2306,6 +2453,7 @@ if ($stats.JunkKept -gt 0) {
 }
 Write-Host "Übersprungen:    $($stats.Skipped)"     -ForegroundColor Magenta
 Write-Host "Verschlüsselt:   $($stats.Encrypted)"   -ForegroundColor Magenta
+Write-Host "COM-Timeouts:    $($stats.Timeouts)"    -ForegroundColor Magenta
 Write-Host "Gesperrt:        $($stats.Locked)"      -ForegroundColor Yellow
 Write-Host "Fehler:          $($stats.Errors)"      -ForegroundColor Red
 if ($script:RetryStats.Recovered -gt 0 -or $script:RetryStats.Failed -gt 0) {
@@ -2328,7 +2476,7 @@ Write-Host "=====================================================" -ForegroundCo
     "Log Ende:  $(Get-Date)"
     "Dauer:     $durStr"
     "Geprüft:   $($stats.Processed)  |  Entsperrt: $($stats.Unlocked)  |  Fehler: $($stats.Errors)"
-    "Konv:      $($stats.Converted)  |  Skip: $($stats.Skipped)  |  Verschlüsselt: $($stats.Encrypted)  |  Gesperrt: $($stats.Locked)"
+    "Konv:      $($stats.Converted)  |  Skip: $($stats.Skipped)  |  Verschlüsselt: $($stats.Encrypted)  |  Timeouts: $($stats.Timeouts)  |  Gesperrt: $($stats.Locked)"
     "Simuliert: $($stats.WouldChange)  |  Sperrdateien geschont: $($stats.JunkKept)  |  Repariert: $($stats.Repaired)"
     $(if ($backupCleanup) {
         "Backups:   entfernt=$($backupCleanup.Deleted)  behalten=$($backupCleanup.Kept)  ohne Original=$($backupCleanup.Orphans)  Fehler=$($backupCleanup.Failed)"
@@ -2337,7 +2485,7 @@ Write-Host "=====================================================" -ForegroundCo
       })
     "Retry:     Recovered=$($script:RetryStats.Recovered)  Failed=$($script:RetryStats.Failed)"
     "=================================================================="
-) | Add-Content -LiteralPath $LogFilePath -Encoding utf8
+) | Add-Content -LiteralPath $LogFilePath -Encoding utf8 -WhatIf:$false -Confirm:$false
 
 if (-not $NoInteractive) {
     Write-Host ""

@@ -26,11 +26,25 @@ import shutil
 import stat
 import time
 import logging
+import hashlib
 import threading
 import fnmatch
 from datetime import datetime
 from typing import List, Set, Tuple, Dict, Generator, Optional, Any
 from concurrent.futures import ThreadPoolExecutor
+
+
+# ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Fehlt _gemeinsam.py, laeuft alles unveraendert weiter.
+try:
+    _eigener_ordner = os.path.dirname(os.path.abspath(__file__))
+    if _eigener_ordner not in sys.path:
+        sys.path.insert(0, _eigener_ordner)
+    import _gemeinsam as gem
+except Exception:
+    gem = None
 
 IS_WINDOWS = os.name == "nt"
 
@@ -127,17 +141,13 @@ _SUFFIX_RULES_BASE: Tuple[Tuple[str, str], ...] = (
     (".dwl",          "app"),
     (".dwl2",         "app"),
     (".sv$",          "app"),
-    (".prv",          "app"),
     (".psd.lock",     "app"),
     (".ai.lock",      "app"),
     (".idlk",         "app"),
     (".pyc",          "dev"),
     (".pyo",          "dev"),
-    (".class",        "dev"),
     (".suo",          "dev"),
-    (".user",         "dev"),
     (".ncb",          "dev"),
-    (".sdf",          "dev"),
     (".opensdf",      "dev"),
     (".vspscc",       "dev"),
     (".vssscc",       "dev"),
@@ -154,6 +164,28 @@ _SUFFIX_RULES_BASE: Tuple[Tuple[str, str], ...] = (
 _OPTIONAL_BAK_LOG_SUFFIXES: Tuple[Tuple[str, str], ...] = (
     (".bak", "windows"),
     (".log", "other"),
+)
+
+# Endungen, die NUR im Sonderfall eines Entwicklerprojekts Zwischenstaende
+# sind, sonst aber vollwertige Nutzdaten bezeichnen. Sie standen frueher
+# unbedingt in _SUFFIX_RULES_BASE und wurden damit ueber den gesamten Bestand
+# hinweg ohne Rueckfrage geloescht - per os.remove, also ohne Papierkorb und
+# unwiederbringlich. should_delete_file prueft ausschliesslich die Endung,
+# ohne jeden Kontext:
+#   .sdf   SQL-Server-Compact-Datenbank UND Autodesk Spatial Data File.
+#          Dass hier Autodesk im Einsatz ist, belegt die Regeltabelle selbst
+#          (.dwl, .dwl2, .sv$). Nur '<Projekt>.sdf' in einem Visual-Studio-
+#          Ordner ist ein Cache.
+#   .class Java-Bytecode - Bestandteil ausgelieferter Anwendungen, kein
+#          Zwischenstand.
+#   .prv   in mehreren Produkten die Ablage privater Schluessel.
+#   .user  trifft jedes 'Name.user', nicht nur '<Projekt>.vcxproj.user'.
+# Deshalb wie .bak/.log und desktop.ini nur auf ausdruecklichen Wunsch.
+_OPTIONAL_DEV_SUFFIXES: Tuple[Tuple[str, str], ...] = (
+    (".sdf",   "dev"),
+    (".class", "dev"),
+    (".user",  "dev"),
+    (".prv",   "app"),
 )
 
 _EXACT_RULES: Dict[str, str] = {
@@ -290,8 +322,8 @@ def _setup_logging(log_path: str) -> None:
                     # Anfang setzt.
                     self.stream.write("\r" + " " * 120 + "\r")
                     self.stream.flush()
-                except Exception:
-                    pass
+                except Exception as _e:
+                    logging.debug(f"emit: Exception verworfen: {_e!r}")
                 super().emit(record)
 
     console_handler = _ProgressAwareStreamHandler()
@@ -396,8 +428,8 @@ def is_old_enough(st: os.stat_result, min_age_seconds: float) -> bool:
 def register_protected_path(path: str) -> None:
     try:
         _PROTECTED_PATHS.add(os.path.normcase(os.path.abspath(path)))
-    except Exception:
-        pass
+    except Exception as _e:
+        logging.debug(f"register_protected_path: Exception verworfen: {_e!r}")
 
 
 def is_protected_path(path: str) -> bool:
@@ -585,8 +617,8 @@ def _rmtree_handle(func, path: str, exc: BaseException) -> None:
             os.chmod(path, stat.S_IWRITE)
             func(path)
             return
-        except Exception:
-            pass
+        except Exception as _e:
+            logging.debug(f"_rmtree_handle: Exception verworfen: {_e!r}")
     logging.error(f"rmtree-Fehler (nicht behebbar): {path} – {exc}")
 
 
@@ -612,30 +644,221 @@ def walk_and_clean_junk(
     base_dir: str,
     stats: "CleanupStats",
     dry_run: bool = False,
-) -> Generator[str, None, None]:
+    done_dirs: Optional[Set[str]] = None,
+) -> Generator[Tuple[str, str], None, None]:
+    """Liefert (Verzeichnis, Dateipfad).
+
+    Das Verzeichnis wird mitgegeben, damit der Aufrufer den Fortschritt
+    auf VERZEICHNISEBENE vermerken kann. Ein Vermerk je Datei waere hier
+    das falsche Mass: bei einem Bestand in Millionenhoehe entstuende eine
+    Fortschrittsdatei von hunderten Megabyte, die beim naechsten Start
+    komplett in den Speicher gelesen werden muesste - das Heilmittel
+    waere schlimmer als die Krankheit.
+
+    Ein vermerktes Verzeichnis wird uebersprungen, der Abstieg in seine
+    Unterordner aber NICHT. Das ist der entscheidende Punkt:
+
+    os.walk liefert im topdown-Modus ein Verzeichnis IMMER vor seinen
+    Unterverzeichnissen. Die letzte Datei eines Elternordners ist damit
+    zwangslaeufig fertig, bevor der Walk die Unterordner ueberhaupt
+    gelesen hat - der Elternordner gilt also strukturell frueh als
+    abgeschlossen. Wurde daraufhin (wie in der ersten Fassung) mit
+    'dirs[:] = []' der Abstieg unterbunden, schnitt die Wiederaufnahme
+    den GESAMTEN Teilbaum ab: ein Lauf meldete "sauber durchgelaufen",
+    obwohl er den Grossteil des Bestands nie angesehen hatte, und
+    loeschte anschliessend den Vermerk.
+
+    Gespart wird jetzt die Arbeit je Datei (Regelabgleich, stat,
+    Loeschversuch), nicht der Verzeichnisdurchlauf. Das ist weniger, aber
+    es ist richtig.
+    """
     def _walk_error(err: OSError) -> None:
         logging.warning(f"Verzeichnis nicht lesbar (fehlende Rechte?) – übersprungen: {err.filename}")
 
     for root, dirs, files in os.walk(base_dir, topdown=True, onerror=_walk_error):
+        # Schluessel OHNE '\\?\'-Praefix: os.walk reicht den Praefix des
+        # Wurzelpfads an jeden Unterordner weiter, die Fortschrittsdatei
+        # soll aber lesbare Pfade enthalten. Ohne diese Normalisierung
+        # verglichen sich praefigierte mit unpraefigierten Pfaden - der
+        # Vermerk hatte dann gar keine Wirkung.
+        schluessel = os.path.normcase(_strip_long_prefix(root))
+        bereits_erledigt = bool(done_dirs) and schluessel in done_dirs
+
         junk = [d for d in dirs if d.lower() in _MAC_JUNK_DIRS_LOWER]
         dirs[:] = [d for d in dirs if d not in junk and not is_excluded_dir(d)]
 
-        for d in junk:
-            full = os.path.join(root, d)
-            if dry_run:
-                logging.info(f"[SIMULATION] Würde Mac-Junk entfernen: {full}")
-                stats.add_mac_junk()
-                continue
-            try:
-                shutil.rmtree(full, **_RMTREE_KWARGS)
-                logging.info(f"Mac-Junk entfernt: {full}")
-                stats.add_mac_junk()
-            except Exception as e:
-                logging.error(f"Mac-Junk-Fehler {full}: {e}")
-                stats.add_mac_junk_error()
+        if not bereits_erledigt:
+            for d in junk:
+                full = os.path.join(root, d)
+                if dry_run:
+                    logging.info(f"[SIMULATION] Würde Mac-Junk entfernen: {full}")
+                    stats.add_mac_junk()
+                    continue
+                try:
+                    shutil.rmtree(full, **_RMTREE_KWARGS)
+                    logging.info(f"Mac-Junk entfernt: {full}")
+                    stats.add_mac_junk()
+                except Exception as e:
+                    logging.error(f"Mac-Junk-Fehler {full}: {e}")
+                    stats.add_mac_junk_error()
+
+        if bereits_erledigt:
+            # Dateien dieses Ordners ueberspringen, Unterordner aber
+            # weiterhin betreten (siehe Erklaerung im Docstring).
+            continue
+
+        # Die VOLLE Dateizahl des Verzeichnisses wird vorab gemeldet.
+        # Wuerde erst je Datei hochgezaehlt, faellt der Zaehler zwischen
+        # zwei Einreihungen auf 0 - schon nach der ersten fertigen Datei
+        # galt der Ordner dann als abgeschlossen.
+        yield schluessel, len(files), None
 
         for f in files:
-            yield os.path.join(root, f)
+            # Schluessel fuer den Fortschritt, echter Pfad fuer die Arbeit.
+            yield schluessel, 0, os.path.join(root, f)
+
+# ================================================================================
+# Wiederaufnahme nach Abbruch (auf Verzeichnisebene)
+# ================================================================================
+# ================================================================================
+# Gemeinsames Laufprotokoll (migration.jsonl)
+# ================================================================================
+# Ergaenzt das skripteigene Protokoll, ersetzt es nicht. Bewusst NUR die
+# tatsaechlichen Loeschungen und Fehler - ein Eintrag je geprueft-und-
+# behalten haette bei einem Bestand in Millionenhoehe eine Datei von
+# hunderten Megabyte ergeben.
+_laufprotokoll = None
+_protokoll_lock = threading.Lock()
+
+
+def _protokoll(pfad: str, aktion: str, status: str, detail: str = "") -> None:
+    global _laufprotokoll
+    if gem is None:
+        return
+    try:
+        with _protokoll_lock:
+            if _laufprotokoll is None:
+                _laufprotokoll = gem.Laufprotokoll(
+                    os.path.splitext(os.path.basename(__file__))[0])
+            _laufprotokoll.schreibe(pfad, aktion, status, detail)
+    except Exception:
+        pass
+
+
+class Fortschritt:
+    """Vermerkt abgeschlossene Verzeichnisse, damit ein Abbruch nicht den
+    kompletten Durchlauf kostet.
+
+    Ein Verzeichnis gilt erst als abgeschlossen, wenn ALLE daraus
+    eingereihten Dateien fertig verarbeitet sind - nicht schon beim
+    Einreihen. Deshalb die Zaehlung offener Dateien je Verzeichnis: bei
+    einem Thread-Pool laufen Einreihen und Abarbeiten auseinander, und
+    ein zu frueher Vermerk wuerde bei einem Abbruch genau die Dateien
+    ueberspringen, die noch in der Warteschlange standen.
+    """
+
+    def __init__(self, pfad: Optional[str]) -> None:
+        self.pfad   = pfad
+        self.lock   = threading.Lock()
+        self.offen: Dict[str, int] = {}
+        self.abgeschlossen = False
+
+    @staticmethod
+    def pfad_fuer(verzeichnis: str, regelkennung: str = "") -> str:
+        # realpath statt abspath: loest 8.3-Kurznamen (BENUTZ~1) und
+        # Verknuepfungen auf. Sonst bekaeme derselbe Ordner je nach
+        # Schreibweise des eingegebenen Pfades zwei verschiedene
+        # Fortschrittsdateien, und die Wiederaufnahme liefe ins Leere.
+        try:
+            aufgeloest = os.path.realpath(_strip_long_prefix(verzeichnis))
+        except Exception:
+            aufgeloest = os.path.abspath(_strip_long_prefix(verzeichnis))
+        # Die gewaehlten Loeschoptionen gehoeren MIT in die Kennung. Der
+        # Regelsatz wird pro Lauf aus den Startabfragen zusammengesetzt und
+        # variiert damit. Ohne die Optionen teilten sich ein zurueckhaltender
+        # und ein schaerferer Lauf dieselbe Fortschrittsdatei: der zweite
+        # ueberspraenge alle Verzeichnisse, die der erste bereits vermerkt
+        # hat - die zusaetzlich gewaehlten Dateitypen wuerden dort nie
+        # angefasst, und die Zusammenfassung meldete trotzdem einen sauberen
+        # Durchlauf. Mit der Regelkennung bekommt jede Optionskombination
+        # ihre eigene Datei; ein Wechsel beginnt bewusst von vorn.
+        kennung = hashlib.sha1(
+            (os.path.normcase(aufgeloest) + "\x00" + regelkennung)
+            .encode("utf-8", "surrogatepass")
+        ).hexdigest()[:12]
+        basis  = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or "."
+        ordner = os.path.join(basis, "Temp-File-Cleaner")
+        try:
+            os.makedirs(ordner, exist_ok=True)
+        except Exception:
+            ordner = basis
+        return os.path.join(ordner, f"resume_{kennung}.txt")
+
+    def laden(self) -> Set[str]:
+        if not self.pfad or not os.path.exists(self.pfad):
+            return set()
+        try:
+            with open(self.pfad, "r", encoding="utf-8", errors="replace") as fh:
+                return {os.path.normcase(z.rstrip("\n")) for z in fh if z.strip()}
+        except Exception as e:
+            logging.warning(f"Fortschrittsdatei nicht lesbar ({e}) – beginne von vorne.")
+            return set()
+
+    def registriere(self, verzeichnis: str, anzahl: int) -> bool:
+        """Meldet die VOLLE Dateizahl eines Verzeichnisses vorab an.
+
+        Rueckgabe True, wenn der Ordner gar keine Dateien hat und damit
+        sofort als abgeschlossen gilt.
+
+        Der Zaehler darf erst dann auf 0 fallen, wenn wirklich alle
+        Dateien fertig sind. Wuerde er - wie in der ersten Fassung - je
+        Datei einzeln hochgezaehlt, erreichte er zwischen zwei
+        Einreihungen den Wert 0, und der Ordner landete schon nach der
+        ersten fertigen Datei im Vermerk.
+        """
+        if not self.pfad:
+            return False
+        if anzahl <= 0:
+            self._schreibe(verzeichnis)
+            return True
+        with self.lock:
+            self.offen[verzeichnis] = self.offen.get(verzeichnis, 0) + anzahl
+        return False
+
+    def _schreibe(self, verzeichnis: str) -> None:
+        try:
+            with open(self.pfad, "a", encoding="utf-8") as fh:
+                fh.write(verzeichnis + "\n")
+        except Exception:
+            # Ein nicht schreibbarer Vermerk darf den Lauf nicht
+            # anhalten - er kostet dann nur die Wiederaufnahme.
+            pass
+
+    def erledigt(self, verzeichnis: str) -> None:
+        if not self.pfad:
+            return
+        schreiben = False
+        with self.lock:
+            if verzeichnis not in self.offen:
+                # Nicht (mehr) angemeldet: entweder bereits geschrieben
+                # oder nie registriert. Kein zweiter Eintrag.
+                return
+            rest = self.offen[verzeichnis] - 1
+            if rest <= 0:
+                self.offen.pop(verzeichnis, None)
+                schreiben = True
+            else:
+                self.offen[verzeichnis] = rest
+        if schreiben:
+            self._schreibe(verzeichnis)
+
+    def aufraeumen(self) -> None:
+        try:
+            if self.pfad and os.path.exists(self.pfad):
+                os.remove(self.pfad)
+        except Exception as _e:
+            logging.debug(f"aufraeumen: Exception verworfen: {_e!r}")
+
 
 # ================================================================================
 # Leere Ordner entfernen
@@ -838,8 +1061,8 @@ class ProgressReporter:
                 if len(short_path) > 45:
                     short_path = "..." + short_path[-42:]
                 path_info = f" | 📂 {short_path}"
-            except Exception:
-                pass
+            except Exception as _e:
+                logging.debug(f"_render: Exception verworfen: {_e!r}")
 
         proc    = self.stats.processed
         deleted = self.stats.deleted
@@ -932,9 +1155,12 @@ def process_file(
         if safe_remove_with_retry(filepath):
             logging.info(f"Gelöscht: {filepath}  ({reason}, {file_size/1024:.1f} KB)")
             stats.add_deleted(file_size, category)
+            _protokoll(filepath, "temp geloescht", "OK",
+                       f"{reason}, {file_size} Byte")
         else:
             logging.error(f"Fehler/Lock: {filepath}")
             stats.add_error()
+            _protokoll(filepath, "temp geloescht", "FEHLER", "gesperrt oder nicht loeschbar")
 
     except Exception as e:
         logging.error(f"Fehler bei {filepath}: {e}")
@@ -980,6 +1206,7 @@ def run_cleanup(
     wildcard_rules: Tuple[Tuple[str, str], ...],
     dry_run: bool = False,
     min_age_seconds: float = 0.0,
+    resume_path: Optional[str] = None,
 ) -> CleanupStats:
     stats = CleanupStats()
 
@@ -1015,7 +1242,23 @@ def run_cleanup(
     progress         = ProgressReporter(stats, base_dir, base_dir_display, total_files)
     executor         = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
-    def _worker_wrapper(fp: str) -> None:
+    # Im Probelauf wird nichts vermerkt: er aendert nichts, also gibt es
+    # auch nichts fortzusetzen.
+    fortschritt = Fortschritt(None if dry_run else resume_path)
+    erledigte   = fortschritt.laden()
+    if erledigte:
+        print(f"  ♻  Wiederaufnahme: {len(erledigte):,} abgeschlossene Verzeichnisse werden übersprungen")
+
+    def _worker_wrapper(verzeichnis: str, fp: str) -> None:
+        # War beim Eintritt bereits abgebrochen, kehrt process_file sofort
+        # zurueck, OHNE die Datei zu pruefen. Sie dann als erledigt zu melden
+        # ist falsch: faellt der Zaehler des Verzeichnisses dadurch auf 0,
+        # gilt es als abgeschlossen und wird beim Wiederaufnahmelauf
+        # uebersprungen - die ungeprueften Dateien darin bleiben fuer immer
+        # liegen. Der Zustand wird VOR dem Aufruf festgehalten, damit ein
+        # Abbruch waehrend der Verarbeitung die dann tatsaechlich geleistete
+        # Arbeit weiterhin zaehlt.
+        abgebrochen_beim_start = abort_flag.is_set()
         try:
             process_file(
                 fp, stats,
@@ -1027,15 +1270,26 @@ def run_cleanup(
             logging.error(f"Thread-Ausführung fehlgeschlagen: {exc}")
             stats.add_error()
         finally:
+            # Erst hier gilt die Datei als verarbeitet - siehe Fortschritt.
+            if not abgebrochen_beim_start:
+                fortschritt.erledigt(verzeichnis)
             submit_semaphore.release()
 
     progress.start()
 
     try:
         try:
-            for filepath in walk_and_clean_junk(base_dir, stats, dry_run):
+            for verzeichnis, anzahl, filepath in walk_and_clean_junk(
+                    base_dir, stats, dry_run, erledigte):
                 if abort_flag.is_set():
                     break
+
+                # Ankuendigung eines Verzeichnisses (filepath ist None):
+                # volle Dateizahl vorab anmelden, damit der Zaehler nicht
+                # zwischendurch auf 0 faellt.
+                if filepath is None:
+                    fortschritt.registriere(verzeichnis, anzahl)
+                    continue
 
                 submit_semaphore.acquire()
                 if abort_flag.is_set():
@@ -1043,8 +1297,9 @@ def run_cleanup(
                     break
 
                 try:
-                    executor.submit(_worker_wrapper, filepath)
+                    executor.submit(_worker_wrapper, verzeichnis, filepath)
                 except Exception:
+                    fortschritt.erledigt(verzeichnis)
                     submit_semaphore.release()
                     raise
 
@@ -1083,9 +1338,17 @@ def run_cleanup(
             wort = "leere Ordner gefunden" if dry_run else "leere Ordner entfernt"
             print(f"  → {removed} {wort}, {errors} Fehler")
 
+        # Nur ein vollstaendig durchgelaufener Durchgang loescht den
+        # Vermerk. Nach einem Abbruch bleibt er liegen - genau dafuer
+        # ist er da.
+        fortschritt.aufraeumen()
+
     except KeyboardInterrupt:
         print("\n\n⚠️  Abbruch durch Benutzer!")
         logging.warning("Abgebrochen durch Benutzer")
+        if fortschritt.pfad:
+            print(f"    Fortschritt vermerkt in: {fortschritt.pfad}")
+            print("    Ein erneuter Start setzt dort fort (--no-resume beginnt neu).")
         stats.print_summary(dry_run)
         return stats
     except Exception as e:
@@ -1101,10 +1364,14 @@ def run_cleanup(
 # Einstiegspunkt
 # ================================================================================
 
-def _build_suffix_rules(include_bak_log: bool) -> Tuple[Tuple[str, str], ...]:
+def _build_suffix_rules(include_bak_log: bool,
+                        include_dev: bool = False) -> Tuple[Tuple[str, str], ...]:
+    rules = _SUFFIX_RULES_BASE
     if include_bak_log:
-        return _SUFFIX_RULES_BASE + _OPTIONAL_BAK_LOG_SUFFIXES
-    return _SUFFIX_RULES_BASE
+        rules = rules + _OPTIONAL_BAK_LOG_SUFFIXES
+    if include_dev:
+        rules = rules + _OPTIONAL_DEV_SUFFIXES
+    return rules
 
 
 def _build_exact_rules(include_desktop_ini: bool) -> Dict[str, str]:
@@ -1164,12 +1431,20 @@ def main() -> None:
         default_yes=False,
     )
 
+    delete_dev = ask_yes_no(
+        "\nEntwickler-Zwischenstände (*.sdf, *.class, *.user, *.prv) ebenfalls löschen?\n"
+        "  (⚠️  Nur in Visual-Studio-Projektordnern sind das Caches. Sonst sind\n"
+        "   *.sdf Datenbanken bzw. Autodesk-Geodaten, *.class Java-Programmteile\n"
+        "   und *.prv private Schlüssel – gelöscht wird ohne Papierkorb)",
+        default_yes=False,
+    )
+
     dry_run = not ask_yes_no(
         "\nECHT-Modus starten? (Nein = Simulation, es wird nichts gelöscht)",
         default_yes=False,
     )
 
-    suffix_rules    = _build_suffix_rules(delete_bak_log)
+    suffix_rules    = _build_suffix_rules(delete_bak_log, delete_dev)
     exact_rules     = _build_exact_rules(delete_desktop_ini)
     wildcard_rules  = _WILDCARD_RULES
     min_age_seconds = max(MIN_AGE_HOURS, 0) * 3600.0
@@ -1208,6 +1483,11 @@ def main() -> None:
         print("    • desktop.ini    (auf Nutzerwunsch aktiviert)")
     else:
         print("    ○ desktop.ini    (nicht aktiv – Ordnersymbole/-namen)")
+    if delete_dev:
+        print("    • *.sdf / *.class / *.user / *.prv  (auf Nutzerwunsch aktiviert)")
+    else:
+        print("    ○ *.sdf / *.class / *.user / *.prv  (nicht aktiv – Datenbanken,")
+        print("      Autodesk-Geodaten, Java-Programmteile, private Schlüssel)")
     print("=" * 66)
 
     if dry_run:
@@ -1224,18 +1504,35 @@ def main() -> None:
             print("Abgebrochen.")
             return
 
+    # Wiederaufnahme: nach einem Abbruch setzt der naechste Lauf dort
+    # fort, statt den kompletten Verzeichnisbaum erneut abzugehen.
+    # Abschaltbar ueber die Umgebungsvariable TEMPCLEANER_NO_RESUME=1.
+    resume_path = None
+    if not dry_run and os.environ.get("TEMPCLEANER_NO_RESUME", "") != "1":
+        # Regelkennung mitgeben: sie unterscheidet Laeufe mit verschiedenen
+        # Loeschoptionen, damit ein schaerferer Lauf nicht die Verzeichnisse
+        # ueberspringt, die ein zurueckhaltenderer bereits vermerkt hat.
+        regelkennung = (
+            f"bak_log={int(bool(delete_bak_log))};"
+            f"desktop_ini={int(bool(delete_desktop_ini))};"
+            f"dev={int(bool(delete_dev))};"
+            f"leere_ordner={int(bool(remove_empty))};"
+            f"min_age_h={MIN_AGE_HOURS}"
+        )
+        resume_path = Fortschritt.pfad_fuer(target_dir, regelkennung)
+
     run_cleanup(
         target_dir, target_dir_display, remove_empty, count_first,
         exact_rules, suffix_rules, wildcard_rules,
-        dry_run, min_age_seconds,
+        dry_run, min_age_seconds, resume_path,
     )
 
     print()
     print(f"  Log gespeichert: {log_path}")
     try:
         input("\nEnter zum Beenden ...")
-    except Exception:
-        pass
+    except Exception as _e:
+        logging.debug(f"main: Exception verworfen: {_e!r}")
 
 
 if __name__ == "__main__":

@@ -100,10 +100,24 @@ if sys.platform == "win32":
     except Exception:
         pass
 try:
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+
+# ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Fehlt _gemeinsam.py - etwa weil nur dieses eine Skript weitergegeben
+# wurde -, laeuft alles unveraendert weiter; die daraus bedienten
+# Zusatzfunktionen schalten sich dann still ab.
+try:
+    _eigener_ordner = os.path.dirname(os.path.abspath(__file__))
+    if _eigener_ordner not in sys.path:
+        sys.path.insert(0, _eigener_ordner)
+    import _gemeinsam as gem
+except Exception:
+    gem = None
 
 import pythoncom
 import win32com.client
@@ -363,32 +377,32 @@ def _signal_handler(sig, frame) -> None:
         if ppt_orig_security_global is not None:
             try:
                 ppt_app_global.AutomationSecurity = ppt_orig_security_global
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
         try:
             ppt_app_global.Quit()
             time.sleep(1)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
 
     _kill_powerpoint_by_pid(ppt_pid_global, ppt_create_time_global)
 
     # Best effort Cache-Cleanup beim Strg+C-Abbruch (analog 3c).
     try:
         _cleanup_ppt_inetcache()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
     try:
         _cleanup_user_recent()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
 
     _safe_cleanup_temp()
 
     try:
         pythoncom.CoUninitialize()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
 
     sys.exit(1)
 
@@ -505,8 +519,8 @@ def _kill_powerpoint_by_pid(pid: Optional[int],
             try:
                 proc.terminate()
                 proc.wait(timeout=5)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_kill_powerpoint_by_pid: Exception verworfen: {_e!r}")
         try:
             if proc.is_running():
                 detail_logger.error(
@@ -588,8 +602,8 @@ def check_powerpoint_installed() -> None:
             ppt = win32com.client.DispatchEx("PowerPoint.Application")
             try:
                 detail_logger.info(f"PowerPoint-Version erkannt: {ppt.Version}")
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"check_powerpoint_installed: Exception verworfen: {_e!r}")
         except pywintypes.com_error as e:
             print("=" * 66)
             print("FEHLER: PowerPoint konnte nicht gestartet werden.")
@@ -608,13 +622,13 @@ def check_powerpoint_installed() -> None:
         if ppt is not None:
             try:
                 ppt.Quit()
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"check_powerpoint_installed: Exception verworfen: {_e!r}")
             time.sleep(0.5)
         try:
             pythoncom.CoUninitialize()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"check_powerpoint_installed: Exception verworfen: {_e!r}")
 
 
 def get_file_timestamps(file_path: str) -> Tuple[float, float, float]:
@@ -660,8 +674,8 @@ def _get_ppt_pid(ppt_app) -> Optional[int]:
         if hwnd:
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
             return pid
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_get_ppt_pid: Exception verworfen: {_e!r}")
     return None
 
 
@@ -723,8 +737,8 @@ def _enable_restore_privileges() -> None:
             try:
                 luid = win32security.LookupPrivilegeValue(None, name)
                 privs.append((luid, win32security.SE_PRIVILEGE_ENABLED))
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_enable_restore_privileges: Exception verworfen: {_e!r}")
         if not privs:
             return
         win32security.AdjustTokenPrivileges(htoken, 0, privs)
@@ -757,6 +771,27 @@ def _get_security_descriptor(path: str):
 
 
 def _apply_security_descriptor(path: str, sd) -> None:
+    """Eigentuemer, Gruppe und DACL einer ersetzten Datei wiederherstellen.
+
+    Alles wird in EINEM SetNamedSecurityInfo-Aufruf gesetzt. Frueher liefen
+    zwei getrennte Aufrufe (erst DACL, dann Owner) - und das Setzen des
+    Eigentuemers ordnet die Vererbung neu. Nachgestellt: eine Datei verlor
+    dabei die Kennzeichnung ihrer geerbten ACEs, und eine geerbte
+    EIGENTUEMERRECHTE-ACE (S-1-3-4) bekam zusaetzlich INHERIT_ONLY - damit galt
+    sie fuer die Datei selbst nicht mehr. Wer seinen Zugriff allein daraus
+    bezog, konnte die eigene Datei anschliessend nicht mehr oeffnen
+    (PermissionError). Das ist das Gegenteil dessen, was diese Funktion
+    bezweckt. Ein gemeinsamer Aufruf laesst Windows die Rechte in einem Zug
+    berechnen; der schaedliche Zwischenzustand entsteht gar nicht erst.
+
+    Der Eigentuemer wird ausserdem nur gesetzt, wenn er tatsaechlich abweicht -
+    ein privilegierter Schreibvorgang ohne Wirkung entfaellt damit.
+
+    Schlaegt der gemeinsame Aufruf fehl (typisch: kein SeRestorePrivilege im
+    Nutzer-Kontext, dann verweigert bereits das Owner-Feld), wird die DACL
+    einzeln nachgezogen. Damit bleibt das bisherige Verhalten erhalten, dass
+    wenigstens die Rechte ankommen.
+    """
     if sd is None:
         return
     try:
@@ -769,48 +804,72 @@ def _apply_security_descriptor(path: str, sd) -> None:
         dacl = sd.GetSecurityDescriptorDacl()
     except Exception:
         dacl = None
-    if dacl is not None:
-        try:
-            dacl_flags = win32security.DACL_SECURITY_INFORMATION
-            try:
-                ctrl, _rev = sd.GetSecurityDescriptorControl()
-                if ctrl & win32security.SE_DACL_PROTECTED:
-                    dacl_flags |= win32security.PROTECTED_DACL_SECURITY_INFORMATION
-                else:
-                    dacl_flags |= win32security.UNPROTECTED_DACL_SECURITY_INFORMATION
-            except Exception:
-                pass
-            win32security.SetNamedSecurityInfo(
-                p, win32security.SE_FILE_OBJECT, dacl_flags,
-                None, None, dacl, None)
-            detail_logger.debug(f"DACL wiederhergestellt: {path}")
-        except Exception as e:
-            detail_logger.warning(
-                f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e}")
-
     try:
         owner = sd.GetSecurityDescriptorOwner()
+    except Exception:
+        owner = None
+    try:
+        group = sd.GetSecurityDescriptorGroup()
+    except Exception:
         group = None
+
+    info = 0
+    if dacl is not None:
+        info |= win32security.DACL_SECURITY_INFORMATION
         try:
-            group = sd.GetSecurityDescriptorGroup()
-        except Exception:
-            pass
-        if owner is not None:
-            sec_flags = win32security.OWNER_SECURITY_INFORMATION
-            if group is not None:
-                sec_flags |= win32security.GROUP_SECURITY_INFORMATION
-            win32security.SetNamedSecurityInfo(
-                p, win32security.SE_FILE_OBJECT, sec_flags,
-                owner, group, None, None)
-            detail_logger.debug(f"Owner wiederhergestellt: {path}")
+            ctrl, _rev = sd.GetSecurityDescriptorControl()
+            if ctrl & win32security.SE_DACL_PROTECTED:
+                info |= win32security.PROTECTED_DACL_SECURITY_INFORMATION
+            else:
+                info |= win32security.UNPROTECTED_DACL_SECURITY_INFORMATION
+        except Exception as _e:
+            detail_logger.debug(f"_apply_security_descriptor: Exception verworfen: {_e!r}")
+
+    # Eigentuemer nur setzen, wenn er wirklich abweicht.
+    if owner is not None:
+        try:
+            akt = win32security.GetNamedSecurityInfo(
+                p, win32security.SE_FILE_OBJECT,
+                win32security.OWNER_SECURITY_INFORMATION
+            ).GetSecurityDescriptorOwner()
+            if (win32security.ConvertSidToStringSid(akt)
+                    == win32security.ConvertSidToStringSid(owner)):
+                owner = None
+        except Exception as _e:
+            detail_logger.debug(f"_apply_security_descriptor: Owner-Vergleich verworfen: {_e!r}")
+
+    if owner is not None:
+        info |= win32security.OWNER_SECURITY_INFORMATION
+    if group is not None:
+        info |= win32security.GROUP_SECURITY_INFORMATION
+    if not info:
+        return
+
+    nur_dacl = info & ~(win32security.OWNER_SECURITY_INFORMATION
+                        | win32security.GROUP_SECURITY_INFORMATION)
+
+    try:
+        win32security.SetNamedSecurityInfo(
+            p, win32security.SE_FILE_OBJECT, info, owner, group, dacl, None)
+        detail_logger.debug(f"Sicherheitsinfo wiederhergestellt: {path}")
+        return
     except Exception as e:
+        if owner is None and group is None:
+            detail_logger.warning(f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e}")
+            return
         if _restore_privileges_enabled:
-            detail_logger.warning(
-                f"Owner-Wiederherstellung fehlgeschlagen ({path}): {e}")
+            detail_logger.warning(f"Owner-Wiederherstellung fehlgeschlagen ({path}): {e}")
         else:
-            detail_logger.debug(
-                f"Owner nicht gesetzt (kein Admin-Privileg – im "
-                f"Nutzer-Kontext unkritisch): {path} – {e}")
+            detail_logger.debug(f"Owner nicht gesetzt (kein Admin-Privileg - im Nutzer-Kontext unkritisch): {path} - {e}")
+
+    # Rueckfall: wenigstens die DACL setzen.
+    if dacl is not None and nur_dacl:
+        try:
+            win32security.SetNamedSecurityInfo(
+                p, win32security.SE_FILE_OBJECT, nur_dacl, None, None, dacl, None)
+            detail_logger.debug(f"DACL wiederhergestellt (ohne Owner): {path}")
+        except Exception as e2:
+            detail_logger.warning(f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e2}")
 
 
 # ==================================================================
@@ -839,10 +898,10 @@ def _check_file_locked(file_path: str) -> bool:
         attrs = win32api.GetFileAttributes(long_path)
         if attrs != -1 and (attrs & win32con.FILE_ATTRIBUTE_READONLY):
             is_read_only = True
-    except Exception:
+    except Exception as _e:
         # Wenn GetFileAttributes scheitert, dem alten Pfad folgen
         # (Write-Test wird scheitern, aber das ist dann nicht durch R/O)
-        pass
+        detail_logger.debug(f"_check_file_locked: Exception verworfen: {_e!r}")
 
     try:
         if is_read_only:
@@ -912,8 +971,8 @@ def _safe_remove_with_retry(path: str,
     # wuerden saemtliche Retries sinnlos fehlschlagen.
     try:
         os.chmod(long_path, stat.S_IWRITE)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_safe_remove_with_retry: Exception verworfen: {_e!r}")
     for attempt in range(retries):
         try:
             os.remove(long_path)
@@ -952,13 +1011,24 @@ def _replace_file_with_backup(src: str, dst: str) -> None:
     if os.path.exists(dst_long):
         try:
             os.chmod(dst_long, stat.S_IWRITE)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_replace_file_with_backup: Exception verworfen: {_e!r}")
         bak_long = _long_path(dst + f"_{uuid.uuid4().hex[:6]}.bak")
         os.replace(dst_long, bak_long)
     try:
         _safe_move(src, dst)
-    except Exception:
+    # BaseException, nicht Exception: Der Signal-Handler beendet sich mit
+    # sys.exit(), und das loest SystemExit aus - eine BaseException. Bei
+    # Strg+C oder SIGTERM mitten im Kopiervorgang wurde der Rollback deshalb
+    # UEBERSPRUNGEN, obwohl das Original oben bereits per os.replace auf den
+    # .bak-Namen umbenannt war. Zurueck blieb am Originalnamen der von
+    # shutil.copy2 sofort auf 0 Byte trunkierte Torso, waehrend der einzige
+    # vollstaendige Bestand unter einem .bak-Namen lag, den weder der
+    # Anwender noch ein spaeterer Lauf findet oder aufraeumt. Nachgestellt:
+    # 'Vortrag.pptx' 2 Byte statt 1400, daneben 'Vortrag.pptx_99688a.bak'.
+    # Das abschliessende 'raise' reicht SystemExit unveraendert weiter, der
+    # Abbruch wirkt also wie bisher - nur eben mit intakter Datei.
+    except BaseException:
         if bak_long and os.path.exists(bak_long):
             try:
                 if os.path.exists(dst_long):
@@ -1019,8 +1089,8 @@ def _cleanup_ppt_inetcache() -> None:
                 try:
                     try:
                         os.chmod(fpath, stat.S_IWRITE)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"_cleanup_ppt_inetcache: Exception verworfen: {_e!r}")
                     os.remove(fpath)
                     files_deleted += 1
                     bytes_freed   += fsize
@@ -1096,8 +1166,8 @@ def _cleanup_user_recent() -> None:
             try:
                 try:
                     os.chmod(fpath, stat.S_IWRITE)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"_cleanup_user_recent: Exception verworfen: {_e!r}")
                 os.remove(fpath)
                 files_deleted += 1
                 bytes_freed   += fsize
@@ -1156,24 +1226,24 @@ def _cleanup_windows_temp() -> None:
                 try:
                     os.remove(entry.path)
                     removed_files += 1
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"_cleanup_windows_temp: Exception verworfen: {_e!r}")
             elif entry.is_dir():
                 try:
                     shutil.rmtree(entry.path, ignore_errors=True)
                     if not os.path.exists(entry.path):
                         removed_dirs += 1
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as _e:
+                    detail_logger.debug(f"_cleanup_windows_temp: Exception verworfen: {_e!r}")
+        except Exception as _e:
+            detail_logger.debug(f"_cleanup_windows_temp: Exception verworfen: {_e!r}")
     try:
         detail_logger.info(
             f"Windows-Temp-Cleanup (Whitelist): {removed_files} Dateien, "
             f"{removed_dirs} Ordner aus {win_temp} entfernt, "
             f"{skipped} fremde Einträge unangetastet.")
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_cleanup_windows_temp: Exception verworfen: {_e!r}")
 
 
 # ==================================================================
@@ -1194,16 +1264,16 @@ def _start_ppt_instance():
 
     try:
         ppt.WindowState = PP_WINDOW_MINIMIZED
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_start_ppt_instance: Exception verworfen: {_e!r}")
     try:
         ppt.DisplayAlerts = PP_ALERTS_NONE
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_start_ppt_instance: Exception verworfen: {_e!r}")
     try:
         ppt.FeatureInstall = MSO_FEATURE_INSTALL_NONE
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_start_ppt_instance: Exception verworfen: {_e!r}")
 
     pid = _get_ppt_pid(ppt)
     try:
@@ -1220,13 +1290,13 @@ def _quit_ppt_instance(ppt, ppt_pid: Optional[int], orig_security=None,
         if orig_security is not None:
             try:
                 ppt.AutomationSecurity = orig_security
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_quit_ppt_instance: Exception verworfen: {_e!r}")
         try:
             ppt.Quit()
             time.sleep(1)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_quit_ppt_instance: Exception verworfen: {_e!r}")
     _kill_powerpoint_by_pid(ppt_pid, create_time)
 
 
@@ -1410,18 +1480,19 @@ def test_trust_center_smoke(timeout: float = 25.0) -> Tuple[bool, str, str]:
     finally:
         if open_pres is not None:
             try: open_pres.Close()
-            except Exception: pass
+            except Exception as _e:
+                detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         if ppt is not None:
             _quit_ppt_instance(ppt, ppt_pid, orig_security, ppt_create_time)
         try:
             if os.path.exists(test_path):
                 os.remove(test_path)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try:
             pythoncom.CoUninitialize()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
 
 
 # ==================================================================
@@ -1442,7 +1513,29 @@ def load_done_set() -> set:
     return done
 
 
+
+# ==================================================================
+# Gemeinsames Laufprotokoll (migration.jsonl)
+# ==================================================================
+# Ergaenzt das skripteigene Protokoll, ersetzt es nicht. Erst damit
+# laesst sich der Fortschritt ueber alle elf Schritte auswerten.
+_laufprotokoll = None
+
+
+def _protokoll(pfad: str, aktion: str, status: str, detail: str = "") -> None:
+    global _laufprotokoll
+    if gem is None:
+        return
+    try:
+        if _laufprotokoll is None:
+            _laufprotokoll = gem.Laufprotokoll(
+                os.path.splitext(os.path.basename(__file__))[0])
+        _laufprotokoll.schreibe(pfad, aktion, status, detail)
+    except Exception:
+        pass
+
 def append_done(file_path: str) -> None:
+    _protokoll(file_path, "Schrift ersetzt", "OK")
     try:
         with open(DONE_FILE, "a", encoding="utf-8") as f:
             f.write(file_path + "\n")
@@ -1480,7 +1573,7 @@ def ask_directory() -> str:
     while True:
         try:
             choice = input("Auswahl [0-8]: ").strip()
-        except EOFError:
+        except (EOFError, RuntimeError, OSError):
             print("\nKeine Eingabe möglich (EOF) – Abbruch.")
             sys.exit(1)
         if choice == "0":
@@ -1503,7 +1596,7 @@ def ask_directory() -> str:
         elif choice == "8":
             try:
                 raw = input("Pfad eingeben: ")
-            except EOFError:
+            except (EOFError, RuntimeError, OSError):
                 print("\nKeine Eingabe möglich (EOF) – Abbruch.")
                 sys.exit(1)
             path = sanitize_path(raw)
@@ -1531,9 +1624,36 @@ def ask_directory() -> str:
 def ask_font(default: str) -> str:
     try:
         val = input(f"\nZiel-Schriftart [Standard: {default}]: ").strip()
-    except EOFError:
+    except (EOFError, RuntimeError, OSError):
         return default
     return val if val else default
+
+
+def _is_tty() -> bool:
+    """Haengt stdin an einer echten Konsole? (wie in 4b)"""
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def _warte_auf_taste(auto_mode: bool = False) -> None:
+    """Abschliessendes 'Beliebige Taste' - nur wenn wirklich jemand zusieht.
+
+    Ohne diesen Schutz blockierte ein geplanter Lauf mit angehaengter Konsole
+    unbegrenzt an der Eingabe: der Task lief nie zu Ende und hielt die
+    Einzelinstanz-Sperre, so dass der Folgelauf am naechsten Tag mit
+    'bereits aktiv' abbrach - die Migration stand still, ohne dass ein Fehler
+    im Log erschien. Ist stdin ganz abgeloest (pythonw, Taskplaner ohne
+    Benutzeranmeldung), wirft input() ausserdem RuntimeError('lost sys.stdin')
+    oder OSError - beides KEIN EOFError, der frueher allein abgefangen wurde.
+    """
+    if auto_mode or not _is_tty():
+        return
+    try:
+        input("Beliebige Taste drücken, um das Fenster zu schließen ...")
+    except (EOFError, RuntimeError, OSError):
+        pass
 
 
 def ask_yes_no(prompt: str, default_yes: bool = False) -> bool:
@@ -1541,7 +1661,7 @@ def ask_yes_no(prompt: str, default_yes: bool = False) -> bool:
     while True:
         try:
             answer = input(f"{prompt} {hint}: ").strip().lower()
-        except EOFError:
+        except (EOFError, RuntimeError, OSError):
             return default_yes
         if answer == "" and default_yes:
             return True
@@ -1575,7 +1695,7 @@ def ask_progress_mode() -> tuple:
     while True:
         try:
             choice = input("Auswahl [1-3]: ").strip()
-        except EOFError:
+        except (EOFError, RuntimeError, OSError):
             return (False, False)
         if choice in ("", "1"):
             return (False, False)
@@ -1698,8 +1818,8 @@ def _set_chart_fonts(chart, font_name: str) -> None:
     try:
         if chart.HasTitle:
             chart.ChartTitle.Characters().Font.Name = font_name
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     for axis_type in (1, 2, 3):
         for axis_group in (1, 2):
@@ -1708,44 +1828,44 @@ def _set_chart_fonts(chart, font_name: str) -> None:
                 try:
                     if ax.HasTitle:
                         ax.AxisTitle.Characters().Font.Name = font_name
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
                 try:
                     ax.TickLabels.Font.Name = font_name
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                except Exception as _e:
+                    detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
+            except Exception as _e:
+                detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     try:
         if chart.HasLegend:
             chart.Legend.Font.Name = font_name
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     try:
         for series in chart.SeriesCollection():
             try:
                 if series.HasDataLabels:
                     series.DataLabels().Font.Name = font_name
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
             try:
                 for trendline in series.Trendlines():
                     try:
                         if trendline.HasLabel:
                             trendline.DataLabel.Font.Name = font_name
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-    except Exception:
-        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
+            except Exception as _e:
+                detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     try:
         chart.ChartArea.Font.Name = font_name
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
 
 def _set_wordart_font(shape, font_name: str) -> bool:
@@ -1755,8 +1875,8 @@ def _set_wordart_font(shape, font_name: str) -> bool:
             tef.FontName = font_name
             detail_logger.debug("WordArt-Font gesetzt")
             return True
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_set_wordart_font: Exception verworfen: {_e!r}")
     return False
 
 
@@ -1770,25 +1890,25 @@ def _process_shape_font(shape, font_name: str, depth: int = 0) -> None:
         # --- WordArt ---
         try:
             _set_wordart_font(shape, font_name)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
 
         # --- Textrahmen ---
         if shape.HasTextFrame:
             tr = shape.TextFrame.TextRange
             try:
                 tr.Font.Name = font_name
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
             try:
                 if tr.Length > 0:
                     for run in tr.Runs():
                         try:
                             run.Font.Name = font_name
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+                        except Exception as _e:
+                            detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
+            except Exception as _e:
+                detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
 
         # --- Tabelle ---
         if shape.HasTable:
@@ -1802,29 +1922,29 @@ def _process_shape_font(shape, font_name: str, depth: int = 0) -> None:
                                 tr = cell.Shape.TextFrame.TextRange
                                 try:
                                     tr.Font.Name = font_name
-                                except Exception:
-                                    pass
+                                except Exception as _e:
+                                    detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
                                 try:
                                     if tr.Length > 0:
                                         for run in tr.Runs():
                                             try:
                                                 run.Font.Name = font_name
-                                            except Exception:
-                                                pass
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+                                            except Exception as _e:
+                                                detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
+                                except Exception as _e:
+                                    detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
+                        except Exception as _e:
+                            detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
+            except Exception as _e:
+                detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
 
         # --- Gruppe (rekursiv) ---
         if shape.Type == MSO_TYPE_GROUP:
             try:
                 for sub_shape in shape.GroupItems:
                     _process_shape_font(sub_shape, font_name, depth + 1)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
 
         # --- SmartArt ---
         try:
@@ -1842,16 +1962,16 @@ def _process_shape_font(shape, font_name: str, depth: int = 0) -> None:
                         if tf2 is not None:
                             tf2.TextRange.Font.Name = font_name
                             font_set = True
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"_process_smartart_node: Exception verworfen: {_e!r}")
                     if not font_set:
                         try:
                             tf = node.TextFrame
                             if tf is not None:
                                 tf.TextRange.Font.Name = font_name
                                 font_set = True
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"_process_smartart_node: Exception verworfen: {_e!r}")
                     if not font_set:
                         smartart_failed_nodes += 1
 
@@ -1861,18 +1981,18 @@ def _process_shape_font(shape, font_name: str, depth: int = 0) -> None:
                     detail_logger.warning(
                         f"SmartArt: {smartart_failed_nodes}/{smartart_total_nodes} "
                         f"Knoten nicht änderbar – ggf. manuell prüfen")
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
 
         # --- Chart ---
         if shape.HasChart:
             try:
                 _set_chart_fonts(shape.Chart, font_name)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
 
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
 
 
 def _process_shapes_collection(shapes, font_name: str) -> None:
@@ -1882,8 +2002,8 @@ def _process_shapes_collection(shapes, font_name: str) -> None:
         try:
             for shape in shapes:
                 _process_shape_font(shape, font_name)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_process_shapes_collection: Exception verworfen: {_e!r}")
         return
 
     for i in range(1, count + 1):
@@ -1933,8 +2053,8 @@ def _remove_ppt_metadata(presentation, selected: dict) -> bool:
                         try:
                             slide.Comments(j).Delete()
                             any_removed = True
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"_remove_ppt_metadata: Exception verworfen: {_e!r}")
                 except Exception as e:
                     detail_logger.debug(
                         f"Kommentare auf Folie {i} nicht löschbar: {e}")
@@ -1975,6 +2095,15 @@ def replace_fonts_in_presentation(
     # Original ueberschrieben. Schuetzt vor Datenverlust bei Crash
     # (Watchdog-Kill nach 240s, Netzwerk-Drop, COM-Fehler) waehrend Save.
     temp_stage2_path = None
+    # Zieldatei einer Formatkonvertierung, die DIREKT in die Ablage geschrieben
+    # wurde (kein Long-Path-Temp-Umweg). Bricht die Verarbeitung danach ab -
+    # Watchdog-Timeout beim Save, harter Kill, COM-Fehler -, liegt dort eine
+    # halbfertige Datei NEBEN dem unveraenderten Original. Kein Aufraeumpfad
+    # erfasste sie: der finally-Block kennt nur Temp-Artefakte. Deshalb hier
+    # mitfuehren und im finally entfernen, solange der Durchlauf nicht
+    # erfolgreich abgeschlossen ist.
+    direkt_geschriebenes_ziel = None
+    lauf_erfolgreich          = False
     # was_read_only protokolliert, ob das Original schreibgeschuetzt war.
     # Wird am Ende nach erfolgreichem Move wiederhergestellt.
     was_read_only  = False
@@ -2079,14 +2208,14 @@ def replace_fonts_in_presentation(
             if presentation.Final:
                 presentation.Final = False
                 detail_logger.debug("Final-Markierung aufgehoben")
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"replace_fonts_in_presentation: Exception verworfen: {_e!r}")
 
         try:
             presentation.RemovePersonalInformation = False
             detail_logger.debug("RemovePersonalInformation deaktiviert")
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"replace_fonts_in_presentation: Exception verworfen: {_e!r}")
 
         # --- Schema-Migration ---
         new_path = None
@@ -2096,8 +2225,8 @@ def replace_fonts_in_presentation(
                 has_macros = False
                 try:
                     has_macros = presentation.HasVBProject
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"replace_fonts_in_presentation: Exception verworfen: {_e!r}")
 
                 if ext == ".pps":
                     new_format = PP_FORMAT_PPSM if has_macros else PP_FORMAT_PPSX
@@ -2142,6 +2271,9 @@ def replace_fonts_in_presentation(
                     _saveas_target = temp_conv_path
                 else:
                     _saveas_target = new_path
+                    # Ohne Temp-Umweg schreibt SaveAs direkt in die Ablage -
+                    # ab hier ist eine unfertige Zieldatei moeglich.
+                    direkt_geschriebenes_ziel = new_path
 
                 try:
                     _ppt_call_with_watchdog(
@@ -2216,6 +2348,14 @@ def replace_fonts_in_presentation(
                     return "ERROR"
                 except Exception as e:
                     detail_logger.warning(f"Re-Serialisierung fehlgeschlagen: {e}")
+                    # temp_stage2_path zuruecksetzen - wie im Parallelzweig
+                    # weiter unten. Der Pfad wurde oben GESETZT, bevor der
+                    # SaveAs lief. Scheitert der SaveAs mit einem gewoehnlichen
+                    # COM-Fehler (Temp-Ordner nicht beschreibbar, Datentraeger
+                    # voll, Trust-Center-Ablehnung), existiert dort keine
+                    # brauchbare Datei - der Rueckschreibzweig weiter unten
+                    # haette sie aber trotzdem als Quelle genommen.
+                    temp_stage2_path = None
             else:
                 # Kein OOXML-Format-Mapping (selten - alte Formate ohne
                 # Open-XML-Pendant). Trotzdem temp_stage2 vorbereiten,
@@ -2265,8 +2405,8 @@ def replace_fonts_in_presentation(
                                 _process_shapes_collection(layout.Shapes, font_name)
                             except Exception:
                                 continue
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"replace_fonts_in_presentation: Exception verworfen: {_e!r}")
                 except Exception:
                     continue
         except Exception as e:
@@ -2411,8 +2551,8 @@ def replace_fonts_in_presentation(
                             if attrs != -1 and (attrs & win32con.FILE_ATTRIBUTE_READONLY):
                                 was_read_only = True
                                 os.chmod(orig_long, stat.S_IWRITE)
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"replace_fonts_in_presentation: Exception verworfen: {_e!r}")
 
                     if not (os.path.exists(_long_path(temp_stage2_path))
                             and os.path.getsize(_long_path(temp_stage2_path)) > 0):
@@ -2485,6 +2625,7 @@ def replace_fonts_in_presentation(
                    + (" [konvertiert]" if was_converted else ""))
         detail_logger.info(f"Erfolgreich: {original_path}")
         append_done(original_path)
+        lauf_erfolgreich = True
         return "SUCCESS"
 
     except Exception as e:
@@ -2514,8 +2655,8 @@ def replace_fonts_in_presentation(
         if presentation is not None:
             try:
                 presentation.Close()
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_presentation: Exception verworfen: {_e!r}")
         if is_temp_copy and os.path.exists(_long_path(file_path)):
             _safe_remove_with_retry(file_path)
         if temp_conv_path and os.path.exists(_long_path(temp_conv_path)):
@@ -2525,6 +2666,24 @@ def replace_fonts_in_presentation(
         # RESCUE_-Datei kopiert; das hier ist nur Aufraeumarbeit.
         if temp_stage2_path and os.path.exists(_long_path(temp_stage2_path)):
             _safe_remove_with_retry(temp_stage2_path)
+        # Halbfertige Zieldatei einer direkt in die Ablage geschriebenen
+        # Konvertierung entfernen. Sonst laegen Original und Teilkonvertat
+        # nebeneinander: der Anwender sieht zwei Dateien und kann nicht
+        # erkennen, welche brauchbar ist - und ein Wiederholungslauf legt
+        # wegen der Namenskollision eine dritte an (_1).
+        # Das Original bleibt unangetastet; nur die neue Datei faellt weg.
+        if (not lauf_erfolgreich
+                and direkt_geschriebenes_ziel
+                and direkt_geschriebenes_ziel.lower() != original_path.lower()
+                and os.path.exists(_long_path(direkt_geschriebenes_ziel))):
+            if _safe_remove_with_retry(direkt_geschriebenes_ziel):
+                detail_logger.warning(
+                    f"Unfertige Zieldatei nach Abbruch entfernt: "
+                    f"{direkt_geschriebenes_ziel}")
+            else:
+                detail_logger.error(
+                    f"Unfertige Zieldatei NICHT entfernbar - bitte pruefen: "
+                    f"{direkt_geschriebenes_ziel}")
 
 
 # ==================================================================
@@ -2606,12 +2765,12 @@ def process_directory(
                         # Cache-Cleanup analog 3c (PowerPoint tot, frischer Neustart).
                         try:
                             _cleanup_ppt_inetcache()
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
                         try:
                             _cleanup_user_recent()
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
                         time.sleep(1)
 
                     # --- Recovery, falls PPT-Instanz fehlt ---
@@ -2665,8 +2824,8 @@ def process_directory(
                         try:
                             _quit_ppt_instance(ppt, ppt_pid, orig_security,
                                                ppt_create_time)
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
                         ppt             = None
                         ppt_pid         = None
                         ppt_create_time = None
@@ -2674,12 +2833,12 @@ def process_directory(
                         # Cache-Cleanup nach Watchdog-Kill (PowerPoint tot).
                         try:
                             _cleanup_ppt_inetcache()
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
                         try:
                             _cleanup_user_recent()
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
                 except Exception as e:
                     log_error(file_path, e)
                     stats["ERROR"] += 1
@@ -2706,12 +2865,12 @@ def process_directory(
         # aufraeumen - analog zu 3a/3b/3c/4a/4b. Beide best effort.
         try:
             _cleanup_ppt_inetcache()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
         try:
             _cleanup_user_recent()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
 
     return stats
 
@@ -2919,11 +3078,7 @@ if __name__ == "__main__":
             log_error("GLOBAL", e)
         print(f"\n  Dauer:       {str(datetime.now() - dr_start).split('.')[0]}")
         print(f"  Detail-Log:  {os.path.abspath(DETAILED_LOG_FILE)}")
-        if not auto_mode:
-            try:
-                input("\nBeliebige Taste drücken, um das Fenster zu schließen ...")
-            except EOFError:
-                pass
+        _warte_auf_taste(auto_mode)
         sys.exit(0)
 
     # --- PowerPoint Smoke-Test (nach Bestaetigung, vor Hauptlauf) ---
@@ -2968,6 +3123,20 @@ if __name__ == "__main__":
             log_warn_text = "Abbruch durch Benutzer nach Smoke-Test-Warnung."
             log_ignore_text = "Smoke-Test-Warnung vom Benutzer ignoriert – Fortsetzung."
 
+        # Im Automatikmodus NICHT fragen. Der Hilfetext zu --auto sagt
+        # 'Trust-Center-Check und interaktive Rueckfragen ueberspringen', und
+        # alle anderen Rueckfragen sind entsprechend geklammert - dieser Block
+        # war es nicht. Mit angehaengter Konsole blockierte input() unbegrenzt
+        # (der Task lief nie zu Ende und hielt die Einzelinstanz-Sperre); ohne
+        # stdin lieferte ask_yes_no den Vorgabewert False und das Skript
+        # beendete sich mit sys.exit(0), also Erfolgs-Exitcode - der
+        # Aufgabenplaner meldete 'erfolgreich', obwohl keine einzige Datei
+        # verarbeitet wurde. Exit-Code 2 macht den Fehlschlag sichtbar.
+        if auto_mode:
+            print("\n❌  Abbruch im AUTO-Modus nach fehlgeschlagenem Trust-Center-Test.")
+            file_logger.error("Abbruch (auto_mode) nach fehlgeschlagenem Trust-Center-Test.")
+            sys.exit(2)
+
         if not ask_yes_no("\nTrotzdem fortfahren? (Timeout-Risiko pro Datei!)",
                           default_yes=False):
             print("Abgebrochen.")
@@ -2985,6 +3154,20 @@ if __name__ == "__main__":
             signal.signal(signal.SIGTERM, _signal_handler)
         except (ValueError, OSError):
             pass
+
+    # --- Einzelinstanz-Schutz ---
+    # Diese Sperre gab es bisher nur in 3a-3c. Ohne sie konnten zwei
+    # Laeufe gleichzeitig ueber denselben Bestand gehen und sich
+    # gegenseitig die Temp-Kopien und Zieldateien wegziehen.
+    # Freigabe ueber atexit, damit sie auch bei sys.exit greift.
+    _sperre = None
+    if gem is not None:
+        _sperre = gem.Einzelinstanz("4c_ersetze_font_in_powerpoint")
+        if not _sperre.belegen():
+            print(_sperre.hinweis())
+            sys.exit(1)
+        import atexit
+        atexit.register(_sperre.freigeben)
 
     pythoncom.CoInitialize()
 
@@ -3042,8 +3225,9 @@ if __name__ == "__main__":
     print("=" * 66)
 
     print()
-    try:
-        input("Beliebige Taste drücken, um das Fenster zu schließen ...")
-    except EOFError:
-        pass
+    # _cleanup_windows_temp() VOR die Wartezeile: schliesst der Anwender das
+    # Fenster ueber das Kreuz statt Enter zu druecken, unterblieb die
+    # Temp-Bereinigung sonst vollstaendig (~$-, gen_py- und 4c-Reste in
+    # %TEMP%). In 4a steht der Aufruf ebenfalls davor.
     _cleanup_windows_temp()
+    _warte_auf_taste(auto_mode)

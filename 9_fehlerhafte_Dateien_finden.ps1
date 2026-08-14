@@ -2,18 +2,84 @@
 # Fehlerhafte Office-Dateien finden (Word / Excel / PowerPoint)
 # Voraussetzung: Windows PowerShell 5.1, .NET Framework, STA-Modus
 #
-# Hinweise zur .exe-Kompilierung (PS2EXE/ps2exe): mit -sta kompilieren, -noConsole nicht verwenden 
-# (Read-Host und Fortschritt werden sonst unsichtbar), und sicherstellen, dass PresentationFramework 
-# auf dem Zielsystem verfügbar ist 
+# Hinweise zur .exe-Kompilierung (PS2EXE/ps2exe): mit -sta kompilieren, -noConsole nicht verwenden
+# (Read-Host und Fortschritt werden sonst unsichtbar). PresentationFramework wird nicht mehr
+# benoetigt - die drei Rueckfragen laufen seit der Umstellung auf Confirm-YesNo ueber die Konsole.
 # Invoke-ps2exe -inputFile "9_fehlerhafte_Dateien_finden.ps1" -outputFile \
 # "9_fehlerhafte_Dateien_finden.exe" -iconFile "powershell_icon.ico" -sta
 #
 # Stand: 11.06.2026
 # =====================================================================
 
-Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+# ---------------------------------------------------------------------
+# Rueckfragen
+# ---------------------------------------------------------------------
+function Confirm-YesNo {
+    <#
+        Ja/Nein-Rueckfrage auf der Konsole.
+
+        Dieses Skript war das einzige der Sammlung, das seine drei
+        Rueckfragen ueber [System.Windows.MessageBox]::Show stellte. Das
+        setzt eine Fensterstation voraus: unter 'ps2exe -noConsole', in
+        einer Remote-Sitzung ohne Desktop oder in einem geplanten Task
+        erscheint das Fenster nicht oder unsichtbar hinter anderen - der
+        Lauf stand dann ohne erkennbaren Grund. Alle anderen Skripte
+        benutzen Read-Host; jetzt auch dieses.
+
+        Ohne interaktive Konsole wird NICHT fortgefahren: die drei
+        Rueckfragen betreffen alle einen Zustand, in dem ein blindes
+        Weiterlaufen Office-Sitzungen des Anwenders gefaehrdet oder
+        stundenlang in Timeouts laeuft.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Message,
+        [switch]$DefaultYes
+    )
+
+    # Nicht am Hostnamen festmachen: ps2exe - der im Kopf dieser Datei
+    # vorgeschriebene Auslieferungsweg - stellt einen eigenen PSHost bereit,
+    # dessen Name 'PSRunspace-Host' ist (ps2exe 1.0.18, ps2exe.ps1 Z. 2431-2435;
+    # eine testweise kompilierte .exe meldet genau das). Mit der frueheren
+    # Pruefung auf 'ConsoleHost' war $interactive in der ausgelieferten .exe
+    # IMMER $false: alle drei Rueckfragen lieferten ohne Zutun $false und das
+    # Programm brach vor der ersten geprueften Datei ab, obwohl eine voll
+    # funktionsfaehige Konsole samt Read-Host vorhanden war.
+    # Massgeblich ist deshalb die tatsaechliche Eingabefaehigkeit: ist die
+    # Standardeingabe NICHT umgeleitet, haengt eine echte Konsole daran und
+    # Read-Host funktioniert - gleich, wie der Host heisst. Wirft der Zugriff
+    # (gar keine Konsole, z. B. 'ps2exe -noConsole' oder ein Dienst), bleibt es
+    # bei $false: dann waere die Rueckfrage unsichtbar und ein blindes
+    # Weiterlaufen genau das, was der Kommentar oben ausschliesst.
+    $interactive = $false
+    try { $interactive = -not [Console]::IsInputRedirected } catch { $interactive = $false }
+
+    Write-Host ""
+    Write-Host ("=" * 70) -ForegroundColor Yellow
+    Write-Host ("  " + $Title) -ForegroundColor Yellow
+    Write-Host ("=" * 70) -ForegroundColor Yellow
+    foreach ($zeile in ($Message -split "`n")) { Write-Host ("  " + $zeile.TrimEnd()) }
+    Write-Host ("=" * 70) -ForegroundColor Yellow
+
+    if (-not $interactive) {
+        Write-Host "  Keine interaktive Konsole - es wird NICHT fortgefahren." -ForegroundColor Red
+        return $false
+    }
+
+    $hint = if ($DefaultYes) { '[J/n]' } else { '[j/N]' }
+    while ($true) {
+        $answer = Read-Host ("  Fortfahren? " + $hint)
+        if ([string]::IsNullOrWhiteSpace($answer)) { return [bool]$DefaultYes }
+        switch -Regex ($answer.Trim()) {
+            '^[JjYy]' { return $true }
+            '^[Nn]'   { return $false }
+            default   { Write-Host "  Bitte 'j' oder 'n' eingeben." -ForegroundColor DarkGray }
+        }
+    }
+}
 
 # ---------------------------------------------------------------------
 # 1. Konfiguration
@@ -49,6 +115,26 @@ $script:DirectoryPresets = @(
     '\\server\dfs'
 )
 
+
+# ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Bindet _gemeinsam.psm1 ein, wenn vorhanden. Die eingebauten Kopien der
+# Helfer bleiben bestehen - so bleibt jedes Skript einzeln lauffaehig und
+# die ps2exe-Uebersetzung funktioniert unveraendert. Genutzt wird das
+# Modul fuer das gemeinsame Laufprotokoll (migration.jsonl).
+$script:GemeinsamGeladen = $false
+try {
+    $gemModul = Join-Path $PSScriptRoot '_gemeinsam.psm1'
+    if (Test-Path -LiteralPath $gemModul) {
+        Import-Module $gemModul -Force -DisableNameChecking -ErrorAction Stop
+        $script:GemeinsamGeladen = $true
+    }
+} catch {
+    # Ohne Modul laeuft das Skript mit seinen eingebauten Helfern weiter.
+}
+
+
 $officeExtensions = [System.Collections.Generic.HashSet[string]]::new(
     [System.StringComparer]::OrdinalIgnoreCase
 )
@@ -77,7 +163,11 @@ $script:ReportShownInExcel = $false
 # dann doch hart und der Excel-Bericht ginge verloren.
 $script:CtrlCAsInput = $false
 try {
-    if ($Host.Name -eq 'ConsoleHost') {
+    # Ebenfalls nicht am Hostnamen festmachen (siehe Confirm-YesNo): unter
+    # ps2exe heisst der Host 'PSRunspace-Host', der sanfte Strg+C-Abbruch
+    # blieb in der ausgelieferten .exe daher wirkungslos. Ob eine Konsole da
+    # ist, zeigt der Zugriff selbst am zuverlaessigsten.
+    if (-not [Console]::IsInputRedirected) {
         [Console]::TreatControlCAsInput = $true
         $script:CtrlCAsInput = $true
     }
@@ -201,6 +291,52 @@ function Remove-LongPathPrefix {
     return $Path
 }
 
+function Test-IstVerschluesselt {
+    <#
+        Erkennt eine verschluesselte OOXML-Datei an der DATEISIGNATUR, bevor
+        Office sie ueberhaupt zu Gesicht bekommt.
+
+        Hintergrund: Der Passwortschutz wurde bisher allein aus der
+        Office-Fehlermeldung abgeleitet ('passwort|password|kennwort|...').
+        Excel meldet bei einer mit Oeffnungskennwort geschuetzten Datei aber
+        den generischen HRESULT 0x800A03EC, der eine Zeile frueher bereits
+        als 'Office-Fehler' abgefangen wird - die Kategorie 'Passwortschutz'
+        war fuer Excel damit unerreichbar, und der Bericht nannte einen
+        Anwendungsfehler statt der wahren Ursache.
+
+        Eine verschluesselte OOXML-Datei ist kein ZIP ('PK'), sondern ein
+        CFB-Container mit der Signatur D0 CF 11 E0 A1 B1 1A E1. Bei den
+        MODERNEN Endungen (.docx/.xlsx/.pptx usw.) ist dieser Container ein
+        eindeutiger Beleg fuer Verschluesselung. Fuer die ALTEN Formate
+        (.doc/.xls/.ppt) sagt er nichts aus - sie sind immer CFB; dort bleibt
+        es bei der bisherigen Auswertung.
+    #>
+    param([string]$Path)
+
+    $modern = @('.docx','.docm','.dotx','.dotm',
+                '.xlsx','.xlsm','.xltx','.xltm','.xlsb',
+                '.pptx','.pptm','.potx','.potm','.ppsx','.ppsm')
+    $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    if ($modern -notcontains $ext) { return $false }
+
+    try {
+        $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        try {
+            $buf = New-Object byte[] 8
+            if ($fs.Read($buf, 0, 8) -lt 8) { return $false }
+        } finally { $fs.Dispose() }
+    } catch {
+        return $false   # nicht lesbar - andere Pruefungen melden das
+    }
+
+    $cfb = @(0xD0,0xCF,0x11,0xE0,0xA1,0xB1,0x1A,0xE7)
+    $cfb[7] = 0xE1
+    for ($i = 0; $i -lt 8; $i++) {
+        if ($buf[$i] -ne $cfb[$i]) { return $false }
+    }
+    return $true
+}
+
 function Get-OfficeAppType {
     param([string]$Extension)
     $e = $Extension.ToLowerInvariant()
@@ -232,6 +368,34 @@ function Get-FileMetadata {
     }
 }
 
+function Get-EchtenHResult {
+    <#
+        Liefert den TATSAECHLICHEN HRESULT einer Ausnahme.
+
+        Beim Aufruf einer .NET-Methode verpackt PowerShell die Ausnahme in
+        eine System.Management.Automation.MethodInvocationException. Deren
+        HResult ist konstant 0x80131501 - unabhaengig davon, was wirklich
+        passiert ist. Damit war der komplette HRESULT-Switch der
+        Fehlerkategorisierung auf diesem Weg tot: eine gesperrte Datei
+        (0x80070020) und eine ohne Leserecht (0x80070005) kamen beide als
+        derselbe Wrapper-Code an. Nachgestellt unter 5.1 mit einer exklusiv
+        gesperrten Datei: aeusserer HResult 0x80131501, innerer 0x80070020.
+        Deshalb die Kette der InnerExceptions durchgehen und den ersten
+        Wert nehmen, der nicht der Wrapper-Code ist.
+    #>
+    param($Exception)
+    $WRAPPER = 0x80131501
+    $e = $Exception
+    $tiefe = 0
+    while ($null -ne $e -and $tiefe -lt 8) {
+        if ($e.HResult -ne 0 -and $e.HResult -ne $WRAPPER) { return $e.HResult }
+        $e = $e.InnerException
+        $tiefe++
+    }
+    if ($null -ne $Exception) { return $Exception.HResult }
+    return 0
+}
+
 function Test-FileAccessible {
     param([string]$Path)
     $fs = $null
@@ -239,7 +403,8 @@ function Test-FileAccessible {
         $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
         return @{ OK = $true; Error = $null; HResult = 0 }
     } catch {
-        return @{ OK = $false; Error = $_.Exception.Message; HResult = $_.Exception.HResult }
+        return @{ OK = $false; Error = $_.Exception.Message
+                  HResult = (Get-EchtenHResult -Exception $_.Exception) }
     } finally {
         if ($null -ne $fs) { try { $fs.Close(); $fs.Dispose() } catch {} }
     }
@@ -382,6 +547,17 @@ function New-ErrorRecord {
         [double]$SizeMB     = 0,
         [string]$Modified   = ""
     )
+
+    # Gemeinsames Laufprotokoll (migration.jsonl) - ergaenzt das
+    # skripteigene Protokoll, ersetzt es nicht. Erst damit laesst sich
+    # der Fortschritt ueber alle elf Schritte hinweg auswerten.
+    if ($script:GemeinsamGeladen) {
+        try {
+            Write-Laufprotokoll -Skript '9_fehlerhafte_Dateien_finden' `
+                -Pfad $DateiPfad -Aktion 'Pruefung' `
+                -Status $Kategorie -Detail $Details
+        } catch { }
+    }
     return [PSCustomObject]@{
         Ordner           = $Ordner
         Datei_Pfad       = $DateiPfad
@@ -576,11 +752,9 @@ Write-Host ""
 
 $tcTitle   = "Konfiguration prüfen"
 $tcMessage = "Haben Sie die Einstellungen im Trust Center (Geschützte Ansicht DEAKTIVIERT, Makros AKTIVIERT) für Word, Excel und PowerPoint vorgenommen?"
-$tcOptions = [System.Windows.MessageBoxButton]::YesNo
-$tcIcon    = [System.Windows.MessageBoxImage]::Question
-$tcResult  = [System.Windows.MessageBox]::Show($tcMessage, $tcTitle, $tcOptions, $tcIcon)
+$tcResult = Confirm-YesNo -Title $tcTitle -Message $tcMessage
 
-if ($tcResult -eq [System.Windows.MessageBoxResult]::No) {
+if (-not $tcResult) {
     Write-Host "Bitte konfigurieren Sie zuerst das Trust Center in den Office-Optionen. Abbruch." -ForegroundColor Red
     Stop-Script
 }
@@ -852,11 +1026,8 @@ if ($openOfficeSessions.Count -gt 0) {
                "Prozess erkannt wird - haengende Dateien blockieren den Lauf unbegrenzt.`n`n" +
                "Empfehlung: JETZT abbrechen, Office schliessen, Skript neu starten.`n`n" +
                "Trotzdem fortfahren?"
-    $sessRes = [System.Windows.MessageBox]::Show(
-        $sessMsg, "Office laeuft bereits",
-        [System.Windows.MessageBoxButton]::YesNo,
-        [System.Windows.MessageBoxImage]::Warning)
-    if ($sessRes -ne [System.Windows.MessageBoxResult]::Yes) {
+    $sessRes = Confirm-YesNo -Title "Office laeuft bereits" -Message $sessMsg
+    if (-not $sessRes) {
         Write-Log -Message "Abbruch durch Benutzer - Office-Sitzungen laufen noch." -Color Yellow
         Stop-Script
     }
@@ -1015,7 +1186,24 @@ function Test-WordTrustCenter {
             return @{ Ok = $false; Msg = $_.Exception.Message; AppPid = $myWordPid }
         } finally {
             try { $word.Interactive = $true } catch {}
-            try { $word.Quit() } catch {}
+            # NUR eine selbst gestartete Instanz beenden. New-Object
+            # -ComObject Word.Application startet KEINE neue Instanz, wenn
+            # Word bereits laeuft - COM haengt sich an die vorhandene. Ein
+            # bedingungsloses Quit() beendete damit die Sitzung des Anwenders
+            # samt ungespeicherter Dokumente, und wegen DisplayAlerts = 0
+            # sogar ohne Speichern-Rueckfrage. Der Aufraeumteil am Skriptende
+            # macht es bereits richtig; die Warnung in Abschnitt 8 sichert dem
+            # Anwender ausdruecklich zu 'Ihre Sitzung wird am Ende nicht
+            # beendet' - direkt danach lief hier das Gegenteil.
+            # $myWordPid ist oben bereits ermittelt und ist genau dann gesetzt,
+            # wenn eine neue EXCEL/WINWORD-Instanz entstanden ist.
+            if ($myWordPid) {
+                try { $word.Quit() } catch {}
+            } else {
+                # Fremdsitzung uebernommen: nur wieder sichtbar machen und
+                # die Referenz freigeben.
+                try { $word.Visible = $true } catch {}
+            }
             # Wenn $word null ist (Office nicht installiert, Lizenz, COM-
             # Init fehlgeschlagen), wirft FinalReleaseComObject sonst eine
             # ArgumentNullException und der Job crasht statt ein sauberes
@@ -1194,7 +1382,14 @@ function Test-PowerPointTrustCenter {
         } finally {
             if ($pres1) { try { $pres1.Close() } catch {} }
             if ($pres2) { try { $pres2.Close() } catch {} }
-            try { $ppt.Quit() } catch {}
+            # Nur eine selbst gestartete Instanz beenden - Begruendung siehe
+            # Word-Smoke-Test oben. Fuer PowerPoint gilt dasselbe, dort ist
+            # DisplayAlerts = 1 (ppAlertsNone), also ebenfalls ohne Rueckfrage.
+            if ($myPptPid) {
+                try { $ppt.Quit() } catch {}
+            } else {
+                try { $ppt.Visible = $true } catch {}
+            }
             if ($null -ne $ppt) {
                 try { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ppt) | Out-Null } catch {}
             }
@@ -1267,13 +1462,9 @@ if ($smokeFailures.Count -gt 0) {
     $smokeMsg     = "Der Office-Smoke-Test ist fuer folgende Office-Anwendung(en) fehlgeschlagen:`n`n" +
                     ($smokeFailures -join ", ") +
                     "`n`nDetails siehe Log. Risiko: betroffene Dateien laufen in den $($Config.TimeoutSeconds)s-Timeout.`n`nTrotzdem fortfahren?"
-    $smokeResult  = [System.Windows.MessageBox]::Show(
-        $smokeMsg,
-        "Trust-Center-Test fehlgeschlagen",
-        [System.Windows.MessageBoxButton]::YesNo,
-        [System.Windows.MessageBoxImage]::Warning)
+    $smokeResult = Confirm-YesNo -Title "Trust-Center-Test fehlgeschlagen" -Message $smokeMsg
 
-    if ($smokeResult -ne [System.Windows.MessageBoxResult]::Yes) {
+    if (-not $smokeResult) {
         Write-Log -Message "Abbruch durch Benutzer nach Trust-Center-Warnung." -Color Yellow
         Stop-Script
     }
@@ -1413,6 +1604,16 @@ try {
     # einen Restart zu probieren (sonst Endlos-Crash-Schleife bei kaputter
     # Office-Installation oder vollem RAM).
     $script:AppFailed = @{ "word" = $false; "excel" = $false; "ppt" = $false }
+    # Get-OfficeAppType liefert 'Word'/'Excel'/'PowerPoint', gesetzt wird
+    # AppFailed aber ueber $targetApp mit 'word'/'excel'/'ppt'. Fuer Word und
+    # Excel faellt das nicht auf, weil ein @{}-Hashtable in PowerShell
+    # case-insensitiv ist - 'PowerPoint' hat mit 'ppt' aber keine
+    # Aehnlichkeit. Nachgestellt: ContainsKey('Word')=True,
+    # ContainsKey('Excel')=True, ContainsKey('PowerPoint')=False, und
+    # AppFailed['PowerPoint'] ist $null, also auch als Wert falsy - die
+    # Bremse gegen die Endlos-Neustartschleife war fuer PowerPoint doppelt
+    # wirkungslos. Diese Zuordnung haelt Setzen und Pruefen deckungsgleich.
+    $script:AppTypeToKey = @{ "Word" = "word"; "Excel" = "excel"; "PowerPoint" = "ppt" }
 
     # -----------------------------------------------------------------
     # 12. Dateiprüfung
@@ -1434,7 +1635,8 @@ try {
         # Iterationsschritt endgueltig fehlgeschlagen ist, gar nicht erst
         # versuchen - direkt als Problem markieren und Bericht-Lauf nicht
         # gefaehrden (sonst Endlos-Crash beim naechsten Restart-Versuch).
-        if ($appType -and $script:AppFailed.ContainsKey($appType) -and $script:AppFailed[$appType]) {
+        $appKey = if ($appType) { $script:AppTypeToKey[$appType] } else { $null }
+        if ($appKey -and $script:AppFailed.ContainsKey($appKey) -and $script:AppFailed[$appKey]) {
             $meta = Get-FileMetadata -Path $filePath
             $results.Add((New-ErrorRecord -Ordner $dirName -DateiPfad $comPath `
                 -Kategorie "Office-App nicht verfügbar" `
@@ -1493,6 +1695,22 @@ try {
                 -Kategorie $cat.Kategorie -Details "[Preflight] $($cat.Details)" `
                 -Dateityp $appType -SizeMB $meta.SizeMB -Modified $meta.Modified))
             Write-Log -Message "Preflight-Fehler: $fileName [$($cat.Kategorie)]" -Level WARN -Color Red
+            continue
+        }
+
+        # Verschluesselung VOR dem COM-Open an der Dateisignatur erkennen.
+        # Aus der Office-Fehlermeldung laesst sie sich fuer Excel nicht
+        # ableiten: dort kommt der generische HRESULT 0x800A03EC, der weiter
+        # oben bereits als 'Office-Fehler' abgefangen wird - die Kategorie
+        # 'Passwortschutz' war damit unerreichbar. Nebenbei entfaellt fuer
+        # diese Dateien der komplette COM-Weg samt Watchdog-Timeout.
+        if (Test-IstVerschluesselt -Path $comPath) {
+            $meta = Get-FileMetadata -Path $filePath
+            $results.Add((New-ErrorRecord -Ordner $dirName -DateiPfad $comPath `
+                -Kategorie "Passwortschutz" `
+                -Details "Datei ist verschluesselt (OOXML mit Oeffnungskennwort - CFB-Container statt ZIP). Nicht pruefbar." `
+                -Dateityp $appType -SizeMB $meta.SizeMB -Modified $meta.Modified))
+            Write-Log -Message "Problem: $fileName [Passwortschutz]" -Level WARN -Color Yellow
             continue
         }
 
@@ -1555,7 +1773,10 @@ try {
             catch {
                 $isProblem = $true
                 $reason    = $_.Exception.Message
-                $hresult   = $_.Exception.HResult
+                # Echten HRESULT auspacken - PowerShell verpackt .NET- und
+                # COM-Ausnahmen in eine MethodInvocationException mit dem
+                # konstanten Code 0x80131501 (siehe Get-EchtenHResult).
+                $hresult   = Get-EchtenHResult -Exception $_.Exception
                 if ($comPath.Length -gt 259) {
                     $reason += " [HINWEIS: Pfad $($comPath.Length) Zeichen — möglicherweise pfadlängenbedingt.]"
                 }

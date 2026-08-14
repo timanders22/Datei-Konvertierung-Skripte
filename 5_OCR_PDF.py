@@ -69,6 +69,36 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, NamedTuple, Set
 
+# ==================================================================
+# Konsolen-Encoding (UTF-8) - muss VOR jedem print stehen
+# ==================================================================
+# Ohne diesen Block bricht die erste Ausgabe mit Rahmenzeichen oder Emoji
+# unter der Windows-Standardcodepage (cp850/cp1252) mit UnicodeEncodeError
+# ab - und zwar sowohl im Konsolenfenster als auch bei Umleitung in eine
+# Datei. Betroffen waren hier 169 print-Zeilen, die erste davon in der
+# Hinweismeldung zu pypdfium2, also noch vor der ersten PDF.
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+# ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Fehlt _gemeinsam.py - etwa weil nur dieses eine Skript weitergegeben
+# wurde -, laeuft alles unveraendert weiter; die daraus bedienten
+# Zusatzfunktionen schalten sich dann still ab.
+try:
+    _eigener_ordner = os.path.dirname(os.path.abspath(__file__))
+    if _eigener_ordner not in sys.path:
+        sys.path.insert(0, _eigener_ordner)
+    import _gemeinsam as gem
+except Exception:
+    gem = None
+
 os.environ["PATH"] = r"C:\OCR;" + r"C:\OCR\bin;" + os.environ.get("PATH", "")
 
 # Tesseract nutzt intern OpenMP und startet sonst je Instanz mehrere
@@ -165,6 +195,23 @@ else:
     _SUBPROCESS_FLAGS = {}
 
 
+# ==================================================================
+# Protokoll-Objekte fruehzeitig binden
+# ==================================================================
+# Zahlreiche except-Zweige weiter unten 'verwerfen' Ausnahmen mit
+# detail_logger.debug(...). Diese Zweige sind aber schon waehrend des Imports
+# erreichbar - lange bevor _setup_logging() am Ende der Datei die Namen
+# belegt. Der Fehlerschlucker loeste dann selbst einen NameError aus, der
+# NICHT abgefangen wurde: das Skript startete gar nicht, und die Meldung
+# zeigte auf den falschen Fehler.
+# Am eindeutigsten ist _ensure_bom(): es wird von _setup_logging() selbst
+# aufgerufen, dort KANN der Name konstruktionsbedingt noch nicht existieren.
+# Deshalb hier bereits gueltige Logger-Objekte binden; _setup_logging()
+# ergaenzt spaeter nur noch die Handler und Stufen.
+error_logger  = logging.getLogger("ErrorLogger")
+detail_logger = logging.getLogger("DetailLogger")
+
+
 def _fmt_exc(e: BaseException) -> str:
     return f"{type(e).__name__}: {e}"
 
@@ -187,8 +234,8 @@ def _get_exe_dir() -> str:
     if getattr(sys, "frozen", False):
         try:
             return os.path.dirname(sys.executable)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_get_exe_dir: Exception verworfen: {_e!r}")
     try:
         return os.path.dirname(os.path.abspath(__file__))
     except Exception:
@@ -211,8 +258,180 @@ def _register_dll_dirs(paths: List[str]) -> None:
                 handle = os.add_dll_directory(p)
                 if handle is not None:
                     _DLL_DIR_HANDLES.append(handle)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_register_dll_dirs: Exception verworfen: {_e!r}")
+
+
+# ==================================================================
+# Absicherung der Werkzeugverzeichnisse
+# ==================================================================
+# C:\OCR und C:\OCR\bin stehen laut Zeile 102 in PATH VOR allen System-
+# verzeichnissen, bilden die obersten Kandidaten der Werkzeugsuche
+# (tesseract.exe, gswin64c.exe, jbig2.exe, verapdf.bat) und landen ueber
+# EXTRA_DLL_DIRS im DLL-Suchpfad des Prozesses. Ein direkt unter C:\
+# angelegter Ordner erbt aber die Standard-ACL von C:\ und ist damit fuer
+# JEDEN authentifizierten Benutzer beschreibbar. Wird das Skript 'als
+# Administrator' gestartet - wozu der Hinweis bei der Zielauswahl
+# ausdruecklich einlaedt -, kann ein Standardbenutzer dort vorab eine
+# eigene tesseract.exe oder leptonica-*.dll ablegen und damit Code im
+# Administratorkontext ausfuehren: lokale Rechteausweitung.
+
+# Rechte, mit denen sich in einem Verzeichnis eine Programmdatei
+# unterschieben oder eine vorhandene ersetzen laesst.
+_GEFAEHRLICHE_RECHTE = (
+    0x00000002      # FILE_ADD_FILE / FILE_WRITE_DATA
+    | 0x00000004    # FILE_ADD_SUBDIRECTORY / FILE_APPEND_DATA
+    | 0x00000040    # FILE_DELETE_CHILD
+    | 0x00010000    # DELETE
+    | 0x00040000    # WRITE_DAC
+    | 0x00080000    # WRITE_OWNER
+    | 0x10000000    # GENERIC_ALL
+    | 0x40000000    # GENERIC_WRITE
+)
+
+# Konten, denen Schreibrecht auf ein Programmverzeichnis zusteht. Als SID
+# statt als Name, weil die Klartextnamen sprachabhaengig sind
+# ('Authentifizierte Benutzer' / 'Authenticated Users').
+_VERTRAUTE_SIDS = {
+    "S-1-5-18",      # SYSTEM
+    "S-1-5-32-544",  # Administratoren
+    "S-1-3-0",       # ERSTELLER-BESITZER (greift nur auf selbst erzeugte Dateien)
+    "S-1-3-4",       # Besitzerrechte
+}
+
+
+def _sid_klartext(sid: Any, rueckfall: str) -> str:
+    try:
+        import win32security
+        name, domaene, _typ = win32security.LookupAccountSid(None, sid)
+        return f"{domaene}\\{name}" if domaene else name
+    except Exception:
+        return rueckfall
+
+
+def _unsichere_schreiber(pfad: str) -> List[str]:
+    """Konten nennen, die in `pfad` eine Programmdatei unterschieben koennen.
+
+    Leere Liste heisst unbedenklich. Ist die ACL nicht lesbar, ebenfalls
+    leer - lieber kein Befund als ein Fehlalarm, der den Lauf blockiert.
+    Inherit-only-ACEs werden mitgezaehlt: sie gelten zwar nicht fuer den
+    Ordner selbst, vererben sich aber auf die Dateien darin und sind
+    damit genau der Weg, eine vorhandene .exe zu ersetzen.
+    """
+    try:
+        import win32security
+    except Exception:
+        return []
+    try:
+        sd = win32security.GetFileSecurity(
+            pfad, win32security.DACL_SECURITY_INFORMATION)
+        dacl = sd.GetSecurityDescriptorDacl()
+    except Exception as _e:
+        detail_logger.debug(f"_unsichere_schreiber({pfad}): Exception verworfen: {_e!r}")
+        return []
+    if dacl is None:
+        # Fehlende DACL bedeutet Vollzugriff fuer jeden.
+        return ["<ohne DACL – Vollzugriff für alle>"]
+
+    ACCESS_ALLOWED_ACE_TYPE        = 0
+    ACCESS_ALLOWED_OBJECT_ACE_TYPE = 5
+    treffer: List[str] = []
+    for i in range(dacl.GetAceCount()):
+        try:
+            ace = dacl.GetAce(i)
+            ace_typ = ace[0][0]
+            if ace_typ not in (ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_OBJECT_ACE_TYPE):
+                continue
+            maske = ace[1]
+            sid   = ace[-1]
+            if not (maske & _GEFAEHRLICHE_RECHTE):
+                continue
+            sid_text = win32security.ConvertSidToStringSid(sid)
+            if sid_text in _VERTRAUTE_SIDS:
+                continue
+            # Dienstkonten (S-1-5-80-*, u.a. TrustedInstaller) sind unkritisch.
+            if sid_text.startswith("S-1-5-80-"):
+                continue
+            treffer.append(_sid_klartext(sid, sid_text))
+        except Exception as _e:
+            detail_logger.debug(f"_unsichere_schreiber: ACE {i} verworfen: {_e!r}")
+    return treffer
+
+
+def _ist_erhoeht() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _pruefe_werkzeugverzeichnisse() -> None:
+    """Werkzeugverzeichnisse vor der ersten Programmausfuehrung pruefen.
+
+    Bei erhoehten Rechten ist ein beschreibbares Werkzeugverzeichnis eine
+    Rechteausweitung - dann Abbruch. Ohne erhoehte Rechte bleibt der
+    Angreifer auf dem Rechteniveau des Anwenders; dann genuegt eine
+    deutliche Warnung, damit der Lauf auf den Ablagen nicht ausfaellt.
+    """
+    if os.name != "nt":
+        return
+    befunde: Dict[str, List[str]] = {}
+    for pfad in EXTRA_DLL_DIRS:
+        if not os.path.isdir(pfad):
+            continue
+        schreiber = _unsichere_schreiber(pfad)
+        if schreiber:
+            befunde[pfad] = sorted(set(schreiber))
+    if not befunde:
+        return
+
+    for pfad, konten in befunde.items():
+        detail_logger.error(
+            f"Unsicheres Werkzeugverzeichnis {pfad}: Schreibrecht für {', '.join(konten)}")
+
+    print()
+    print("=" * 72)
+    print("  ⚠  Werkzeugverzeichnis ist für normale Benutzer beschreibbar")
+    print("=" * 72)
+    for pfad, konten in befunde.items():
+        print(f"  {pfad}")
+        for k in konten:
+            print(f"        Schreibrecht: {k}")
+    print()
+    print("  Aus diesem Verzeichnis werden tesseract.exe, gswin64c.exe,")
+    print("  jbig2.exe und verapdf.bat gestartet und DLLs geladen – mit")
+    print("  Vorrang vor C:\\Program Files. Wer dort schreiben darf, kann")
+    print("  dem Skript ein eigenes Programm unterschieben.")
+    print()
+    print("  Reparatur (Eingabeaufforderung als Administrator):")
+    # Unterordner eines ohnehin genannten Ordners weglassen: sie erben die
+    # neuen Rechte. Ein eigener /inheritance:r-Aufruf wuerde die Vererbung
+    # dort unnoetig wieder kappen.
+    wurzeln = [
+        p for p in befunde
+        if not any(o != p and p.lower().startswith(o.lower().rstrip("\\") + "\\")
+                   for o in befunde)
+    ]
+    for pfad in wurzeln:
+        print(f'      icacls "{pfad}" /inheritance:r'
+              f' /grant *S-1-5-32-544:(OI)(CI)F'
+              f' /grant *S-1-5-18:(OI)(CI)F'
+              f' /grant *S-1-5-32-545:(OI)(CI)RX')
+    print()
+    if _ist_erhoeht():
+        print("  Dieser Lauf hat erhöhte Rechte. Ein untergeschobenes Programm")
+        print("  liefe damit als Administrator – das ist eine lokale Rechte-")
+        print("  ausweitung. ABBRUCH.")
+        print("=" * 72)
+        print()
+        detail_logger.error(
+            "Abbruch: erhöhte Rechte bei beschreibbarem Werkzeugverzeichnis.")
+        sys.exit(2)
+    print("  Dieser Lauf hat keine erhöhten Rechte; ein untergeschobenes")
+    print("  Programm käme nicht über Ihre eigenen Rechte hinaus. Der Lauf")
+    print("  wird fortgesetzt – die Rechte bitte trotzdem korrigieren.")
+    print("=" * 72)
+    print()
 
 
 # ==================================================================
@@ -264,11 +483,11 @@ def _get_known_folder(folder_id_guid: str) -> Optional[str]:
             path = path_ptr.value
             try:
                 ctypes.windll.ole32.CoTaskMemFree(path_ptr)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_get_known_folder: Exception verworfen: {_e!r}")
             return path
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_get_known_folder: Exception verworfen: {_e!r}")
     return None
 
 
@@ -282,8 +501,8 @@ def _get_user_shell_folder_from_registry(name: str) -> Optional[str]:
             expanded = os.path.expandvars(val)
             if expanded and os.path.isdir(expanded):
                 return expanded
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_get_user_shell_folder_from_registry: Exception verworfen: {_e!r}")
     return None
 
 
@@ -388,6 +607,10 @@ DETAILED_LOG_FILE  = os.path.join(LOG_DIR, f"5_OCR_PDF_detailed_{_RUN_TIMESTAMP}
 CSV_LOG_FILE       = os.path.join(LOG_DIR, "5_OCR_PDF_results.csv")
 RESUME_FILE_PREFIX = os.path.join(LOG_DIR, "5_OCR_PDF_resume")
 RUN_SUMMARY_FILE   = os.path.join(LOG_DIR, "5_OCR_PDF_last_run.txt")
+# Der Probelauf schreibt in eine EIGENE Datei. Sonst ueberschrieb er die
+# Zusammenfassung des letzten ECHTEN Laufs - und meldete dort "Status: OK"
+# fuer einen Lauf, der gar nichts geschrieben hat.
+RUN_SUMMARY_DRYRUN = os.path.join(LOG_DIR, "5_OCR_PDF_last_dryrun.txt")
 
 LOG_MAX_BYTES     = 10 * 1024 * 1024
 LOG_BACKUP_COUNT  = 5
@@ -612,8 +835,8 @@ def _ensure_bom(path: str) -> None:
         with open(path, "wb") as fh:
             fh.write(UTF8_BOM)
             fh.write(data)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_ensure_bom: Exception verworfen: {_e!r}")
 
 
 def _setup_logging(
@@ -763,7 +986,29 @@ def _setup_csv_log(path: str = CSV_LOG_FILE) -> None:
         pass
 
 
+
+# ==================================================================
+# Gemeinsames Laufprotokoll (migration.jsonl)
+# ==================================================================
+# Ergaenzt das skripteigene Protokoll, ersetzt es nicht. Erst damit
+# laesst sich der Fortschritt ueber alle elf Schritte auswerten.
+_laufprotokoll = None
+
+
+def _protokoll(pfad: str, aktion: str, status: str, detail: str = "") -> None:
+    global _laufprotokoll
+    if gem is None:
+        return
+    try:
+        if _laufprotokoll is None:
+            _laufprotokoll = gem.Laufprotokoll(
+                os.path.splitext(os.path.basename(__file__))[0])
+        _laufprotokoll.schreibe(pfad, aktion, status, detail)
+    except Exception:
+        pass
+
 def _write_csv_row(result: _ProcessResult, path: str = CSV_LOG_FILE) -> None:
+    _protokoll(result.file_path, "OCR", result.status, result.detail)
     row = [
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         result.file_path,
@@ -824,16 +1069,16 @@ def append_resume(resume_path: str, file_path: str) -> None:
         try:
             with open(resume_path, "a", encoding="utf-8") as fh:
                 fh.write(file_path + "\n")
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"append_resume: Exception verworfen: {_e!r}")
 
 
 def delete_resume_file(resume_path: str) -> None:
     try:
         if os.path.exists(resume_path):
             os.remove(resume_path)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"delete_resume_file: Exception verworfen: {_e!r}")
 
 
 # ==================================================================
@@ -855,12 +1100,12 @@ def _install_signal_handlers() -> None:
             os._exit(130)
     try:
         signal.signal(signal.SIGINT, handler)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_install_signal_handlers: Exception verworfen: {_e!r}")
     try:
         signal.signal(signal.SIGTERM, handler)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_install_signal_handlers: Exception verworfen: {_e!r}")
 
 
 # ==================================================================
@@ -871,8 +1116,8 @@ def clear_mru() -> None:
     try:
         SHARD_PIDL = 0x00000001
         ctypes.windll.shell32.SHAddToRecentDocs(SHARD_PIDL, None)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"clear_mru: Exception verworfen: {_e!r}")
 
 
 # ==================================================================
@@ -1039,10 +1284,33 @@ _WINDOWS_TEMP_WHITELIST_PREFIXES = (
     "ocrmypdf.", "test_ocr", "5_ocr_pdf",
 )
 
+# 'ocrmypdf.'-Ordner im ECHTEN System-Temp koennen seit der Temp-Umlenkung
+# (_worker_init_tempdir lenkt tempfile.tempdir und TMP/TEMP in das eigene,
+# PID-getrennte Arbeitsverzeichnis) gar nicht mehr von diesem Lauf stammen -
+# sie gehoeren also einem FREMDEN ocrmypdf-Prozess, dessen unkomprimierte
+# Seitenbilder womoeglich gerade in Benutzung sind. Sie am Skriptende blind zu
+# loeschen zerstoert fremde Zwischendaten. Vollstaendig streichen waere aber
+# auch falsch: Reste ABGEBROCHENER frueherer Laeufe dieses Skripts (aus der
+# Zeit vor der Umlenkung oder nach einem harten Kill) sind GB-gross und
+# gehoeren geraeumt. Deshalb: nur, was schon vor dem Start dieses Laufs da war
+# und seither nicht mehr angefasst wurde.
+_LAUF_BEGINN = time.time()
+_TEMP_MINDESTALTER_S = 3600.0
+
 
 def _is_whitelisted_temp_entry(name: str) -> bool:
     nl = name.lower()
     return any(nl.startswith(p) for p in _WINDOWS_TEMP_WHITELIST_PREFIXES)
+
+
+def _temp_eintrag_ist_verwaist(pfad: str) -> bool:
+    """Wurde der Eintrag zuletzt vor dem Laufbeginn veraendert?"""
+    try:
+        mtime = os.path.getmtime(pfad)
+    except Exception as _e:
+        detail_logger.debug(f"_temp_eintrag_ist_verwaist: Exception verworfen: {_e!r}")
+        return False
+    return mtime < min(_LAUF_BEGINN, time.time() - _TEMP_MINDESTALTER_S)
 
 
 def _cleanup_windows_temp() -> None:
@@ -1058,15 +1326,22 @@ def _cleanup_windows_temp() -> None:
             if not _is_whitelisted_temp_entry(name):
                 continue
             full = os.path.join(win_temp, name)
+            # Nur eindeutig verwaiste Reste anfassen - siehe Begruendung an
+            # _temp_eintrag_ist_verwaist. Ein laufender Fremdprozess haelt
+            # seine Zwischendaten aktuell und bleibt damit verschont.
+            if not _temp_eintrag_ist_verwaist(full):
+                detail_logger.debug(
+                    f"System-Temp: '{name}' ist aktuell in Benutzung – nicht angetastet.")
+                continue
             try:
                 if os.path.isdir(full):
                     shutil.rmtree(full, ignore_errors=True)
                 else:
                     os.remove(full)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _e:
+                detail_logger.debug(f"_cleanup_windows_temp: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_cleanup_windows_temp: Exception verworfen: {_e!r}")
 
 
 def _worker_init_tempdir(worker_temp_dir: str) -> None:
@@ -1086,8 +1361,8 @@ def _worker_init_tempdir(worker_temp_dir: str) -> None:
         tempfile.tempdir = worker_temp_dir
         os.environ["TMP"]  = worker_temp_dir
         os.environ["TEMP"] = worker_temp_dir
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_worker_init_tempdir: Exception verworfen: {_e!r}")
 
     # Restore-Privilegien (Admin-Kontext) fuer ACL/Owner-Erhalt aktivieren –
     # Token-Privilegien gelten pro Prozess, daher hier je Worker.
@@ -1110,8 +1385,8 @@ def _purge_orphan_temp_files(temp_dir: str) -> int:
         if (os.path.normcase(os.path.abspath(temp_dir))
                 == os.path.normcase(os.path.abspath(_ORIG_WINDOWS_TEMP))):
             return 0
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_purge_orphan_temp_files: Exception verworfen: {_e!r}")
     try:
         for name in os.listdir(_lp(temp_dir)):
             full = os.path.join(temp_dir, name)
@@ -1123,10 +1398,10 @@ def _purge_orphan_temp_files(temp_dir: str) -> int:
                     removed += 1
                 elif os.path.isfile(_lp(full)) and safe_remove(full):
                     removed += 1
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _e:
+                detail_logger.debug(f"_purge_orphan_temp_files: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_purge_orphan_temp_files: Exception verworfen: {_e!r}")
     return removed
 
 
@@ -1173,8 +1448,8 @@ def _enable_restore_privileges() -> None:
             try:
                 luid = win32security.LookupPrivilegeValue(None, name)
                 privs.append((luid, win32security.SE_PRIVILEGE_ENABLED))
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_enable_restore_privileges: Exception verworfen: {_e!r}")
         if not privs:
             return
         win32security.AdjustTokenPrivileges(htoken, 0, privs)
@@ -1207,6 +1482,27 @@ def _get_security_descriptor(path: str):
 
 
 def _apply_security_descriptor(path: str, sd) -> None:
+    """Eigentuemer, Gruppe und DACL einer ersetzten Datei wiederherstellen.
+
+    Alles wird in EINEM SetNamedSecurityInfo-Aufruf gesetzt. Frueher liefen
+    zwei getrennte Aufrufe (erst DACL, dann Owner) - und das Setzen des
+    Eigentuemers ordnet die Vererbung neu. Nachgestellt: eine Datei verlor
+    dabei die Kennzeichnung ihrer geerbten ACEs, und eine geerbte
+    EIGENTUEMERRECHTE-ACE (S-1-3-4) bekam zusaetzlich INHERIT_ONLY - damit galt
+    sie fuer die Datei selbst nicht mehr. Wer seinen Zugriff allein daraus
+    bezog, konnte die eigene Datei anschliessend nicht mehr oeffnen
+    (PermissionError). Das ist das Gegenteil dessen, was diese Funktion
+    bezweckt. Ein gemeinsamer Aufruf laesst Windows die Rechte in einem Zug
+    berechnen; der schaedliche Zwischenzustand entsteht gar nicht erst.
+
+    Der Eigentuemer wird ausserdem nur gesetzt, wenn er tatsaechlich abweicht -
+    ein privilegierter Schreibvorgang ohne Wirkung entfaellt damit.
+
+    Schlaegt der gemeinsame Aufruf fehl (typisch: kein SeRestorePrivilege im
+    Nutzer-Kontext, dann verweigert bereits das Owner-Feld), wird die DACL
+    einzeln nachgezogen. Damit bleibt das bisherige Verhalten erhalten, dass
+    wenigstens die Rechte ankommen.
+    """
     if sd is None:
         return
     try:
@@ -1219,48 +1515,72 @@ def _apply_security_descriptor(path: str, sd) -> None:
         dacl = sd.GetSecurityDescriptorDacl()
     except Exception:
         dacl = None
-    if dacl is not None:
-        try:
-            dacl_flags = win32security.DACL_SECURITY_INFORMATION
-            try:
-                ctrl, _rev = sd.GetSecurityDescriptorControl()
-                if ctrl & win32security.SE_DACL_PROTECTED:
-                    dacl_flags |= win32security.PROTECTED_DACL_SECURITY_INFORMATION
-                else:
-                    dacl_flags |= win32security.UNPROTECTED_DACL_SECURITY_INFORMATION
-            except Exception:
-                pass
-            win32security.SetNamedSecurityInfo(
-                p, win32security.SE_FILE_OBJECT, dacl_flags,
-                None, None, dacl, None)
-            log_debug("ACL", f"DACL wiederhergestellt: {path}")
-        except Exception as e:
-            log_warning("ACL", 
-                f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e}")
-
     try:
         owner = sd.GetSecurityDescriptorOwner()
+    except Exception:
+        owner = None
+    try:
+        group = sd.GetSecurityDescriptorGroup()
+    except Exception:
         group = None
+
+    info = 0
+    if dacl is not None:
+        info |= win32security.DACL_SECURITY_INFORMATION
         try:
-            group = sd.GetSecurityDescriptorGroup()
-        except Exception:
-            pass
-        if owner is not None:
-            sec_flags = win32security.OWNER_SECURITY_INFORMATION
-            if group is not None:
-                sec_flags |= win32security.GROUP_SECURITY_INFORMATION
-            win32security.SetNamedSecurityInfo(
-                p, win32security.SE_FILE_OBJECT, sec_flags,
-                owner, group, None, None)
-            log_debug("ACL", f"Owner wiederhergestellt: {path}")
+            ctrl, _rev = sd.GetSecurityDescriptorControl()
+            if ctrl & win32security.SE_DACL_PROTECTED:
+                info |= win32security.PROTECTED_DACL_SECURITY_INFORMATION
+            else:
+                info |= win32security.UNPROTECTED_DACL_SECURITY_INFORMATION
+        except Exception as _e:
+            log_debug("ACL", f"_apply_security_descriptor: Exception verworfen: {_e!r}")
+
+    # Eigentuemer nur setzen, wenn er wirklich abweicht.
+    if owner is not None:
+        try:
+            akt = win32security.GetNamedSecurityInfo(
+                p, win32security.SE_FILE_OBJECT,
+                win32security.OWNER_SECURITY_INFORMATION
+            ).GetSecurityDescriptorOwner()
+            if (win32security.ConvertSidToStringSid(akt)
+                    == win32security.ConvertSidToStringSid(owner)):
+                owner = None
+        except Exception as _e:
+            log_debug("ACL", f"_apply_security_descriptor: Owner-Vergleich verworfen: {_e!r}")
+
+    if owner is not None:
+        info |= win32security.OWNER_SECURITY_INFORMATION
+    if group is not None:
+        info |= win32security.GROUP_SECURITY_INFORMATION
+    if not info:
+        return
+
+    nur_dacl = info & ~(win32security.OWNER_SECURITY_INFORMATION
+                        | win32security.GROUP_SECURITY_INFORMATION)
+
+    try:
+        win32security.SetNamedSecurityInfo(
+            p, win32security.SE_FILE_OBJECT, info, owner, group, dacl, None)
+        log_debug("ACL", f"Sicherheitsinfo wiederhergestellt: {path}")
+        return
     except Exception as e:
+        if owner is None and group is None:
+            log_warning("ACL", f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e}")
+            return
         if _restore_privileges_enabled:
-            log_warning("ACL", 
-                f"Owner-Wiederherstellung fehlgeschlagen ({path}): {e}")
+            log_warning("ACL", f"Owner-Wiederherstellung fehlgeschlagen ({path}): {e}")
         else:
-            log_debug("ACL", 
-                f"Owner nicht gesetzt (kein Admin-Privileg – im "
-                f"Nutzer-Kontext unkritisch): {path} – {e}")
+            log_debug("ACL", f"Owner nicht gesetzt (kein Admin-Privileg - im Nutzer-Kontext unkritisch): {path} - {e}")
+
+    # Rueckfall: wenigstens die DACL setzen.
+    if dacl is not None and nur_dacl:
+        try:
+            win32security.SetNamedSecurityInfo(
+                p, win32security.SE_FILE_OBJECT, nur_dacl, None, None, dacl, None)
+            log_debug("ACL", f"DACL wiederhergestellt (ohne Owner): {path}")
+        except Exception as e2:
+            log_warning("ACL", f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e2}")
 
 
 def safe_remove(path: str) -> bool:
@@ -1270,8 +1590,8 @@ def safe_remove(path: str) -> bool:
             try:
                 import win32api, win32con
                 win32api.SetFileAttributes(p, win32con.FILE_ATTRIBUTE_NORMAL)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"safe_remove: Exception verworfen: {_e!r}")
             os.remove(p)
             return True
         return False
@@ -1305,10 +1625,10 @@ def safe_move_with_retry(
             import win32api, win32con
             try:
                 win32api.SetFileAttributes(dst_lp, win32con.FILE_ATTRIBUTE_NORMAL)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _e:
+                detail_logger.debug(f"safe_move_with_retry: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"safe_move_with_retry: Exception verworfen: {_e!r}")
 
     for attempt in range(retries):
         try:
@@ -1350,10 +1670,10 @@ def safe_replace_with_retry(src: str, dst: str, retries: int = 5, delay: float =
             import win32api, win32con
             try:
                 win32api.SetFileAttributes(dst_lp, win32con.FILE_ATTRIBUTE_NORMAL)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _e:
+                detail_logger.debug(f"safe_replace_with_retry: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"safe_replace_with_retry: Exception verworfen: {_e!r}")
 
     if _same_volume(src, dst):
         stage = src
@@ -1408,8 +1728,8 @@ def get_file_size_mb(file_path: str) -> float:
     try:
         if safe_exists(file_path):
             return os.path.getsize(_lp(file_path)) / (1024 * 1024)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"get_file_size_mb: Exception verworfen: {_e!r}")
     return 0.0
 
 
@@ -1453,8 +1773,8 @@ def is_file_locked(filepath: str) -> bool:
                     return False  # nur read-only, kein Lock
                 except OSError:
                     return True   # zusaetzlich gelockt
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"is_file_locked: Exception verworfen: {_e!r}")
         return True  # PermissionError ohne erkennbares Read-Only -> Lock
     except OSError:
         return True
@@ -1534,8 +1854,8 @@ def create_temp_copy(file_path: str, temp_dir: str) -> Optional[str]:
             print(f"  ⚠️  Temp-Kopie bleibt gesperrt (AV-Scanner?): {temp_path}")
             try:
                 os.remove(_lp(temp_path))
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"create_temp_copy: Exception verworfen: {_e!r}")
             return None
 
     return temp_path
@@ -1574,6 +1894,38 @@ def cleanup_orphaned_backups(
             dirs[:] = [d for d in dirs if not is_excluded_dir(d)]
             for f in files:
                 low = f.lower()
+
+                # Verwaiste Staging-Kopien aus safe_replace_with_retry und
+                # set_ocr_marker.
+                #
+                # Beim volumeuebergreifenden Ersetzen wird die neue Datei
+                # zuerst als '<name>.pdf.tmp_new' NEBEN dem Original
+                # abgelegt und dann per os.replace() darueber geschoben.
+                # Stirbt der Prozess in diesem Fenster - Worker-Timeout-Kill,
+                # Stromausfall, harter Abbruch -, bleibt die .tmp_new liegen.
+                # Aufgeraeumt wurde sie bisher NIRGENDS: weder vom
+                # Temp-Verzeichnis-Aufraeumen (das betrifft nur den eigenen
+                # Arbeitsordner) noch von diesem Backup-Lauf. Damit wanderten
+                # solche Reste am Ende mit in die Cloud.
+                #
+                # Anders als beim Backup ist hier kein Schutz noetig: die
+                # .tmp_new ist immer nur eine Zwischenkopie, das Original
+                # liegt zu jedem Zeitpunkt unveraendert daneben.
+                # '.tmp_marker' gehoert zur selben Klasse: set_ocr_marker legt
+                # die neue Fassung ebenfalls NEBEN dem Original an und schiebt
+                # sie per os.replace darueber. Auch diese Zwischendatei war von
+                # keinem Aufraeumpfad erfasst.
+                if low.endswith(".pdf.tmp_new") or low.endswith(".pdf.tmp_marker"):
+                    full = os.path.join(root, f)
+                    try:
+                        if os.path.getmtime(_lp(full)) < cutoff and safe_remove(full):
+                            count += 1
+                            detail_logger.info(
+                                f"Verwaiste Staging-Kopie entfernt: {_strip_long_path(full)}")
+                    except Exception as _e:
+                        detail_logger.debug(f"cleanup_orphaned_backups: Exception verworfen: {_e!r}")
+                    continue
+
                 # NUR eigene Artefakte (<name>.pdf.backup): ein generischer
                 # *.backup-Filter wuerde fremde Sicherungsdateien loeschen.
                 if low.endswith(".pdf.backup"):
@@ -1595,10 +1947,10 @@ def cleanup_orphaned_backups(
                                 continue
                             if safe_remove(full):
                                 count += 1
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"cleanup_orphaned_backups: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"cleanup_orphaned_backups: Exception verworfen: {_e!r}")
     if kept:
         print(f"  ⚠️  {kept} Backup(s) wegen fehlendem/defektem Original behalten – bitte manuell pruefen.")
     return count
@@ -1835,8 +2187,8 @@ def get_pdf_info(file_path: str) -> Dict[str, Any]:
             try:
                 if getattr(doc, "is_repaired", False):
                     info["needs_repair"] = True
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"get_pdf_info: Exception verworfen: {_e!r}")
 
             metadata = doc.metadata or {}
             subject = str(metadata.get(MARKER_KEY, ""))
@@ -1883,10 +2235,18 @@ def get_pdf_info(file_path: str) -> Dict[str, Any]:
                         if px > info["max_image_pixels"]:
                             info["max_image_pixels"] = px
                         _analyze_image_for_print(doc, page, img, w, h, px, info)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"get_pdf_info: Exception verworfen: {_e!r}")
 
-        if info["existing_marker"] is None:
+        # XMP-Rueckfall NUR bei tatsaechlich vorhandener Textebene.
+        # Die Marker aus dem Subject setzt ausschliesslich dieses Skript, sie
+        # belegen also wirklich eine OCR-Verarbeitung. Die XMP-Kennung sagt
+        # dagegen nur, dass die Datei als PDF/A vorliegt - das kann jeder
+        # Scanner oder jedes Archivwerkzeug erzeugt haben, ganz ohne OCR.
+        # Ein reiner Bild-Scan im Format PDF/A-2u galt damit als 'bereits
+        # verarbeitet' und wurde uebersprungen, obwohl er keine Textebene hat:
+        # genau die Dateien, deretwegen das Skript laeuft.
+        if info["existing_marker"] is None and info["has_text"]:
             xmp_code = _read_xmp_pdfa_code(file_path)
             if xmp_code in ("PDFA_2U", "PDFA_2B"):
                 info["existing_marker"] = xmp_code
@@ -1899,11 +2259,55 @@ def get_pdf_info(file_path: str) -> Dict[str, Any]:
     return info
 
 
+def _sichere_datei_metadaten(file_path: str):
+    """Zeitstempel und NTFS-Sicherheitsinfo einer Datei festhalten.
+
+    Wird gebraucht, wo eine Datei per os.replace ERSETZT wird: das Ergebnis
+    ist dann eine neue Datei mit aktuellem Zeitstempel, dem ausfuehrenden
+    Konto als Eigentuemer und nur den vom Ordner geerbten ACEs. Auf einer
+    Ablage mit Owner-Mapping kostet das den Fachnutzer den Zugriff auf seine
+    eigene Datei - genau der Fall, den der Kommentarblock zur ACL-Uebernahme
+    weiter oben beschreibt.
+    """
+    times = None
+    sd    = None
+    try:
+        times = _read_file_times(file_path)
+    except Exception as _e:
+        detail_logger.debug(f"_sichere_datei_metadaten (Zeiten): {_e!r}")
+    try:
+        sd = _get_security_descriptor(file_path)
+    except Exception as _e:
+        detail_logger.debug(f"_sichere_datei_metadaten (ACL): {_e!r}")
+    return (times, sd)
+
+
+def _stelle_datei_metadaten_her(file_path: str, gesichert) -> None:
+    """Gegenstueck zu _sichere_datei_metadaten. Fehler sind nicht fatal."""
+    times, sd = gesichert if gesichert else (None, None)
+    if sd is not None:
+        try:
+            _apply_security_descriptor(file_path, sd)
+        except Exception as _e:
+            detail_logger.debug(f"_stelle_datei_metadaten_her (ACL): {_e!r}")
+    # Zeitstempel zuletzt: das Setzen der ACL wuerde ihn sonst wieder
+    # ueberschreiben koennen.
+    if times is not None:
+        try:
+            _write_file_times(file_path, times)
+        except Exception as _e:
+            detail_logger.debug(f"_stelle_datei_metadaten_her (Zeiten): {_e!r}")
+
+
 def _add_ocr_marker_legacy(file_path: str, marker_value: str = MARKER_VALUE_PDF) -> bool:
     if not safe_exists(file_path):
         return False
     p = _lp(file_path)
     tmp = p + ".tmp_marker"
+    # Vor jeder Aenderung sichern - der Nicht-Inkrementell-Zweig unten ersetzt
+    # die Datei und wuerde Zeitstempel, Eigentuemer und explizite ACEs sonst
+    # verlieren.
+    gesichert = _sichere_datei_metadaten(file_path)
     try:
         doc = fitz.open(p)
         try:
@@ -1914,12 +2318,14 @@ def _add_ocr_marker_legacy(file_path: str, marker_value: str = MARKER_VALUE_PDF)
             doc.set_metadata(metadata)
             try:
                 doc.save(p, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+                _stelle_datei_metadaten_her(file_path, gesichert)
                 return True
             except Exception:
                 doc.save(tmp, garbage=2, deflate=True)
         finally:
             doc.close()
         if safe_replace_with_retry(tmp, p):
+            _stelle_datei_metadaten_her(file_path, gesichert)
             return True
         safe_remove(tmp)
         return False
@@ -1929,12 +2335,21 @@ def _add_ocr_marker_legacy(file_path: str, marker_value: str = MARKER_VALUE_PDF)
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_add_ocr_marker_legacy: Exception verworfen: {_e!r}")
         return False
 
 
 def set_ocr_marker(file_path: str, marker_value: str) -> bool:
+    # Zeitstempel und Sicherheitsinfo VOR der Ersetzung festhalten. Die
+    # Funktion schreibt eine komplette Neufassung nach '<name>.pdf.tmp_marker'
+    # und schiebt sie ueber das Original; danach ist es eine neue Datei.
+    # Beim Lauf mit --verify-markers endet der aufrufende Zweig direkt danach
+    # mit SKIPPED, die Wiederherstellung am Ende der Verarbeitung wird also
+    # nie erreicht - und die spaeter gelesenen orig_times/orig_sd enthielten
+    # ohnehin schon die zerstoerten Werte. Deshalb hier, in der Funktion, die
+    # die Ersetzung tatsaechlich vornimmt.
+    gesichert = _sichere_datei_metadaten(file_path)
     try:
         import pikepdf
         p   = _lp(file_path)
@@ -1946,15 +2361,16 @@ def set_ocr_marker(file_path: str, marker_value: str) -> bool:
                     f"OCR-Automation {datetime.now().strftime('%Y-%m-%d')}"
                 )
                 pdf.docinfo["/Creator"] = pikepdf.String("PDF OCR Automation")
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"set_ocr_marker: Exception verworfen: {_e!r}")
             try:
                 with pdf.open_metadata() as meta:
                     meta["dc:description"] = marker_value
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"set_ocr_marker: Exception verworfen: {_e!r}")
             pdf.save(tmp)
         if safe_replace_with_retry(tmp, p):
+            _stelle_datei_metadaten_her(file_path, gesichert)
             return True
         safe_remove(tmp)
     except ImportError:
@@ -1966,26 +2382,37 @@ def set_ocr_marker(file_path: str, marker_value: str) -> bool:
             tmp_path = _lp(file_path) + ".tmp_marker"
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"set_ocr_marker: Exception verworfen: {_e!r}")
     return _add_ocr_marker_legacy(file_path, marker_value)
 
 
 def repair_pdf(file_path: str, temp_dir: str) -> bool:
     tmp_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}_repaired.pdf")
+    # Zeitstempel und Sicherheitsinfo VOR dem Ersetzen festhalten. Die
+    # reparierte Datei wird per safe_replace_with_retry ueber das Original
+    # geschoben und ist danach eine neue Datei. Die Sicherung im Aufrufer
+    # greift zu spaet: sie liest erst nach dem Reparaturblock und wuerde
+    # damit den Reparaturzeitpunkt und die bereits verlorenen Rechte
+    # wiederherstellen. Gleiche Ursache und gleiche Loesung wie bei
+    # set_ocr_marker.
+    gesichert = _sichere_datei_metadaten(file_path)
     try:
         p = _lp(file_path)
         with fitz.open(p) as src, fitz.open() as dst:
             dst.insert_pdf(src)
             dst.save(tmp_path, garbage=4, deflate=True)
-        return safe_replace_with_retry(tmp_path, file_path)
+        if safe_replace_with_retry(tmp_path, file_path):
+            _stelle_datei_metadaten_her(file_path, gesichert)
+            return True
+        return False
     except Exception as e:
         log_warning("repair_pdf", f"Reparatur fehlgeschlagen ({file_path}): {_fmt_exc(e)}")
         try:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"repair_pdf: Exception verworfen: {_e!r}")
         return False
 
 
@@ -2130,8 +2557,8 @@ def get_cpu_info() -> Tuple[int, str]:
     except Exception:
         try:
             cpu_name = platform.processor() or "Unbekannt"
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"get_cpu_info: Exception verworfen: {_e!r}")
     return cpu_count, cpu_name
 
 
@@ -2225,8 +2652,8 @@ def _read_file_times(file_path: str) -> Optional[Any]:
             return ("win32", times)
         finally:
             h.Close()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_read_file_times: Exception verworfen: {_e!r}")
 
     try:
         st = os.stat(p)
@@ -3128,41 +3555,50 @@ def process_pdf_file(
                                 size_mb=pdf_info["size_mb"],
                                 pages=pdf_info["pages"])
 
-    if pdf_info["has_forms"]:
-        pwrite("  ⚠️  Enthält Formularfelder – wird zum Schutz übersprungen")
-        lwarn(log_context, f"Formularfelder erkannt – uebersprungen: {file_path}")
-        return build_result("SKIPPED", "SKIP_HAS_FORMS",
-                            size_mb=pdf_info["size_mb"],
-                            pages=pdf_info["pages"])
+    # Schutzpruefungen als Block, damit sie nach einer Reparatur ERNEUT laufen
+    # koennen. get_pdf_info() kehrt bei fitz.FileDataError sofort zurueck und
+    # liefert dann needs_repair=True, is_valid=True, aber pages=0,
+    # has_forms=False, is_oversized=False und max_image_pixels=0. Auf diesen
+    # leeren Werten gingen alle Pruefungen unten folgenlos durch - der
+    # Formular-, Uebergroessen-, Bildpixel- und RAM-Schutz griff bei genau den
+    # Dateien nicht, die am ehesten Probleme machen.
+    def _schutzpruefungen(info):
+        if info["has_forms"]:
+            pwrite("  ⚠️  Enthält Formularfelder – wird zum Schutz übersprungen")
+            lwarn(log_context, f"Formularfelder erkannt – uebersprungen: {file_path}")
+            return build_result("SKIPPED", "SKIP_HAS_FORMS",
+                                size_mb=info["size_mb"], pages=info["pages"])
 
-    if pdf_info["is_oversized"]:
-        pwrite(f"  ⚠️  Physische Dimensionen zu groß (>{MAX_PAGE_DIMENSION} pt ≈ "
-               f"{MAX_PAGE_DIMENSION / 72:.0f} Zoll) – überspringe")
-        lwarn(log_context, f"Übergröße: {file_path}")
-        return build_result("SKIPPED", "SKIP_OVERSIZED",
-                            size_mb=pdf_info["size_mb"],
-                            pages=pdf_info["pages"])
+        if info["is_oversized"]:
+            pwrite(f"  ⚠️  Physische Dimensionen zu groß (>{MAX_PAGE_DIMENSION} pt ≈ "
+                   f"{MAX_PAGE_DIMENSION / 72:.0f} Zoll) – überspringe")
+            lwarn(log_context, f"Übergröße: {file_path}")
+            return build_result("SKIPPED", "SKIP_OVERSIZED",
+                                size_mb=info["size_mb"], pages=info["pages"])
 
-    max_img_px = pdf_info.get("max_image_pixels", 0)
-    if max_img_px > MAX_EMBEDDED_IMAGE_PIXELS:
-        pwrite(f"  ⚠️  Eingebettetes Bild zu groß ({max_img_px / 1_000_000:.0f} MP "
-               f"> {MAX_EMBEDDED_IMAGE_PIXELS / 1_000_000:.0f} MP Pillow-Limit) – überspringe")
-        lwarn(log_context,
-              f"Übergroßes Bild: {file_path} – max_image_pixels={max_img_px}")
-        return build_result("SKIPPED", "SKIP_OVERSIZED_IMAGE",
-                            size_mb=pdf_info["size_mb"],
-                            pages=pdf_info["pages"])
+        max_img_px = info.get("max_image_pixels", 0)
+        if max_img_px > MAX_EMBEDDED_IMAGE_PIXELS:
+            pwrite(f"  ⚠️  Eingebettetes Bild zu groß ({max_img_px / 1_000_000:.0f} MP "
+                   f"> {MAX_EMBEDDED_IMAGE_PIXELS / 1_000_000:.0f} MP Pillow-Limit) – überspringe")
+            lwarn(log_context,
+                  f"Übergroßes Bild: {file_path} – max_image_pixels={max_img_px}")
+            return build_result("SKIPPED", "SKIP_OVERSIZED_IMAGE",
+                                size_mb=info["size_mb"], pages=info["pages"])
 
-    # --- Memory-Check (gelockert; Skip nur bei physischer Unmöglichkeit) ---
-    jobs_planned = config.get("jobs", 1)
-    mem_ok, mem_msg = check_memory_before_ocr(pdf_info["pages"], jobs=jobs_planned)
-    if not mem_ok:
-        pwrite(f"  ⚠️  RAM-Schutz aktiv – überspringe ({mem_msg})")
-        lwarn(log_context, f"Memory-Schutz: {file_path} – {mem_msg}")
-        return build_result("SKIPPED", "SKIP_MEMORY",
-                            size_mb=pdf_info["size_mb"],
-                            pages=pdf_info["pages"],
-                            error_msg=mem_msg)
+        # --- Memory-Check (gelockert; Skip nur bei physischer Unmöglichkeit) ---
+        mem_ok, mem_msg = check_memory_before_ocr(
+            info["pages"], jobs=config.get("jobs", 1))
+        if not mem_ok:
+            pwrite(f"  ⚠️  RAM-Schutz aktiv – überspringe ({mem_msg})")
+            lwarn(log_context, f"Memory-Schutz: {file_path} – {mem_msg}")
+            return build_result("SKIPPED", "SKIP_MEMORY",
+                                size_mb=info["size_mb"], pages=info["pages"],
+                                error_msg=mem_msg)
+        return None
+
+    _abbruch = _schutzpruefungen(pdf_info)
+    if _abbruch is not None:
+        return _abbruch
 
     # --- Beschädigte Struktur reparieren ---
     if pdf_info["needs_repair"]:
@@ -3170,6 +3606,18 @@ def process_pdf_file(
         if repair_pdf(file_path, temp_dir):
             pwrite("  ✓ Reparatur erfolgreich")
             linfo(log_context, f"Repariert: {file_path}")
+            # Erst jetzt sind Seitenzahl, Formularfelder, Bildgroessen und
+            # Marker ueberhaupt lesbar - Schutzpruefungen deshalb wiederholen.
+            pdf_info = get_pdf_info(file_path)
+            if not pdf_info["is_valid"]:
+                pwrite("  ✗ Nach Reparatur nicht lesbar – überspringe")
+                lwarn(log_context, f"Nach Reparatur nicht lesbar: {file_path}")
+                return build_result("ERROR", "ERROR_INVALID",
+                                    size_mb=pdf_info["size_mb"],
+                                    pages=pdf_info["pages"])
+            _abbruch = _schutzpruefungen(pdf_info)
+            if _abbruch is not None:
+                return _abbruch
         else:
             pwrite("  ⚠️  Reparatur fehlgeschlagen – versuche OCR trotzdem")
             lwarn(log_context, f"Reparatur fehlgeschlagen: {file_path}")
@@ -3584,9 +4032,24 @@ def process_pdf_file(
                 and not bitmap_fallback_applied
                 and attempt < MAX_RETRIES - 1
             ):
-                pwrite("  🖼️  pypdfium2 am Speicherlimit – wechsle auf Ghostscript-Pfad + DPI-Reduktion")
+                # KEIN oversample setzen. Der Parameter ist eine DPI-UNTER-
+                # grenze, keine Reduktion: die CLI-Hilfe von ocrmypdf lautet
+                # 'Oversample images to AT LEAST the specified DPI', und
+                # _pipeline.py verrechnet den Wert in einem max(...) mit der
+                # tatsaechlichen Bildaufloesung. 'oversample=200' konnte die
+                # Aufloesung also nur ANHEBEN - und damit den Speicherbedarf
+                # erhoehen, den dieser Rueckfall gerade senken soll. Bei
+                # Scans mit 300 dpi blieb er wirkungslos, bei 150 dpi machte
+                # er es schlimmer.
+                # Wirksam ist stattdessen, die Parallelitaet auf einen Job zu
+                # senken (jeder Job haelt seine eigene Rasterbitmap) und die
+                # Obergrenze fuer Bildpixel zu druecken.
+                pwrite("  🖼️  pypdfium2 am Speicherlimit – wechsle auf Ghostscript-Pfad, "
+                       "1 Job, kleinere Bildobergrenze")
                 current_options["plugins"] = []
-                current_options["oversample"] = 200
+                current_options["jobs"] = 1
+                current_options["max_image_mpixels"] = min(
+                    int(current_options.get("max_image_mpixels") or 250), 128)
                 bitmap_fallback_applied = True
 
             # Farbraum-Problem (falls is_pdfa nicht greift, z.B. bei nicht-pdfa-Output)
@@ -3735,12 +4198,12 @@ def _terminate_pool_workers(executor) -> int:
                 else:
                     try:
                         os.kill(int(pid), signal.SIGTERM)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        detail_logger.debug(f"_terminate_pool_workers: Exception verworfen: {_e!r}")
                 proc.join(timeout=2)
             killed += 1
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_terminate_pool_workers: Exception verworfen: {_e!r}")
     return killed
 
 
@@ -3771,6 +4234,7 @@ def write_run_summary(
     aborted: bool = False,
     abort_reason: Optional[str] = None,
     summary_path: str = RUN_SUMMARY_FILE,
+    ist_probelauf: bool = False,
 ) -> None:
     duration = end_time - start_time
     total = stats.get("TOTAL", 0)
@@ -3809,6 +4273,161 @@ def write_run_summary(
                     fh.write(f"  {k}: {v}\n")
     except Exception as e:
         log_warning("write_run_summary", f"Konnte Summary nicht schreiben: {_fmt_exc(e)}")
+
+
+def dry_run_directory(
+    directory:   str,
+    config:      Dict,
+    resume_path: Optional[str] = None,
+) -> Dict[str, int]:
+    """Probelauf: zeigt je Datei die Entscheidung, ohne etwas zu schreiben.
+
+    Dieses Skript war das einzige schreibende der Sammlung ohne
+    Probelauf - und es ersetzt PDFs an Ort und Stelle
+    (safe_replace_with_retry). Ein Erstlauf auf fremdem Bestand war damit
+    nicht verantwortbar zu machen. Aufbau nach dem Vorbild von
+    dry_run_directory in 4a bis 4c.
+
+    Geprueft wird alles, was ohne Schreibzugriff geht: Lesbarkeit,
+    Sperre, vorhandene Textebene, OCR-Marker, Druckprofil, geschaetzter
+    Speicher- und Plattenbedarf.
+    """
+    stats = _new_stats()
+
+    print(f"\n📁 PROBELAUF (es wird nichts geschrieben): {directory}")
+    if not safe_exists(directory):
+        print(f"❌ Verzeichnis existiert nicht: {directory}")
+        return stats
+
+    skip_set: Set[str] = load_resume_set(resume_path) if resume_path else set()
+    if skip_set:
+        print(f"♻️  Resume-Datei: {len(skip_set)} Datei(en) gelten bereits als erledigt")
+
+    print()
+    print(f"  {'Entscheidung':<14} {'Seiten':>6} {'MB':>8}  Datei / Grund")
+    print("  " + "-" * 78)
+
+    wuerde_ocr = 0
+    gesamt     = 0
+    ram_max    = 0.0
+    platte_mb  = 0.0
+
+    for pdf_path in pdf_generator(directory, skip_set=skip_set):
+        gesamt += 1
+        name = os.path.basename(pdf_path)
+
+        if is_file_locked(pdf_path):
+            stats["SKIPPED"] += 1
+            print(f"  {'ÜBERSPRINGEN':<14} {'-':>6} {'-':>8}  {name}  (gesperrt)")
+            continue
+
+        if not is_real_pdf(pdf_path):
+            stats["ERROR"] += 1
+            print(f"  {'FEHLER':<14} {'-':>6} {'-':>8}  {name}  (keine gültige PDF)")
+            continue
+
+        info = get_pdf_info(pdf_path)
+
+        if info.get("error"):
+            stats["ERROR"] += 1
+            print(f"  {'FEHLER':<14} {'-':>6} {info['size_mb']:>8.1f}  {name}  ({info['error']})")
+            continue
+
+        seiten = info.get("pages", 0)
+        groesse = info.get("size_mb", 0.0)
+
+        if info.get("is_encrypted"):
+            # Der echte Lauf ueberspringt NICHT pauschal: bei Owner-Only-
+            # Verschluesselung (leeres Benutzerpasswort, bei Scanner-PDFs
+            # haeufig) entfernt er den Schutz und ersetzt die Datei. Ob das
+            # gelingt, laesst sich ohne Schreibzugriff nicht sicher sagen -
+            # deshalb hier als 'moeglicherweise' ausweisen statt zu
+            # behaupten, die Datei bleibe unangetastet.
+            stats["SKIPPED"] += 1
+            print(f"  {'ÜBERSPRINGEN':<14} {seiten:>6} {groesse:>8.1f}  {name}  "
+                  f"(verschlüsselt – bei leerem Benutzerpasswort würde der echte "
+                  f"Lauf entschlüsseln und ersetzen)")
+            continue
+
+        # Dieselbe Entscheidung wie im echten Lauf treffen. Frueher galt hier
+        # 'has_text ODER irgendein Marker -> uebersprungen'. Der echte Lauf
+        # sieht das anders:
+        #   - has_text ohne Marker ist KEIN Skip, sondern nur ein Hinweis;
+        #     ocrmypdf ueberspringt mit skip_text lediglich die OCR der
+        #     Textseiten, schreibt aber sehr wohl eine Ausgabedatei, die
+        #     anschliessend ueber das Original geschoben wird.
+        #   - die Marker 'PDF', 'LEGACY' und 'PDFA_2B' fuehren bei der
+        #     Standard-Zielvorgabe pdfa-2u zu einem Upgrade, also ebenfalls
+        #     zu einer Ersetzung.
+        # Ausgerechnet die Funktion, die den Erstlauf auf fremdem Bestand
+        # verantwortbar machen soll, unterschaetzte die Zahl der ersetzten
+        # Dateien damit erheblich - bei Bestaenden mit vielen digital
+        # erzeugten PDFs um Groessenordnungen.
+        output_type    = config.get("output_type", DEFAULT_OUTPUT_TYPE)
+        target_is_pdfa = output_type.startswith("pdfa")
+        marker         = info.get("existing_marker")
+
+        skip_grund = None
+        if marker == "PDFA_2U":
+            skip_grund = "bereits PDF/A-2u"
+        elif marker == "PDFA_2B" and output_type != "pdfa-2u":
+            skip_grund = "bereits PDF/A-2b"
+        elif marker in ("PDF", "LEGACY") and not target_is_pdfa:
+            skip_grund = "bereits als Standard-PDF verarbeitet"
+
+        if skip_grund:
+            stats["SKIPPED"] += 1
+            print(f"  {'ÜBERSPRINGEN':<14} {seiten:>6} {groesse:>8.1f}  {name}  ({skip_grund})")
+            continue
+
+        hinweise = []
+        # Warum diese Datei trotz Marker/Textebene angefasst wird - genau die
+        # Information, die der Bediener vor der Freigabe braucht.
+        if marker == "PDFA_2B" and output_type == "pdfa-2u":
+            hinweise.append("Upgrade PDF/A-2b → PDF/A-2u, wird ersetzt")
+        elif marker in ("PDF", "LEGACY") and target_is_pdfa:
+            fmt = "PDF/A-2u" if output_type == "pdfa-2u" else "PDF/A-2b"
+            hinweise.append(f"Rekonvertierung nach {fmt}, wird ersetzt")
+        elif info.get("has_text"):
+            hinweise.append("Textebene vorhanden (OCR übersprungen), Datei wird ersetzt")
+        try:
+            druckprofil, warum = needs_print_safe_profile(info)
+            if druckprofil:
+                hinweise.append(f"bildschonend: {warum}")
+        except Exception as _e:
+            detail_logger.debug(f"dry_run_directory: Exception verworfen: {_e!r}")
+        if info.get("needs_repair"):
+            hinweise.append("Reparatur nötig")
+        if info.get("has_forms"):
+            hinweise.append("Formularfelder")
+
+        try:
+            ram = estimate_ocr_memory_mb(seiten or 1, 1)
+            ram_max = max(ram_max, ram)
+        except Exception as _e:
+            detail_logger.debug(f"dry_run_directory: Exception verworfen: {_e!r}")
+        try:
+            platte_mb += required_disk_mb_for_pdf(groesse)
+        except Exception as _e:
+            detail_logger.debug(f"dry_run_directory: Exception verworfen: {_e!r}")
+
+        wuerde_ocr += 1
+        zusatz = ("  [" + ", ".join(hinweise) + "]") if hinweise else ""
+        print(f"  {'WÜRDE OCR':<14} {seiten:>6} {groesse:>8.1f}  {name}{zusatz}")
+
+    print("  " + "-" * 78)
+    print(f"\n  Gesamt geprüft        : {gesamt}")
+    print(f"  Würde verarbeitet     : {wuerde_ocr}")
+    print(f"  Würde übersprungen    : {stats['SKIPPED']}")
+    print(f"  Nicht lesbar / Fehler : {stats['ERROR']}")
+    if ram_max:
+        print(f"  Größter Speicherbedarf: {ram_max:,.0f} MB (eine Datei, ein Job)")
+    if platte_mb:
+        print(f"  Temporärer Plattenplatz: {platte_mb:,.0f} MB in Summe")
+    print("\n  Es wurde nichts geschrieben.")
+
+    stats["TOTAL"] = gesamt
+    return stats
 
 
 def process_directory(
@@ -4010,6 +4629,30 @@ def process_directory(
 
                             if timed_out:
                                 timed_out_futures = {f for f, _ in timed_out}
+
+                                # ZUERST die bereits fertigen Futures auswerten.
+                                # concurrent.futures.wait liefert in 'done' die
+                                # abgeschlossenen Ergebnisse; die Auswertung
+                                # dahinter wurde aber vom 'break' am Ende dieses
+                                # Blocks uebersprungen. Diese Dateien waren auf
+                                # der Platte bereits ersetzt - nur ohne CSV-Zeile,
+                                # ohne Resume-Eintrag und ohne Statistik. Beim
+                                # naechsten Lauf gaelten sie als unbearbeitet und
+                                # wuerden erneut durch die OCR geschickt.
+                                for f_done in list(done):
+                                    if f_done not in future_to_path:
+                                        continue
+                                    fp_done, _st = future_to_path.pop(f_done)
+                                    with heartbeat_lock:
+                                        active_workers.pop(fp_done, None)
+                                    try:
+                                        _handle_result(f_done.result(), pbar)
+                                    except Exception as e_done:
+                                        log_error(
+                                            "process_directory",
+                                            f"Ergebnis nach Timeout-Reset nicht auswertbar "
+                                            f"({fp_done}): {_fmt_exc(e_done)}")
+
                                 for _, fp in timed_out:
                                     log_error("process_directory",
                                               f"Worker-Timeout ({WORKER_TIMEOUT//60} Min): {fp}")
@@ -4275,8 +4918,8 @@ def _is_network_path(directory: str) -> bool:
             drive_type = ctypes.windll.kernel32.GetDriveTypeW(drive_root)
             if drive_type == 4:
                 return True
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_is_network_path: Exception verworfen: {_e!r}")
     return False
 
 
@@ -4392,11 +5035,19 @@ def run_watch_mode(
 
                 print(f"\n🆕 Neue PDF erkannt: {os.path.basename(file_path)}")
 
+                # Fehlergrund mitfuehren. Der aeussere except-Zweig unten
+                # umfasst nicht nur den Timeout-Pfad, sondern auch den
+                # Pool-Bruch (der bewusst ein generisches Exception-Objekt
+                # wirft) und das Einsammeln/Auswerten des Ergebnisses. Alles
+                # landete pauschal als ERROR_TIMEOUT in Statistik und CSV -
+                # eine Fehlersuche lief damit in die falsche Richtung.
+                fehlergrund = "ERROR_OCR"
                 try:
                     future = executor.submit(process_pdf_file, file_path, config, thread_temp_dir)
                     try:
                         result = future.result(timeout=WORKER_TIMEOUT)
                     except concurrent.futures.TimeoutError:
+                        fehlergrund = "ERROR_TIMEOUT"
                         future.cancel()
                         _terminate_pool_workers(executor)
                         executor.shutdown(wait=False)
@@ -4427,10 +5078,10 @@ def run_watch_mode(
                 except Exception as e:
                     with thread_lock:
                         stats["ERROR"] += 1
-                        stats["ERROR_TIMEOUT"] = stats.get("ERROR_TIMEOUT", 0) + 1
+                        stats[fehlergrund] = stats.get(fehlergrund, 0) + 1
                         print(f"  [ERROR] {os.path.basename(file_path)}: {_fmt_exc(e)}")
                     log_error("watch_mode", f"Fehler bei {file_path}: {_fmt_exc(e)}", exc_info=True)
-                    _write_error_csv(file_path, "ERROR_TIMEOUT", _fmt_exc(e))
+                    _write_error_csv(file_path, fehlergrund, _fmt_exc(e))
 
                 finally:
                     with thread_lock:
@@ -4441,8 +5092,8 @@ def run_watch_mode(
         finally:
             try:
                 _terminate_pool_workers(executor)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_worker_loop: Exception verworfen: {_e!r}")
             executor.shutdown(wait=False)
 
     def _heartbeat_loop() -> None:
@@ -4597,6 +5248,11 @@ def main() -> None:
     _install_signal_handlers()
     _setup_csv_log()
 
+    # Muss VOR _register_dll_dirs und vor der Werkzeugsuche laufen: danach
+    # ist C:\OCR bereits im DLL-Suchpfad bzw. eine dort abgelegte .exe
+    # schon gestartet.
+    _pruefe_werkzeugverzeichnisse()
+
     # DLL-Suchpfade früh registrieren (relevant für EXE ohne Adminrechte)
     exe_dir = _get_exe_dir()
     meipass = _get_meipass_dir()
@@ -4653,10 +5309,26 @@ def main() -> None:
     parser.add_argument("--no-print-safe", action="store_true",
                         help="Automatische Erkennung druckrelevanter Bilder abschalten "
                              "(altes Verhalten – nicht empfohlen)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Probelauf: zeigt je Datei die Entscheidung, "
+                             "schreibt nichts")
     args = parser.parse_args()
 
     if args.clear_mru:
         clear_mru()
+
+    # --- Einzelinstanz-Schutz ---
+    # Zwei parallele Laeufe ueber denselben Bestand wuerden sich die
+    # Temp-Kopien und Ersetzungen gegenseitig wegziehen. Im Probelauf
+    # nicht noetig - der schreibt nichts.
+    _sperre = None
+    if gem is not None and not args.dry_run:
+        _sperre = gem.Einzelinstanz("5_OCR_PDF")
+        if not _sperre.belegen():
+            print(_sperre.hinweis())
+            sys.exit(1)
+        import atexit
+        atexit.register(_sperre.freigeben)
 
     # Restore-Privilegien (Admin-Kontext) für ACL/Owner-Erhalt aktivieren.
     _enable_restore_privileges()
@@ -4715,14 +5387,21 @@ def main() -> None:
         print("—" * 70)
         do_cleanup = ask_yes_no("  Jetzt nach Backup-Leichen suchen?", default_yes=False)
 
-    if do_cleanup:
-        print(f"\n🧹 Suche nach Backup-Leichen (*.backup, älter als "
+    # Im Probelauf wird auch hier NICHTS geloescht. Das Aufraeumen entfernt
+    # zwar nur eigene Artefakte, aber ein Probelauf, der Dateien loescht,
+    # ist keiner - und genau darauf verlaesst sich der Erstlauf auf fremdem
+    # Bestand.
+    if do_cleanup and args.dry_run:
+        print("\n🧹 Probelauf: Suche nach Resten wird übersprungen "
+              "(im Probelauf wird nichts gelöscht).")
+    elif do_cleanup:
+        print(f"\n🧹 Suche nach Resten (*.backup, *.tmp_new, *.tmp_marker, älter als "
               f"{BACKUP_CLEANUP_MIN_AGE_HOURS}h) ...")
         removed = cleanup_orphaned_backups(target_dir)
         if removed > 0:
-            print(f"  ✓ {removed} alte Backup-Datei(en) entfernt")
+            print(f"  ✓ {removed} Rest-Datei(en) entfernt")
         else:
-            print("  ✓ Keine alten Backups gefunden")
+            print("  ✓ Keine Reste gefunden")
 
     # --- Temporäres Verzeichnis ---
     temp_dir = TEMP_DIR
@@ -4934,7 +5613,21 @@ def main() -> None:
 
     config["jobs"] = recommended_jobs_per_worker(os.cpu_count() or 1, num_workers)
 
-    if args.watch:
+    if args.watch and args.dry_run:
+        # Der Watch-Modus kannte den Probelauf nicht: '--watch --dry-run'
+        # lief als ECHTER Dauerbetrieb und ersetzte PDFs, obwohl der
+        # Anwender einen Probelauf angefordert hat. Zusaetzlich haette
+        # er ohne Einzelinstanz-Sperre gearbeitet, weil die Sperre oben
+        # bei --dry-run bewusst uebersprungen wird.
+        #
+        # Ein dauerhaft ueberwachender Probelauf ergibt keinen Sinn -
+        # er wuerde dieselben Dateien endlos erneut melden. Deshalb wird
+        # der Bestand einmal geprueft und danach beendet.
+        print("\n⚠️  --dry-run und --watch zusammen: der Hotfolder-Betrieb wird")
+        print("    NICHT gestartet. Stattdessen einmalige Prüfung des Bestands,")
+        print("    danach Ende. Für den echten Dauerbetrieb --dry-run weglassen.")
+        stats_result = dry_run_directory(target_dir, config, None)
+    elif args.watch:
         run_watch_mode(target_dir, config, temp_dir, workers=num_workers,
                        initial_scan=not args.no_initial_scan)
     else:
@@ -4943,12 +5636,17 @@ def main() -> None:
         print("=" * 70)
 
         try:
-            stats_result = process_directory(
-                target_dir, config, temp_dir,
-                count_first, num_workers, resume_path,
-            )
-            if stats_result and not shutdown_event.is_set() and resume_path:
-                delete_resume_file(resume_path)
+            if args.dry_run:
+                # Probelauf: keine Worker, kein Temp-Verzeichnis, kein
+                # Schreibzugriff - und die Resume-Datei bleibt unangetastet.
+                stats_result = dry_run_directory(target_dir, config, resume_path)
+            else:
+                stats_result = process_directory(
+                    target_dir, config, temp_dir,
+                    count_first, num_workers, resume_path,
+                )
+                if stats_result and not shutdown_event.is_set() and resume_path:
+                    delete_resume_file(resume_path)
             if shutdown_event.is_set():
                 run_aborted = True
                 abort_reason = "Graceful Shutdown"
@@ -4990,6 +5688,8 @@ def main() -> None:
             stats_result, target_dir, output_type,
             start_time, end_time,
             aborted=run_aborted, abort_reason=abort_reason,
+            summary_path=(RUN_SUMMARY_DRYRUN if args.dry_run else RUN_SUMMARY_FILE),
+            ist_probelauf=bool(args.dry_run),
         )
 
     _flush_log_handlers()
@@ -4998,7 +5698,8 @@ def main() -> None:
     print(f"  Fehler-Log:  {os.path.abspath(LOG_FILE)}")
     print(f"  Detail-Log:  {os.path.abspath(DETAILED_LOG_FILE)}")
     print(f"  CSV-Log:     {os.path.abspath(CSV_LOG_FILE)}")
-    print(f"  Run-Summary: {os.path.abspath(RUN_SUMMARY_FILE)}")
+    print(f"  Run-Summary: "
+          f"{os.path.abspath(RUN_SUMMARY_DRYRUN if args.dry_run else RUN_SUMMARY_FILE)}")
     if resume_path and os.path.exists(resume_path):
         print(f"  Resume-Log:  {os.path.abspath(resume_path)} (erhalten – Neustart möglich)")
     print("=" * 70)

@@ -41,6 +41,10 @@ param(
 # $PSCmdlet ist nur im Skript-Scope verfuegbar, nicht in Funktionen.
 $script:ScriptCmdlet = $PSCmdlet
 
+# Steuert Wait-AnyKey. Im Modus -NoInteractive darf am Ende nichts auf
+# einen Tastendruck warten, sonst haengt ein geplanter Task dauerhaft.
+$script:NoWaitOnExit = $NoInteractive.IsPresent
+
 function Confirm-Write {
     <#
         Zentrale Freigabe fuer jede schreibende Operation am Original.
@@ -88,9 +92,30 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $script:PreviewOnly = $ReadOnlyMode.IsPresent
 $ReadOnly           = $script:PreviewOnly
 
+
+# ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Bindet _gemeinsam.psm1 ein, wenn vorhanden. Die eingebauten Kopien der
+# Helfer bleiben bestehen und ueberschreiben das Modul absichtlich - so
+# bleibt jedes Skript einzeln lauffaehig und die ps2exe-Uebersetzung
+# funktioniert unveraendert. Genutzt wird das Modul fuer das gemeinsame
+# Laufprotokoll (migration.jsonl) und die zentralen Verzeichnis-Presets
+# aus pfade.json.
+$script:GemeinsamGeladen = $false
+try {
+    $gemModul = Join-Path $PSScriptRoot '_gemeinsam.psm1'
+    if (Test-Path -LiteralPath $gemModul) {
+        Import-Module $gemModul -Force -DisableNameChecking -ErrorAction Stop
+        $script:GemeinsamGeladen = $true
+    }
+} catch {
+    # Ohne Modul laeuft das Skript mit seinen eingebauten Helfern weiter.
+}
+
 # --- HILFSFUNKTIONEN ---
 
-function ConvertTo-LongPath {
+function Add-LongPathPrefix {
     param([string]$Path)
     if ([string]::IsNullOrEmpty($Path)) { return $Path }
     if ($Path -like "\\?\*") { return $Path }
@@ -98,7 +123,7 @@ function ConvertTo-LongPath {
     return "\\?\" + $Path
 }
 
-function ConvertFrom-LongPath {
+function Remove-LongPathPrefix {
     param([string]$Path)
     if ([string]::IsNullOrEmpty($Path)) { return $Path }
     if ($Path -like "\\?\UNC\*") { return "\\" + $Path.Substring(8) }
@@ -237,9 +262,24 @@ function Restore-FileTimestamps {
 }
 
 function Wait-AnyKey {
+    <#
+        Wartet nur, wenn wirklich jemand zusehen kann.
+
+        Vorher wartete das Skript bedingungslos - auch im Modus
+        -NoInteractive, der ausdruecklich fuer geplante Tasks gedacht ist.
+        Ein solcher Task beendete sich nie und belegte bei jedem Lauf
+        einen Prozess. Zusaetzlich zur Parameterpruefung wird der Host
+        abgefragt: unter ps2exe -noConsole oder bei umgeleiteter Eingabe
+        wirft ReadKey, statt zu warten.
+    #>
+    if ($script:NoWaitOnExit) { return }
+    if ($Host.Name -ne 'ConsoleHost') { return }
+    try { if ([Console]::IsInputRedirected) { return } } catch {}
     Write-Host ""
     Write-Host "Beliebige Taste druecken zum Beenden..." -ForegroundColor DarkGray
-    [void]$Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    try {
+        [void]$Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    } catch {}
 }
 
 function Get-UserShellFolder {
@@ -467,16 +507,6 @@ Get-ChildItem -LiteralPath $docsFolder -Directory -Filter "6_Excel_automatische_
         }
     }
 
-$staleLogThreshold = (Get-Date).AddDays(-30)
-Get-ChildItem -LiteralPath $scriptDir -File -Filter "6_Excel_automatische_Berechnung_*.csv" -ErrorAction SilentlyContinue |
-    Where-Object { $_.LastWriteTime -lt $staleLogThreshold } |
-    ForEach-Object {
-        try {
-            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
-            Write-Host "[CLEANUP]   Alte Log-Datei entfernt: $($_.Name)" -ForegroundColor DarkGray
-        } catch { }
-    }
-
 if (-not (Test-Path -LiteralPath $tempFolder)) {
     New-Item -Path $tempFolder -ItemType Directory -Force | Out-Null
 }
@@ -509,6 +539,25 @@ if (-not $logFile) {
     Write-Host "WARNUNG: Keine Log-Datei schreibbar - Lauf wird nicht protokolliert." -ForegroundColor Red
 }
 
+# --- CLEANUP: alte Logs (>30 Tage) ---
+# Muss NACH der Wahl des Log-Verzeichnisses laufen und in genau diesem
+# Verzeichnis. Vorher wurde fest in $scriptDir aufgeraeumt - also
+# ausgerechnet dort nicht, wo das Skript bei schreibgeschuetztem
+# Skriptordner tatsaechlich protokolliert (LOCALAPPDATA oder TEMP).
+# Die Protokolle wuchsen dort unbegrenzt.
+if ($logFile) {
+    $staleLogThreshold = (Get-Date).AddDays(-30)
+    $logDirActual      = Split-Path -Parent $logFile
+    Get-ChildItem -LiteralPath $logDirActual -File -Filter "6_Excel_automatische_Berechnung_*.csv" -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt $staleLogThreshold -and $_.FullName -ne $logFile } |
+        ForEach-Object {
+            try {
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+                Write-Host "[CLEANUP]   Alte Log-Datei entfernt: $($_.Name)" -ForegroundColor DarkGray
+            } catch { }
+        }
+}
+
 function Write-Log {
     param(
         [string]$FileName,
@@ -516,9 +565,21 @@ function Write-Log {
         [string]$Status,
         [string]$Details = ""
     )
+
+    # Gemeinsames Laufprotokoll (migration.jsonl) - ergaenzt die CSV,
+    # ersetzt sie nicht. Erst damit laesst sich der Fortschritt ueber
+    # alle elf Schritte hinweg auswerten.
+    if ($script:GemeinsamGeladen) {
+        try {
+            Write-Laufprotokoll -Skript '6_Excel_automatische_Berechnung' `
+                -Pfad $FilePath -Aktion 'Berechnungsmodus' `
+                -Status $Status -Detail $Details
+        } catch { }
+    }
+
     if (-not $logFile) { return }
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $cleanPath = ConvertFrom-LongPath $FilePath
+    $cleanPath = Remove-LongPathPrefix $FilePath
     $line = '"{0}";"{1}";"{2}";"{3}";"{4}"' -f `
         $timestamp, `
         (Format-CsvField $FileName), `
@@ -564,7 +625,7 @@ function Test-AbortRequested {
 }
 
 # --- PFAD-VORBEREITUNG ---
-$longPath   = ConvertTo-LongPath $rootPath
+$longPath   = Add-LongPathPrefix $rootPath
 $extensions = @('.xlsx', '.xlsm', '.xltx', '.xltm')
 
 if ($ReadOnly) {
@@ -612,12 +673,12 @@ if (-not $SkipBackupCleanup) {
                     }
                     if (-not $origOk) {
                         $bakOrphans++
-                        Write-Host "[BACKUP]    Ohne intaktes Original - NICHT geloescht: $(ConvertFrom-LongPath $f)" -ForegroundColor Yellow
+                        Write-Host "[BACKUP]    Ohne intaktes Original - NICHT geloescht: $(Remove-LongPathPrefix $f)" -ForegroundColor Yellow
                         Write-Log -FileName (Split-Path $f -Leaf) -FilePath $f -Status "WARNUNG" -Details "Backup ohne intaktes Original - bitte pruefen"
                         continue
                     }
                     if ($fi.LastWriteTime -gt $bakCutoff) { $bakKept++; continue }
-                    if (Confirm-Write (ConvertFrom-LongPath $f) 'Verwaistes Backup loeschen') {
+                    if (Confirm-Write (Remove-LongPathPrefix $f) 'Verwaistes Backup loeschen') {
                         try { [System.IO.File]::Delete($f); $bakDeleted++ } catch { }
                     } else { $bakKept++ }
                 } catch { }
@@ -708,7 +769,7 @@ foreach ($file in $files) {
         # Basisname kuerzen, damit Tempfile-Komponente nicht NTFS-Limit (255) reisst
         if ($baseName.Length -gt 180) { $baseName = $baseName.Substring(0, 180) }
         $tempFile     = Join-Path $tempFolder "${baseName}_${uniqueId}${extension}"
-        $tempFileLong = ConvertTo-LongPath $tempFile
+        $tempFileLong = Add-LongPathPrefix $tempFile
     } catch {
         $countErrors++
         $msg = $_.Exception.Message
@@ -766,33 +827,83 @@ foreach ($file in $files) {
             $reader.Close()
             $reader     = $null
 
-            # Indikatoren fuer manuellen/zurueckgehaltenen Berechnungsmodus
-            $hasManualCalc        = $xmlContent -match '(?i)calcMode=[''"]manual[''"]'
-            $hasCalcOnSaveZero    = $xmlContent -match '(?i)calcOnSave=[''"]0[''"]'
-            $hasCalcCompletedZero = $xmlContent -match '(?i)calcCompleted=[''"]0[''"]'
-            $needsFix             = $hasManualCalc -or $hasCalcOnSaveZero -or $hasCalcCompletedZero
+            # Auswertung ueber den XML-Baum statt per regulaerem Ausdruck.
+            # Der frueher verwendete -match lief gegen die GESAMTE
+            # workbook.xml: ein gleichnamiges Attribut an einer anderen
+            # Stelle (etwa in einer definedName-Formel oder einer
+            # Erweiterungsliste) loeste dadurch eine Korrektur aus und
+            # wurde vom -replace anschliessend mitentfernt.
+            $xmlDoc   = $null
+            $calcPr   = $null
+            $xmlUsable = $false
+            try {
+                $xmlDoc = New-Object System.Xml.XmlDocument
+                $xmlDoc.PreserveWhitespace = $true
+                $xmlDoc.LoadXml($xmlContent)
+                # local-name(): workbook.xml traegt einen Standard-Namensraum,
+                # ein einfaches SelectSingleNode('calcPr') findet nichts.
+                $calcPr = $xmlDoc.DocumentElement.SelectSingleNode("*[local-name()='calcPr']")
+                $xmlUsable = $true
+            } catch {
+                Write-Host "[ SKIP ]    $fileName (workbook.xml nicht lesbar: $($_.Exception.Message))" -ForegroundColor DarkYellow
+                Write-Log -FileName $fileName -FilePath $file -Status "SKIP" -Details "workbook.xml nicht als XML lesbar: $($_.Exception.Message)"
+            }
 
-            if ($needsFix) {
+            $hasManualCalc        = $false
+            $hasCalcOnSaveZero    = $false
+            $hasCalcCompletedZero = $false
+            if ($xmlUsable -and $null -ne $calcPr) {
+                $hasManualCalc        = ($calcPr.GetAttribute('calcMode')      -ieq 'manual')
+                $hasCalcOnSaveZero    = ($calcPr.GetAttribute('calcOnSave')    -eq  '0')
+                $hasCalcCompletedZero = ($calcPr.GetAttribute('calcCompleted') -eq  '0')
+            }
+            $needsFix = $hasManualCalc -or $hasCalcOnSaveZero -or $hasCalcCompletedZero
+
+            if (-not $xmlUsable) {
+                # Bereits oben als SKIP protokolliert - hier nichts weiter tun,
+                # sonst meldete das Skript die unlesbare Datei zusaetzlich als
+                # "Bereits automatisch".
+                $countSkippedNoZip++
+            } elseif ($needsFix) {
                 $countFound++
 
                 # Zentrale Freigabe: ab hier wird das Original angefasst.
                 $darfSchreiben = Confirm-Write `
-                    -Target (ConvertFrom-LongPath $file) `
+                    -Target (Remove-LongPathPrefix $file) `
                     -Action "Berechnungsmodus auf automatisch zuruecksetzen"
 
                 if ($darfSchreiben) {
                     # Zeitstempel VOR jeder Aenderung sichern.
-                    $origTimes  = Get-FileTimestamps (ConvertTo-LongPath $file)
-                    $newContent = $xmlContent
+                    $origTimes = Get-FileTimestamps (Add-LongPathPrefix $file)
 
-                    # calcMode="manual" entfernen (Default ist 'auto'); 'autoNoTable' bleibt erhalten
-                    $newContent = $newContent -replace '(?i)\s+calcMode=[''"]manual[''"]', ''
-                    # calcOnSave="0" entfernen (Default ist '1')
-                    $newContent = $newContent -replace '(?i)\s+calcOnSave=[''"]0[''"]', ''
-                    # calcCompleted="0" entfernen (Default ist '1')
-                    $newContent = $newContent -replace '(?i)\s+calcCompleted=[''"]0[''"]', ''
-                    # leere Whitespace-Reste in <calcPr> bereinigen
-                    $newContent = $newContent -replace '(<calcPr)\s+(/?>)', '$1$2'
+                    # Geaendert wird ausschliesslich der calcPr-Tag im
+                    # Originaltext. Bewusst NICHT ueber $xmlDoc.OuterXml:
+                    # das serialisiert die komplette workbook.xml neu und
+                    # schreibt dabei Entities in unbeteiligten Textknoten um
+                    # (&quot; wird zu "), was den Eingriff unnoetig gross
+                    # macht. Die Erkennung oben laeuft weiterhin ueber den
+                    # XML-Baum, der Schnitt hier ist auf den einen Tag
+                    # begrenzt - Attributwerte koennen weder '<' noch '>'
+                    # roh enthalten, das Muster ist also eindeutig.
+                    # Excel setzt fuer alle drei Attribute den gewuenschten
+                    # Wert als Vorgabe, wenn sie fehlen: calcMode=auto,
+                    # calcOnSave=1, calcCompleted=1. 'autoNoTable' bleibt
+                    # erhalten, weil oben nur exakt 'manual' geprueft wird.
+                    $tagMatch = [regex]::Match($xmlContent, '<calcPr\b[^>]*?/?>')
+                    if (-not $tagMatch.Success) {
+                        throw "calcPr-Element im Originaltext nicht auffindbar"
+                    }
+                    $newTag = $tagMatch.Value
+                    $attrsToDrop = New-Object System.Collections.Generic.List[string]
+                    if ($hasManualCalc)        { $attrsToDrop.Add('calcMode') }
+                    if ($hasCalcOnSaveZero)    { $attrsToDrop.Add('calcOnSave') }
+                    if ($hasCalcCompletedZero) { $attrsToDrop.Add('calcCompleted') }
+                    foreach ($attrName in $attrsToDrop) {
+                        $newTag = $newTag -replace ("(?i)\s+" + $attrName + "\s*=\s*(""[^""]*""|'[^']*')"), ''
+                    }
+                    $newContent = $xmlContent.Substring(0, $tagMatch.Index) +
+                                  $newTag +
+                                  $xmlContent.Substring($tagMatch.Index + $tagMatch.Length)
 
                     $entry.Delete()
                     $newEntry = $archive.CreateEntry("xl/workbook.xml")
@@ -808,7 +919,7 @@ foreach ($file in $files) {
                     $stream.Close(); $stream.Dispose(); $stream = $null
 
                     # Schritt 4: Quellattribute (ReadOnly/Hidden/System) entfernen - bleiben dauerhaft entfernt
-                    $longFile     = ConvertTo-LongPath $file
+                    $longFile     = Add-LongPathPrefix $file
                     $removedAttrs = Remove-RestrictiveAttributes $longFile
 
                     # Schritt 5: Zurueckkopieren mit Backup-Schutz und Retry.
@@ -818,7 +929,7 @@ foreach ($file in $files) {
                     # (die Temp-Kopie wird im finally-Block geloescht).
                     $backupLong = $null
                     if ([System.IO.File]::Exists($longFile)) {
-                        $backupLong = ConvertTo-LongPath ((ConvertFrom-LongPath $file) + ".bak_" + $uniqueId)
+                        $backupLong = Add-LongPathPrefix ((Remove-LongPathPrefix $file) + ".bak_" + $uniqueId)
                         [System.IO.File]::Copy($longFile, $backupLong, $true)
                     }
                     $copySuccess = $false
@@ -841,7 +952,7 @@ foreach ($file in $files) {
                                         Write-Host "[RESTORE]   $fileName - Original aus Backup wiederhergestellt" -ForegroundColor DarkYellow
                                         Write-Log -FileName $fileName -FilePath $file -Status "RESTORE" -Details "Zurueckkopieren fehlgeschlagen - Original aus Backup wiederhergestellt"
                                     } catch {
-                                        $bakDisplay = ConvertFrom-LongPath $backupLong
+                                        $bakDisplay = Remove-LongPathPrefix $backupLong
                                         Write-Host "[WARNUNG]   $fileName - Backup-Restore fehlgeschlagen, Backup bleibt: $bakDisplay" -ForegroundColor Red
                                         Write-Log -FileName $fileName -FilePath $file -Status "WARNUNG" -Details "Backup-Restore fehlgeschlagen - Backup bleibt erhalten: $bakDisplay"
                                     }
@@ -854,7 +965,7 @@ foreach ($file in $files) {
                         try {
                             [System.IO.File]::Delete($backupLong)
                         } catch {
-                            $bakDisplay = ConvertFrom-LongPath $backupLong
+                            $bakDisplay = Remove-LongPathPrefix $backupLong
                             Write-Host "[WARNUNG]   Backup nicht loeschbar: $bakDisplay" -ForegroundColor DarkYellow
                             Write-Log -FileName $fileName -FilePath $file -Status "WARNUNG" -Details "Backup nicht loeschbar: $bakDisplay"
                         }

@@ -80,18 +80,36 @@ import logging
 import importlib.util
 import gc
 import re
-import pythoncom
-import win32com.client
-import psutil
 from collections import defaultdict
-from tqdm import tqdm
 import time
 import uuid
 from datetime import datetime
 from typing import Optional
-import msoffcrypto
 import threading
-import win32process
+
+# Die Drittanbieter-Module hier gebuendelt und mit Klartext-Meldung. Frueher
+# standen sie als nackte Importe im Modulkopf: fehlte eines, brach das Skript
+# mit einem ModuleNotFoundError-Traceback ab, BEVOR die eigene Pruefung
+# check_required_modules() ueberhaupt lief - sie konnte deshalb nie ausloesen
+# und ihre verstaendliche 'pip install'-Anleitung nie erscheinen.
+try:
+    import pythoncom
+    import win32com.client
+    import win32process
+    import psutil
+    from tqdm import tqdm
+    import msoffcrypto
+except ImportError as _e_imp:
+    _paket = {
+        "pythoncom": "pywin32", "win32com": "pywin32", "win32process": "pywin32",
+        "psutil": "psutil", "tqdm": "tqdm", "msoffcrypto": "msoffcrypto-tool",
+    }.get((getattr(_e_imp, "name", "") or "").split(".")[0], "")
+    print("=" * 66)
+    print("❌ FEHLENDES MODUL:", getattr(_e_imp, "name", _e_imp))
+    if _paket:
+        print(f"   pip install {_paket}")
+    print("=" * 66)
+    raise SystemExit(1)
 
 # ==================================================================
 # Skript-Metadaten
@@ -109,6 +127,19 @@ try:
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+
+# ==================================================================
+# Gemeinsame Grundbibliothek (mit Rueckfall)
+# ==================================================================
+# Fehlt _gemeinsam.py, laeuft alles unveraendert weiter.
+try:
+    _eigener_ordner = os.path.dirname(os.path.abspath(__file__))
+    if _eigener_ordner not in sys.path:
+        sys.path.insert(0, _eigener_ordner)
+    import _gemeinsam as gem
+except Exception:
+    gem = None
+
 
 # ==================================================================
 # COM- und Format-Konstanten
@@ -239,7 +270,33 @@ def _setup_logging(log_dir: str) -> tuple:
     return log_file, detailed_log_file
 
 
+
+# ==================================================================
+# Gemeinsames Laufprotokoll (migration.jsonl)
+# ==================================================================
+# Jedes Skript schreibt sein eigenes Format: CSV mit Semikolon, CSV mit
+# Komma, .log, XLSX, teils mit BOM, teils ohne. Der Gesamtfortschritt
+# ueber die elf Schritte liess sich damit nicht auswerten - etwa die
+# Frage, welche Dateien in Schritt 2 liegen blieben und in Schritt 7
+# wieder auftauchen. Diese Zeile ERGAENZT die bestehenden Protokolle.
+_laufprotokoll = None
+
+
+def _protokoll(pfad: str, aktion: str, status: str, detail: str = "") -> None:
+    global _laufprotokoll
+    if gem is None:
+        return
+    try:
+        if _laufprotokoll is None:
+            _laufprotokoll = gem.Laufprotokoll(
+                os.path.splitext(os.path.basename(__file__))[0])
+        _laufprotokoll.schreibe(pfad, aktion, status, detail)
+    except Exception:
+        pass
+
 def log_conversion(old_path: str, new_path: str) -> None:
+    _protokoll(new_path or old_path, "konvertiert", "OK",
+               f"aus {old_path}")
     # Nachweisliste der .doc/.dot -> .docx/.dotx-Konvertierungen (und
     # Ausweichnamen bei Kollision). Die JSON-Summary enthaelt nur Zaehler;
     # diese CSV haelt die konkreten Pfad-Paare fuers Archiv fest.
@@ -273,10 +330,18 @@ def _signal_handler(sig, frame) -> None:
 
     global word_app_global, word_pid_global
     if word_app_global is not None:
+        # Profil-persistente Word-Optionen VOR dem Quit zuruecksetzen. Sie
+        # ueberdauern das Skript im Benutzerprofil; nach einem Strg+C blieben
+        # sie dauerhaft veraendert, weil der Handler die Instanz beendet und
+        # das finale finally danach keine lebende COM-Instanz mehr vorfindet.
+        try:
+            _restore_word_options(word_app_global)
+        except Exception as _e:
+            detail_logger.debug(f"_signal_handler: Restore verworfen: {_e!r}")
         try:
             word_app_global.Quit(SaveChanges=COM_FALSE)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
         word_app_global = None
         word_pid_global = None
 
@@ -291,8 +356,8 @@ def _signal_handler(sig, frame) -> None:
 
     try:
         pythoncom.CoUninitialize()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
 
     _release_lock()
     sys.exit(1)
@@ -341,8 +406,8 @@ def _clear_readonly(path: str) -> None:
     except Exception:
         try:
             os.chmod(path, stat.S_IWRITE)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_clear_readonly: Exception verworfen: {_e!r}")
 
 
 def safe_remove(path: str) -> bool:
@@ -358,6 +423,24 @@ def safe_remove(path: str) -> bool:
         detail_logger.warning(f"Löschen fehlgeschlagen: {path} – {e}")
         return False
 
+
+
+def _utime_rueckfall(pfad: str, zeiten) -> bool:
+    """Rueckfall, wenn win32file.SetFileTime scheitert.
+
+    Erhaelt Zugriffs- und Aenderungszeit - nicht die Erstellungszeit,
+    aber das ist deutlich besser als der vollstaendige Verlust des
+    Datums. Diesen Rueckfall hatte bisher nur 5_OCR_PDF.py; ohne ihn
+    verloren die uebrigen Skripte die Zeitstempel stillschweigend,
+    sobald pywin32 fehlte oder der Handle nicht zu oeffnen war.
+    """
+    try:
+        zugriff, geaendert = zeiten[1], zeiten[2]
+        os.utime(prepare_long_path(pfad),
+                 (zugriff.timestamp(), geaendert.timestamp()))
+        return True
+    except Exception:
+        return False
 
 def safe_exists(path: str) -> bool:
     try:
@@ -423,8 +506,8 @@ def release_unique_path(path: Optional[str]) -> None:
         p = _lp_for_reserve(path)
         if os.path.isfile(p) and os.path.getsize(p) == 0:
             os.remove(p)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"release_unique_path: Exception verworfen: {_e!r}")
 
 
 def safe_getsize(path: str) -> int:
@@ -471,8 +554,8 @@ def wait_for_file_available(path: str,
             )
             try:
                 h.Close()
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"wait_for_file_available: Exception verworfen: {_e!r}")
             if waited:
                 detail_logger.debug(f"AV-Wait: Datei freigegeben nach Wartezeit – {path}")
             return True
@@ -534,8 +617,8 @@ def _enable_restore_privileges() -> None:
             try:
                 luid = win32security.LookupPrivilegeValue(None, name)
                 privs.append((luid, win32security.SE_PRIVILEGE_ENABLED))
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_enable_restore_privileges: Exception verworfen: {_e!r}")
         if not privs:
             return
         win32security.AdjustTokenPrivileges(htoken, 0, privs)
@@ -568,6 +651,27 @@ def _get_security_descriptor(path: str):
 
 
 def _apply_security_descriptor(path: str, sd) -> None:
+    """Eigentuemer, Gruppe und DACL einer ersetzten Datei wiederherstellen.
+
+    Alles wird in EINEM SetNamedSecurityInfo-Aufruf gesetzt. Frueher liefen
+    zwei getrennte Aufrufe (erst DACL, dann Owner) - und das Setzen des
+    Eigentuemers ordnet die Vererbung neu. Nachgestellt: eine Datei verlor
+    dabei die Kennzeichnung ihrer geerbten ACEs, und eine geerbte
+    EIGENTUEMERRECHTE-ACE (S-1-3-4) bekam zusaetzlich INHERIT_ONLY - damit galt
+    sie fuer die Datei selbst nicht mehr. Wer seinen Zugriff allein daraus
+    bezog, konnte die eigene Datei anschliessend nicht mehr oeffnen
+    (PermissionError). Das ist das Gegenteil dessen, was diese Funktion
+    bezweckt. Ein gemeinsamer Aufruf laesst Windows die Rechte in einem Zug
+    berechnen; der schaedliche Zwischenzustand entsteht gar nicht erst.
+
+    Der Eigentuemer wird ausserdem nur gesetzt, wenn er tatsaechlich abweicht -
+    ein privilegierter Schreibvorgang ohne Wirkung entfaellt damit.
+
+    Schlaegt der gemeinsame Aufruf fehl (typisch: kein SeRestorePrivilege im
+    Nutzer-Kontext, dann verweigert bereits das Owner-Feld), wird die DACL
+    einzeln nachgezogen. Damit bleibt das bisherige Verhalten erhalten, dass
+    wenigstens die Rechte ankommen.
+    """
     if sd is None:
         return
     try:
@@ -580,48 +684,72 @@ def _apply_security_descriptor(path: str, sd) -> None:
         dacl = sd.GetSecurityDescriptorDacl()
     except Exception:
         dacl = None
-    if dacl is not None:
-        try:
-            dacl_flags = win32security.DACL_SECURITY_INFORMATION
-            try:
-                ctrl, _rev = sd.GetSecurityDescriptorControl()
-                if ctrl & win32security.SE_DACL_PROTECTED:
-                    dacl_flags |= win32security.PROTECTED_DACL_SECURITY_INFORMATION
-                else:
-                    dacl_flags |= win32security.UNPROTECTED_DACL_SECURITY_INFORMATION
-            except Exception:
-                pass
-            win32security.SetNamedSecurityInfo(
-                p, win32security.SE_FILE_OBJECT, dacl_flags,
-                None, None, dacl, None)
-            detail_logger.debug(f"DACL wiederhergestellt: {path}")
-        except Exception as e:
-            detail_logger.warning(
-                f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e}")
-
     try:
         owner = sd.GetSecurityDescriptorOwner()
+    except Exception:
+        owner = None
+    try:
+        group = sd.GetSecurityDescriptorGroup()
+    except Exception:
         group = None
+
+    info = 0
+    if dacl is not None:
+        info |= win32security.DACL_SECURITY_INFORMATION
         try:
-            group = sd.GetSecurityDescriptorGroup()
-        except Exception:
-            pass
-        if owner is not None:
-            sec_flags = win32security.OWNER_SECURITY_INFORMATION
-            if group is not None:
-                sec_flags |= win32security.GROUP_SECURITY_INFORMATION
-            win32security.SetNamedSecurityInfo(
-                p, win32security.SE_FILE_OBJECT, sec_flags,
-                owner, group, None, None)
-            detail_logger.debug(f"Owner wiederhergestellt: {path}")
+            ctrl, _rev = sd.GetSecurityDescriptorControl()
+            if ctrl & win32security.SE_DACL_PROTECTED:
+                info |= win32security.PROTECTED_DACL_SECURITY_INFORMATION
+            else:
+                info |= win32security.UNPROTECTED_DACL_SECURITY_INFORMATION
+        except Exception as _e:
+            detail_logger.debug(f"_apply_security_descriptor: Exception verworfen: {_e!r}")
+
+    # Eigentuemer nur setzen, wenn er wirklich abweicht.
+    if owner is not None:
+        try:
+            akt = win32security.GetNamedSecurityInfo(
+                p, win32security.SE_FILE_OBJECT,
+                win32security.OWNER_SECURITY_INFORMATION
+            ).GetSecurityDescriptorOwner()
+            if (win32security.ConvertSidToStringSid(akt)
+                    == win32security.ConvertSidToStringSid(owner)):
+                owner = None
+        except Exception as _e:
+            detail_logger.debug(f"_apply_security_descriptor: Owner-Vergleich verworfen: {_e!r}")
+
+    if owner is not None:
+        info |= win32security.OWNER_SECURITY_INFORMATION
+    if group is not None:
+        info |= win32security.GROUP_SECURITY_INFORMATION
+    if not info:
+        return
+
+    nur_dacl = info & ~(win32security.OWNER_SECURITY_INFORMATION
+                        | win32security.GROUP_SECURITY_INFORMATION)
+
+    try:
+        win32security.SetNamedSecurityInfo(
+            p, win32security.SE_FILE_OBJECT, info, owner, group, dacl, None)
+        detail_logger.debug(f"Sicherheitsinfo wiederhergestellt: {path}")
+        return
     except Exception as e:
+        if owner is None and group is None:
+            detail_logger.warning(f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e}")
+            return
         if _restore_privileges_enabled:
-            detail_logger.warning(
-                f"Owner-Wiederherstellung fehlgeschlagen ({path}): {e}")
+            detail_logger.warning(f"Owner-Wiederherstellung fehlgeschlagen ({path}): {e}")
         else:
-            detail_logger.debug(
-                f"Owner nicht gesetzt (kein Admin-Privileg – im "
-                f"Nutzer-Kontext unkritisch): {path} – {e}")
+            detail_logger.debug(f"Owner nicht gesetzt (kein Admin-Privileg - im Nutzer-Kontext unkritisch): {path} - {e}")
+
+    # Rueckfall: wenigstens die DACL setzen.
+    if dacl is not None and nur_dacl:
+        try:
+            win32security.SetNamedSecurityInfo(
+                p, win32security.SE_FILE_OBJECT, nur_dacl, None, None, dacl, None)
+            detail_logger.debug(f"DACL wiederhergestellt (ohne Owner): {path}")
+        except Exception as e2:
+            detail_logger.warning(f"DACL-Wiederherstellung fehlgeschlagen ({path}): {e2}")
 
 
 # ==================================================================
@@ -684,14 +812,24 @@ def robust_move(src: str, dst: str, max_retries: int = MAX_RETRIES) -> bool:
             safe_remove(src)
             detail_logger.debug(f"Verschoben (staging+replace): {src} → {dst}")
             return True
-        except Exception as e:
-            detail_logger.warning(f"Verschieben Versuch {attempt+1}/{max_retries}: {e}")
+        # BaseException, nicht Exception: Der Signal-Handler beendet sich mit
+        # sys.exit() und loest damit SystemExit aus - das erbt von
+        # BaseException. Bei Strg+C mitten im Kopieren blieb die Staging-Kopie
+        # '<Ziel>.tmp_new' deshalb im ZIELVERZEICHNIS liegen, also auf der
+        # Ablage - und kein Aufraeumpfad des Skripts erfasst sie je wieder.
+        except BaseException as e:
+            if isinstance(e, Exception):
+                detail_logger.warning(f"Verschieben Versuch {attempt+1}/{max_retries}: {e}")
             try:
                 if os.path.exists(stage_s):
                     _clear_readonly(stage_s)
                     os.remove(stage_s)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"robust_move: Exception verworfen: {_e!r}")
+            # Abbruch nach dem Aufraeumen unveraendert weiterreichen, sonst
+            # wuerde Strg+C zu einem blossen 'Versuch fehlgeschlagen'.
+            if not isinstance(e, Exception):
+                raise
         if attempt < max_retries - 1:
             time.sleep(RETRY_DELAY)
     return False
@@ -714,8 +852,8 @@ def is_locked_by_other(path: str) -> bool:
             for oc in owner_candidates:
                 if safe_exists(os.path.join(d, oc)):
                     return True
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"is_locked_by_other: Exception verworfen: {_e!r}")
 
     try:
         import win32file
@@ -733,15 +871,15 @@ def is_locked_by_other(path: str) -> bool:
         )
         try:
             h.Close()
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"is_locked_by_other: Exception verworfen: {_e!r}")
         return False
     except Exception as e:
         try:
             if isinstance(e, pywintypes.error) and e.winerror == ERROR_SHARING_VIOLATION:
                 return True
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"is_locked_by_other: Exception verworfen: {_e!r}")
         return False
 
 
@@ -756,8 +894,8 @@ def is_transient_error(exc: Exception) -> bool:
         try:
             if exc.hresult in HR_TRANSIENT:
                 return True
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"is_transient_error: Exception verworfen: {_e!r}")
     s = str(exc).lower()
     if any(kw in s for kw in ("busy", "timeout", "sharing violation",
                               "network error", "wird gerade verwendet",
@@ -773,8 +911,8 @@ def is_permanent_error(exc: Exception) -> bool:
         try:
             if exc.hresult in HR_PERMANENT:
                 return True
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"is_permanent_error: Exception verworfen: {_e!r}")
     s = str(exc).lower()
     if any(kw in s for kw in ("access denied", "permission denied",
                               "zugriff verweigert", "nicht gefunden",
@@ -823,9 +961,9 @@ def snapshot_foreign_word_pids() -> None:
                     found.add(p.info["pid"])
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
-    except Exception:
+    except Exception as _e:
         # Im Zweifel lieber zu viel schuetzen als eine fremde Sitzung killen.
-        pass
+        detail_logger.debug(f"snapshot_foreign_word_pids: Exception verworfen: {_e!r}")
     _FOREIGN_WORD_PIDS = found
     if found:
         detail_logger.info(
@@ -1004,8 +1142,8 @@ def _cleanup_word_inetcache() -> None:
                     try:
                         try:
                             os.chmod(fpath, stat.S_IWRITE)
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"_cleanup_word_inetcache: Exception verworfen: {_e!r}")
                         os.remove(fpath)
                         files_deleted += 1
                         bytes_freed   += fsize
@@ -1073,8 +1211,8 @@ def _cleanup_user_recent() -> None:
             try:
                 try:
                     os.chmod(fpath, stat.S_IWRITE)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"_cleanup_user_recent: Exception verworfen: {_e!r}")
                 os.remove(fpath)
                 files_deleted += 1
                 bytes_freed   += fsize
@@ -1122,28 +1260,28 @@ def _init_word_app() -> tuple:
         for opt in ("UpdateLinksAtOpen", "DoNotPromptForConvert"):
             try:
                 _orig_word_options[opt] = getattr(app.Options, opt)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_init_word_app: Exception verworfen: {_e!r}")
 
     try:
         app.Options.UpdateLinksAtOpen = False
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_init_word_app: Exception verworfen: {_e!r}")
     # Konvertierungs-Dialog beim Oeffnen alter Formate unterdruecken -
     # das ist der Kern-Use-Case dieses Skripts und ohne dieses Flag eine
     # Haenger-Quelle, die sonst nur der Watchdog (teuer) abfaengt.
     try:
         app.Options.DoNotPromptForConvert = True
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_init_word_app: Exception verworfen: {_e!r}")
     try:
         app.Options.NoPromptForTemplateID = True
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_init_word_app: Exception verworfen: {_e!r}")
     try:
         app.DisplayRecentFiles = False
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_init_word_app: Exception verworfen: {_e!r}")
     return app, pid
 
 
@@ -1154,8 +1292,8 @@ def _restore_word_options(app) -> None:
     for opt, val in _orig_word_options.items():
         try:
             setattr(app.Options, opt, val)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_restore_word_options: Exception verworfen: {_e!r}")
 
 
 def _clear_recent_files(word_app: win32com.client.CDispatch) -> None:
@@ -1164,10 +1302,10 @@ def _clear_recent_files(word_app: win32com.client.CDispatch) -> None:
         for i in range(count, 0, -1):
             try:
                 word_app.RecentFiles(i).Delete()
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _e:
+                detail_logger.debug(f"_clear_recent_files: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_clear_recent_files: Exception verworfen: {_e!r}")
 
 
 def _restart_word_engine(old_app=None, pbar=None) -> tuple:
@@ -1175,8 +1313,8 @@ def _restart_word_engine(old_app=None, pbar=None) -> tuple:
     if old_app is not None:
         try:
             old_app.Quit(SaveChanges=COM_FALSE)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_restart_word_engine: Exception verworfen: {_e!r}")
     word_app_global = None
     word_pid_global = None
     gc.collect()
@@ -1264,8 +1402,8 @@ def _word_call_with_watchdog(call_label: str, timeout: float, word_pid,
                     proc.kill()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
-                except Exception:
-                    pass
+                except Exception as _e:
+                    detail_logger.debug(f"watchdog: Exception verworfen: {_e!r}")
 
     wd_thread = threading.Thread(target=watchdog, daemon=True)
     wd_thread.start()
@@ -1282,8 +1420,8 @@ def _word_call_with_watchdog(call_label: str, timeout: float, word_pid,
         if restore_fn is not None:
             try:
                 restore_fn()
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_word_call_with_watchdog: Exception verworfen: {_e!r}")
 
 
 def safe_word_open(word_app, file_path, pw, is_binary,
@@ -1291,12 +1429,12 @@ def safe_word_open(word_app, file_path, pw, is_binary,
     _prev_alerts = None
     try:
         _prev_alerts = word_app.DisplayAlerts
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"safe_word_open: Exception verworfen: {_e!r}")
     try:
         word_app.DisplayAlerts = COM_FALSE
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"safe_word_open: Exception verworfen: {_e!r}")
 
     def _open():
         return word_app.Documents.Open(
@@ -1316,8 +1454,8 @@ def safe_word_open(word_app, file_path, pw, is_binary,
         if _prev_alerts is not None:
             try:
                 word_app.DisplayAlerts = _prev_alerts
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"_restore: Exception verworfen: {_e!r}")
 
     return _word_call_with_watchdog(
         "Documents.Open (Passwort-Dialog/Netzwerk)",
@@ -1329,8 +1467,8 @@ def safe_word_saveas(word_app, doc, target_path, file_format, compat_mode,
                      timeout: float = SAVEAS_TIMEOUT, word_pid=None):
     try:
         word_app.DisplayAlerts = COM_FALSE
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"safe_word_saveas: Exception verworfen: {_e!r}")
 
     def _save():
         doc.SaveAs2(
@@ -1383,8 +1521,8 @@ def _build_minimal_docx(target_path: str) -> None:
     if os.path.exists(target_path):
         try:
             os.remove(target_path)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"_build_minimal_docx: Exception verworfen: {_e!r}")
 
     with zipfile.ZipFile(target_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml", content_types)
@@ -1437,13 +1575,13 @@ def test_trust_center_smoke(word_app, word_pid: Optional[int],
         if doc is not None:
             try:
                 doc.Close(SaveChanges=COM_FALSE)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
         try:
             if os.path.exists(test_path):
                 os.remove(test_path)
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
 
 
 # ==================================================================
@@ -1548,8 +1686,8 @@ def cleanup_orphaned_temp_dirs() -> None:
             try:
                 shutil.rmtree(full, ignore_errors=True)
                 detail_logger.debug(f"Verwaister Temp-Ordner entfernt: {full}")
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"cleanup_orphaned_temp_dirs: Exception verworfen: {_e!r}")
     except Exception as e:
         detail_logger.debug(f"cleanup_orphaned_temp_dirs: {e}")
 
@@ -1589,10 +1727,10 @@ def cleanup_windows_temp() -> None:
                     shutil.rmtree(full, ignore_errors=True)
                 else:
                     os.remove(full)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _e:
+                detail_logger.debug(f"cleanup_windows_temp: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"cleanup_windows_temp: Exception verworfen: {_e!r}")
 
 
 # ==================================================================
@@ -1677,8 +1815,8 @@ def _release_lock() -> None:
             stored_pid = int(content[0]) if content else 0
             if stored_pid == os.getpid():
                 os.remove(LOCK_FILE)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"_release_lock: Exception verworfen: {_e!r}")
 
 
 # ==================================================================
@@ -1860,7 +1998,7 @@ def ask_directory() -> str:
     while True:
         try:
             choice = input("Auswahl [1-8]: ").strip()
-        except EOFError:
+        except (EOFError, RuntimeError, OSError):
             print("\n⚠ Keine Eingabe möglich. Starte mit --dir und --auto-start.")
             sys.exit(1)
         if choice == "1":
@@ -1880,7 +2018,7 @@ def ask_directory() -> str:
         elif choice == "8":
             try:
                 raw = input("Pfad eingeben: ")
-            except EOFError:
+            except (EOFError, RuntimeError, OSError):
                 print("\n⚠ Keine Eingabe möglich.")
                 sys.exit(1)
             path = sanitize_path(raw)
@@ -1894,12 +2032,38 @@ def ask_directory() -> str:
         print("     Bitte erneut wählen.")
 
 
+def _is_tty() -> bool:
+    """Haengt stdin an einer echten Konsole? (wie in 4b)"""
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def _warte_auf_taste(auto_mode: bool = False) -> None:
+    """Abschliessende Enter-Abfrage - nur wenn wirklich jemand zusieht.
+
+    Ohne diesen Schutz blockierte ein geplanter Lauf mit angehaengter Konsole
+    unbegrenzt an der Eingabe. Ist stdin ganz abgeloest (pythonw, Taskplaner
+    ohne Benutzeranmeldung), wirft input() ausserdem RuntimeError('lost
+    sys.stdin') oder OSError - beides KEIN EOFError, der frueher allein
+    abgefangen wurde; das Skript endete dann nach vollstaendig geleisteter
+    Arbeit mit einem Traceback.
+    """
+    if auto_mode or not _is_tty():
+        return
+    try:
+        input("Drücken Sie Enter, um das Fenster zu schließen ...")
+    except (EOFError, RuntimeError, OSError):
+        pass
+
+
 def ask_yes_no(prompt: str, default_yes: bool = False) -> bool:
     hint = "[J/n]" if default_yes else "[j/N]"
     while True:
         try:
             answer = input(f"{prompt} {hint}: ").strip().lower()
-        except EOFError:
+        except (EOFError, RuntimeError, OSError):
             print("\n⚠ Keine Eingabe möglich (Skript läuft im Hintergrund?). Nutze Standardwert.")
             return default_yes
         if answer == "" and default_yes:
@@ -1923,7 +2087,7 @@ def ask_passwords() -> list:
     for slot in range(1, 4):
         try:
             pw = input(f"  Passwort {slot}: ").strip()
-        except EOFError:
+        except (EOFError, RuntimeError, OSError):
             break
         if pw:
             passwords.append(pw)
@@ -1975,7 +2139,7 @@ def ask_progress_mode() -> tuple:
     while True:
         try:
             choice = input("Auswahl [1-3]: ").strip()
-        except EOFError:
+        except (EOFError, RuntimeError, OSError):
             return (False, False)
         if choice in ("", "1"):
             return (False, False)
@@ -2111,8 +2275,8 @@ def send_summary_mail(
                         error_lines.pop(0)
         if error_lines:
             error_excerpt = "\nFehler-Auszug (letzte 50 Einträge):\n" + "".join(error_lines)
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"send_summary_mail: Exception verworfen: {_e!r}")
 
     info_section = ""
     if info_counters:
@@ -2443,8 +2607,8 @@ def end_compatibility_mode(
             orig_times = win32file.GetFileTime(h_src)
         finally:
             h_src.Close()
-    except Exception:
-        pass
+    except Exception as _e:
+        detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
 
     # NTFS-Sicherheitsinfo (Owner/Group/DACL) des Originals sichern -
     # wird nach der Ersetzung auf die neue Datei uebertragen.
@@ -2538,12 +2702,12 @@ def end_compatibility_mode(
         try:
             _prev_display_alerts = word_app.DisplayAlerts
             word_app.DisplayAlerts = COM_FALSE
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
         try:
             word_app.Interactive = COM_FALSE
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
 
         # --- Öffnen mit Retry und Passwort-Liste ---
         doc_opened       = False
@@ -2591,8 +2755,8 @@ def end_compatibility_mode(
                             except Exception:
                                 try:
                                     pvw.Close()
-                                except Exception:
-                                    pass
+                                except Exception as _e:
+                                    detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
                         else:
                             detail_logger.warning(
                                 f"Kein passendes ProtectedView-Fenster für {original_path} "
@@ -2607,13 +2771,13 @@ def end_compatibility_mode(
 
         try:
             word_app.Interactive = COM_TRUE
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
         try:
             if _prev_display_alerts is not None:
                 word_app.DisplayAlerts = _prev_display_alerts
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
 
         if timeout_occurred:
             pbar.write("  ✗  FEHLER: Kennwort-Dialog blockiert (Timeout) – Word-Prozess beendet.")
@@ -2622,14 +2786,28 @@ def end_compatibility_mode(
             return "ERROR", original_path
 
         if not doc_opened or doc is None:
+            # Zwischen DAUERHAFT und VORUEBERGEHEND unterscheiden. Frueher
+            # ging jeder gescheiterte Open als 'SKIPPED' zurueck, und der
+            # Aufrufer vermerkt 'SKIPPED' in der Resume-Datei - eine Datei,
+            # die nur gerade gesperrt war oder deren Netzpfad kurz weg war,
+            # galt danach als dauerhaft erledigt und wurde in JEDEM Folgelauf
+            # uebersprungen. Das widerspricht dem Kommentar am Resume-Filter,
+            # der ausdruecklich nur dauerhaft erledigte Dateien vorsieht.
+            # Ein fehlendes Passwort ist dauerhaft (SKIPPED), ein
+            # Zugriffs-/Sperrfehler nicht (SKIPPED_TRANSIENT).
             if needs_password_check and passwords and last_exception:
                 pbar.write("  → ÜBERSPRUNGEN: Passwort erforderlich (keines der hinterlegten Passwörter passt).")
-            else:
-                pbar.write("  → ÜBERSPRUNGEN: Zugriff verweigert.")
-            detail_logger.warning(f"Übersprungen (kein Zugriff): {original_path}")
+                detail_logger.warning(f"Übersprungen (Passwort): {original_path}")
+                if info_counters is not None:
+                    info_counters["PROTECTED_SKIPPED"] += 1
+                return "SKIPPED", original_path
+
+            pbar.write("  → ÜBERSPRUNGEN: Zugriff verweigert (wird beim nächsten Lauf erneut versucht).")
+            detail_logger.warning(
+                f"Übersprungen (kein Zugriff, voruebergehend): {original_path}")
             if info_counters is not None:
-                info_counters["PROTECTED_SKIPPED"] += 1
-            return "SKIPPED", original_path
+                info_counters["LOCKED_SKIPPED"] += 1
+            return "SKIPPED_TRANSIENT", original_path
 
         # --- Kompatibilitätsmodus lesen ---
         original_mode = None
@@ -2637,8 +2815,8 @@ def end_compatibility_mode(
             original_mode = doc.CompatibilityMode
             if mode_distribution is not None and original_mode is not None:
                 mode_distribution[original_mode] += 1
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
 
         # --- Bearbeitungsschutz aufheben ---
         try:
@@ -2655,14 +2833,14 @@ def end_compatibility_mode(
                             detail_logger.debug(
                                 "Bearbeitungsschutz mit bekanntem Passwort entfernt.")
                             break
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
                 if not unprotect_succeeded:
                     detail_logger.warning(
                         f"Bearbeitungsschutz konnte nicht entfernt werden "
                         f"(kein passendes Passwort): {original_path}")
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
 
         # --- Migration-First: doc.Convert() ---
         needs_convert_call = (
@@ -2793,8 +2971,8 @@ def end_compatibility_mode(
             detail_logger.info(f"[DRY-RUN] WOULD_UPDATE: {original_path}")
             try:
                 doc.Close(SaveChanges=COM_FALSE)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
             doc = None
             return "WOULD_UPDATE", original_path
 
@@ -2843,22 +3021,47 @@ def end_compatibility_mode(
         else:
             target_path = original_path
 
-        if new_ext != ext and safe_exists(target_path):
-            base, new_ext_part = os.path.splitext(target_path)
-            reserved = reserve_unique_path(base, new_ext_part)
-            if not reserved:
-                raise Exception(
-                    "Kein freier Ausweichname! Abbruch zum Schutz fremder Dateien."
+        if new_ext != ext:
+            # Den Wunschnamen IMMER atomar belegen, nicht nur wenn er schon
+            # besetzt ist. Bisher lief bei freiem Namen 'pruefen und danach
+            # benutzen' - genau das Zeitfenster, gegen das
+            # reserve_unique_path laut eigenem Docstring eingefuehrt wurde:
+            # ein parallel laufender Durchgang oder ein Nutzer, der gerade
+            # speichert, kann den Namen dazwischen belegen, und das
+            # anschliessende Schreiben ueberschreibt die fremde Datei. Der
+            # Fall 'noch frei' ist dabei der HAEUFIGERE.
+            # os.open(O_CREAT|O_EXCL) legt einen 0-Byte-Platzhalter an; das
+            # IST die Reservierung. Der finally-Block gibt ihn wieder frei,
+            # wenn es nicht zum Schreiben kommt.
+            reserviert_direkt = False
+            try:
+                fd = os.open(_lp_for_reserve(target_path),
+                             os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+                os.close(fd)
+                reserviert_direkt = True
+                target_was_reserved = True
+            except FileExistsError:
+                pass
+            except OSError as e_res:
+                detail_logger.debug(
+                    f"Direktreservierung nicht moeglich ({target_path}): {e_res}")
+
+            if not reserviert_direkt:
+                base, new_ext_part = os.path.splitext(target_path)
+                reserved = reserve_unique_path(base, new_ext_part)
+                if not reserved:
+                    raise Exception(
+                        "Kein freier Ausweichname! Abbruch zum Schutz fremder Dateien."
+                    )
+                target_path = reserved
+                target_was_reserved = True
+                pbar.write(
+                    f"  ⚠  Ziel existiert bereits – speichere als "
+                    f"'{os.path.basename(target_path)}'"
                 )
-            target_path = reserved
-            target_was_reserved = True
-            pbar.write(
-                f"  ⚠  Ziel existiert bereits – speichere als "
-                f"'{os.path.basename(target_path)}'"
-            )
-            detail_logger.info(
-                f"Formatkonflikt gelöst: '{original_path}' → '{target_path}'"
-            )
+                detail_logger.info(
+                    f"Formatkonflikt gelöst: '{original_path}' → '{target_path}'"
+                )
 
         # --- Backup der Zieldatei ---
         # Ein frisch reservierter Platzhalter ist 0 Byte gross und braucht
@@ -2925,7 +3128,12 @@ def end_compatibility_mode(
                     break
                 except Exception as e_utime:
                     if av_retry == 1:
-                        detail_logger.warning(f"Konnte Zeitstempel nicht wiederherstellen: {e_utime}")
+                        if not _utime_rueckfall(target_path, orig_times):
+                            detail_logger.warning(f"Konnte Zeitstempel nicht wiederherstellen: {e_utime}")
+                        else:
+                            detail_logger.info(
+                                "Zeitstempel ueber os.utime-Rueckfall gesetzt "
+                                "(ohne Erstellungszeit).")
                     else:
                         time.sleep(0.5)
 
@@ -2988,32 +3196,32 @@ def end_compatibility_mode(
             release_unique_path(target_path)
         try:
             word_app.Interactive = COM_TRUE
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
 
         if doc is not None:
             try:
                 doc.Close(SaveChanges=COM_FALSE)
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
             doc = None
         try:
             count = word_app.ProtectedViewWindows.Count
             for i in range(count, 0, -1):
                 try:
                     word_app.ProtectedViewWindows(i).Close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as _e:
+                    detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
+        except Exception as _e:
+            detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
         try:
             for i in range(word_app.Documents.Count, 0, -1):
                 try:
                     word_app.Documents(i).Close(SaveChanges=COM_FALSE)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as _e:
+                    detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
+        except Exception as _e:
+            detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
         _clear_recent_files(word_app)
         if temp_path and not is_temp_copy and safe_exists(temp_path):
             safe_remove(temp_path)
@@ -3040,12 +3248,28 @@ def process_file_with_retries(
 ) -> tuple:
     result, final_path = "ERROR", full_path
     for attempt in range(MAX_RETRIES):
+        # Die Zaehler je Versuch auf einer KOPIE fuehren und erst beim
+        # erfolgreichen Versuch uebernehmen. Frueher bekam
+        # end_compatibility_mode die echten Dicts: saemtliche Info-Zaehler
+        # werden dort INNERHALB der Funktion gesetzt, ein gescheiterter
+        # Versuch hinterliess sie also - und der Wiederholungsversuch zaehlte
+        # dieselbe Datei erneut. Bei MAX_RETRIES=3 stand am Ende bis zum
+        # Dreifachen in der Auswertung, obwohl die Datei einmal verarbeitet
+        # wurde. Dasselbe gilt fuer die Modus-Verteilung.
+        versuch_counters = dict(info_counters) if info_counters is not None else None
+        versuch_modes    = mode_distribution.copy() if mode_distribution is not None else None
         try:
             result, final_path = end_compatibility_mode(
                 full_path, word_app, max_compat_mode, pbar, passwords,
-                info_counters, mode_distribution,
+                versuch_counters, versuch_modes,
                 target_app_version=target_app_version,
                 dry_run=dry_run)
+            if info_counters is not None:
+                info_counters.clear()
+                info_counters.update(versuch_counters)
+            if mode_distribution is not None:
+                mode_distribution.clear()
+                mode_distribution.update(versuch_modes)
             break
         except Exception as e:
             log_error(full_path, e)
@@ -3073,8 +3297,8 @@ def process_file_with_retries(
         try:
             _ = word_app.Version
             word_alive = True
-        except Exception:
-            pass
+        except Exception as _e:
+            detail_logger.debug(f"process_file_with_retries: Exception verworfen: {_e!r}")
 
         if not word_alive:
             pbar.write("  ↻  Word-Instanz nicht mehr erreichbar – Neustart ...")
@@ -3212,8 +3436,8 @@ def process_directory(
                             if (processed_count + 1) % 50 == 0:
                                 rf_handle.flush()
                                 os.fsync(rf_handle.fileno())
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
 
                 pbar.update(1)
                 processed_count += 1
@@ -3241,8 +3465,8 @@ def process_directory(
             try:
                 rf_handle.flush()
                 rf_handle.close()
-            except Exception:
-                pass
+            except Exception as _e:
+                detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
     detail_logger.info(f"Verarbeitung abgeschlossen: {dict(stats)}")
     return stats, info_counters, mode_distribution, run_completed
 
@@ -3812,7 +4036,4 @@ if __name__ == "__main__":
     logging.shutdown()
 
     print()
-    try:
-        input("Drücken Sie Enter, um das Fenster zu schließen ...")
-    except EOFError:
-        pass
+    _warte_auf_taste(auto_mode)

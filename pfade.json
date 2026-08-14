@@ -1,0 +1,56 @@
+{
+  "_hinweis": [
+    "Zentrale Konfiguration der Migrations-Skripte.",
+    "",
+    "Die Verzeichnis-Presets standen bisher als Platzhalter in acht Skripten -",
+    "mal mit, mal ohne abschliessenden Backslash, in zwei verschiedenen",
+    "Reihenfolgen. Wer sie an seine Umgebung anpasste, musste acht Stellen",
+    "pflegen. Diese Datei ist jetzt die einzige.",
+    "",
+    "Fehlt die Datei oder ist sie fehlerhaft, arbeiten alle Skripte mit ihren",
+    "eingebauten Vorgabewerten weiter - der Lauf bricht nie an dieser Datei ab.",
+    "",
+    "Python : ueber _gemeinsam.preset_liste()",
+    "PowerShell: ueber Import-Presetliste aus _gemeinsam.psm1"
+  ],
+
+  "presets": [
+    "Q:\\",
+    "R:\\",
+    "G:\\Geteilte Ablagen",
+    "G:\\Meine Ablage",
+    "\\\\server\\dfs"
+  ],
+
+  "_hinweis_hunspell": [
+    "Bezugsquellen fuer 11_Typo_Dateinamen_korrigieren.ps1.",
+    "",
+    "Die Woerterbuecher sind auf einen COMMIT festgenagelt, nicht auf",
+    "'master'. Ein Commit-SHA ist unveraenderlich - der Zweig dagegen",
+    "aendert sich jederzeit, und damit aenderte sich unbemerkt, was als",
+    "Tippfehler gilt und welche Dateien umbenannt werden.",
+    "",
+    "Stand: Commit 31bc2a11 vom 09.12.2024 (letzte Aenderung an de/).",
+    "Aktualisieren: neuen SHA eintragen UND hashes.txt im Woerterbuch-",
+    "Ordner loeschen, damit die Pruefsummen neu festgeschrieben werden.",
+    "",
+    "Zusaetzlich prueft das Skript die Integritaet ueber hashes.txt: beim",
+    "ersten Lauf werden die Summen festgeschrieben, danach bricht jede",
+    "Abweichung den Start ab - auch bei den drei nativen DLLs."
+  ],
+  "hunspell": {
+    "nupkg": "https://www.nuget.org/api/v2/package/NHunspell/1.2.5554.16953",
+    "dic": "https://raw.githubusercontent.com/LibreOffice/dictionaries/31bc2a1104a1cd175f900902f994c76dea35c763/de/de_DE_frami.dic",
+    "aff": "https://raw.githubusercontent.com/LibreOffice/dictionaries/31bc2a1104a1cd175f900902f994c76dea35c763/de/de_DE_frami.aff"
+  },
+
+  "_hinweis_protokoll": [
+    "Gemeinsames Laufprotokoll ueber alle Schritte (JSON Lines).",
+    "Ergaenzt die skripteigenen Protokolle, ersetzt sie nicht.",
+    "Leerer Wert = neben den Skripten, sonst LOCALAPPDATA bzw. TEMP."
+  ],
+  "protokoll": {
+    "datei": "",
+    "aktiv": true
+  }
+}
