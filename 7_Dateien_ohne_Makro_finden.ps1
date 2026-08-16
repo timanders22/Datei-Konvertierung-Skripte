@@ -144,6 +144,17 @@ function Show-OfficeRunningWarning {
     Write-Host "  EMPFEHLUNG: Office jetzt schliessen und das Skript neu starten." -ForegroundColor Yellow
     Write-Host ("=" * 66) -ForegroundColor Yellow
     Write-Host ""
+    # Ohne echte Konsole NICHT fragen. Read-Host blockiert dort unbegrenzt
+    # (Aufgabenplanung mit angehaengter Konsole) oder liefert sofort leer -
+    # beides taugt nicht als Freigabe. Massgeblich ist die tatsaechliche
+    # Eingabefaehigkeit, nicht der Hostname (ps2exe meldet 'PSRunspace-Host').
+    $kannFragen = $false
+    try { $kannFragen = -not [Console]::IsInputRedirected } catch { $kannFragen = $false }
+    if (-not $kannFragen) {
+        Write-Warning "Keine interaktive Konsole - Abbruch zum Schutz laufender Office-Sitzungen. Fuer den unbeaufsichtigten Betrieb -NoInteractive bzw. -Automated verwenden."
+        return $false
+    }
+
     $answer = Read-Host "Trotzdem fortfahren? [j/N]"
     if ($answer -notmatch '^[JjYy]') {
         Write-Host "Abgebrochen. Bitte Office schliessen und neu starten." -ForegroundColor Cyan
@@ -1650,6 +1661,10 @@ foreach ($type in $fileTypes) {
                     $backupPath     = Get-UniqueBackupPath $filePath
                     $backupPathLong = Add-LongPathPrefix $backupPath
                     $networkTargetLong = Add-LongPathPrefix $networkTarget
+                    # Muss vor dem try stehen: der Fehlerzweig raeumt darueber
+                    # eine liegengebliebene Zwischenkopie ab, und ein Wert aus
+                    # dem vorigen Schleifendurchlauf duerfte dort nicht stehen.
+                    $stagingPathLong = $null
 
                     Start-Sleep -Milliseconds 200
 
@@ -1666,9 +1681,59 @@ foreach ($type in $fileTypes) {
                         } -MaxAttempts 4 -DelayMs 500
 
                         try {
+                            # Zwischen Get-UniqueTargetPath (oben) und diesem
+                            # Schreibvorgang liegt die komplette
+                            # COM-Konvertierung, das Wartefenster und das
+                            # Umbenennen des Originals - in dieser Zeit kann
+                            # ein anderer Lauf oder Anwender genau diesen
+                            # Zielnamen belegt haben. Ein Copy mit
+                            # overwrite=$true hat die fremde Datei dann
+                            # ersatzlos ueberschrieben (nachgestellt:
+                            # Fremdinhalt weg).
+                            #
+                            # Deshalb zweistufig: erst unter einem eigenen,
+                            # garantiert freien Namen im Zielverzeichnis
+                            # ablegen (dort darf overwrite stehen - die Datei
+                            # gehoert uns, und die Wiederholung braucht es
+                            # nach einem Teilabbruch), dann per File.Move an
+                            # den endgueltigen Platz. Move legt NICHT ueber
+                            # eine bestehende Datei, sondern wirft
+                            # ERROR_ALREADY_EXISTS (0x800700B7, gemessen) -
+                            # das ist die unteilbare Pruefung, die dem
+                            # getrennten Exists() fehlt.
+                            $stagingPath     = $networkTargetBase + ".tmp_" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
+                            $stagingPathLong = Add-LongPathPrefix $stagingPath
+
                             Invoke-WithRetry -Action {
-                                [System.IO.File]::Copy($localTarget, $networkTargetLong, $true)
+                                [System.IO.File]::Copy($localTarget, $stagingPathLong, $true)
                             } -MaxAttempts 4 -DelayMs 500
+
+                            # Platz belegen. Bei Kollision einen neuen Namen
+                            # ziehen statt zu ueberschreiben. Begrenzt, damit
+                            # ein dauerhaft blockiertes Ziel nicht endlos
+                            # dreht; der Fehler faellt dann in den
+                            # Wiederherstellungszweig unten.
+                            $claimed = $false
+                            for ($claimTry = 0; $claimTry -lt 20 -and -not $claimed; $claimTry++) {
+                                try {
+                                    [System.IO.File]::Move($stagingPathLong, $networkTargetLong)
+                                    $claimed = $true
+                                } catch [System.IO.IOException] {
+                                    if (-not ([System.IO.File]::Exists($networkTargetLong) -or
+                                              [System.IO.Directory]::Exists($networkTargetLong))) {
+                                        throw   # andere Ursache (Sperre, Netz) - nicht als Kollision behandeln
+                                    }
+                                    $networkTarget     = Get-UniqueTargetPath $networkTargetBase
+                                    $networkTargetLong = Add-LongPathPrefix $networkTarget
+                                    $wasRenamed        = ($networkTarget -ne $networkTargetBase)
+                                    Write-Log ("Zielname war beim Schreiben belegt, weiche aus auf: " +
+                                               (Split-Path $networkTarget -Leaf)) -Level "WARN"
+                                }
+                            }
+                            if (-not $claimed) {
+                                try { [System.IO.File]::Delete($stagingPathLong) } catch {}
+                                throw "Zielname konnte nicht belegt werden: $networkTarget"
+                            }
 
                             if ($null -ne $origTimestamp) {
                                 try { [System.IO.File]::SetLastWriteTime($networkTargetLong, $origTimestamp) } catch {}
@@ -1694,6 +1759,17 @@ foreach ($type in $fileTypes) {
                         } catch {
                             Write-Log "Rueckkopie fehlgeschlagen fuer $fileName - stelle Original wieder her: $($_.Exception.Message)" -Level "ERROR"
                             $stats.Errors++
+                            # Zwischenkopie abraeumen, sonst bleibt eine
+                            # '<name>.docx.tmp_<8 Hex>' im Zielverzeichnis liegen.
+                            if ($null -ne $stagingPathLong) {
+                                try {
+                                    if ([System.IO.File]::Exists($stagingPathLong)) {
+                                        [System.IO.File]::Delete($stagingPathLong)
+                                    }
+                                } catch {
+                                    Write-Log "Zwischenkopie nicht loeschbar: $stagingPathLong" -Level "WARN"
+                                }
+                            }
                             try {
                                 [System.IO.File]::Move($backupPathLong, $filePathLong)
                             } catch {

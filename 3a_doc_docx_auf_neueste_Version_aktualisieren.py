@@ -1367,6 +1367,15 @@ def _word_call_with_watchdog(call_label: str, timeout: float, word_pid,
                              call_fn, restore_fn=None):
     done_event   = threading.Event()
     timeout_flag = [False]
+    # Schloss + Fertig-Kennzeichen gegen ein schmales, aber echtes Zeitfenster:
+    # 'return call_fn()' berechnet den Rueckgabewert, und ERST DANACH laeuft
+    # das finally mit done_event.set(). Laeuft der Timeout genau dazwischen ab,
+    # toetet der Waechter Word, obwohl der Aufruf bereits gelungen ist - der
+    # Aufrufer bekommt sein Ergebnis, die naechste COM-Operation scheitert dann
+    # aber an der toten Instanz. Mit Schloss prueft der Waechter unteilbar, ob
+    # der Aufruf schon durch ist. safe_excel_open in 3b macht es bereits so.
+    state_lock   = threading.Lock()
+    completed    = [False]
 
     # Erstellungszeit SYNCHRON im Main-Thread erfassen, BEVOR der Watchdog-
     # Thread startet. Wuerde sie erst im Thread gelesen, koennte Word in den
@@ -1383,7 +1392,10 @@ def _word_call_with_watchdog(call_label: str, timeout: float, word_pid,
 
     def watchdog():
         if not done_event.wait(timeout):
-            timeout_flag[0] = True
+            with state_lock:
+                if completed[0]:
+                    return          # Aufruf war bereits fertig
+                timeout_flag[0] = True
             if word_pid:
                 try:
                     proc = psutil.Process(word_pid)
@@ -1409,7 +1421,15 @@ def _word_call_with_watchdog(call_label: str, timeout: float, word_pid,
     wd_thread.start()
 
     try:
-        return call_fn()
+        _ergebnis = call_fn()
+        with state_lock:
+            if timeout_flag[0]:
+                # Der Waechter hat bereits zugeschlagen: die Instanz ist
+                # tot, das Ergebnis damit unbrauchbar. Als Timeout melden,
+                # statt dem Aufrufer einen Erfolg vorzuspiegeln.
+                raise TimeoutError(f"Word Timeout bei {call_label}")
+            completed[0] = True
+        return _ergebnis
     except Exception as e:
         done_event.set()
         if timeout_flag[0]:

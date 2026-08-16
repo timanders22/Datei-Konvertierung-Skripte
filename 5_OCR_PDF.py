@@ -4713,6 +4713,11 @@ def process_directory(
                                 except BrokenProcessPool as e:
                                     log_error("process_directory",
                                               f"BrokenProcessPool: {fp}: {_fmt_exc(e)}", exc_info=True)
+                                    # Ueberlebende Worker hart beenden - siehe
+                                    # Begruendung im Watch-Modus. Ohne das
+                                    # bleiben bei einem Teil-Crash Kindprozesse
+                                    # stehen, die das Arbeitsverzeichnis halten.
+                                    _terminate_pool_workers(executor)
 
                                     reporter_requeue: List[str] = []
                                     n_rep = requeue_counts.get(fp, 0)
@@ -5059,6 +5064,14 @@ def run_watch_mode(
                             "Thread-Pool hart terminiert und neu gestartet"
                         )
                     except BrokenProcessPool as e:
+                        # Ueberlebende Worker hart beenden, BEVOR der Pool
+                        # verworfen wird. shutdown(wait=False) allein laesst
+                        # bei einem Teil-Crash die noch laufenden Kindprozesse
+                        # stehen - sie halten dann das alte Arbeitsverzeichnis
+                        # samt unkomprimierter Seitenbilder offen, und
+                        # _purge_orphan_temp_files darunter kann es nicht
+                        # raeumen. Der Timeout-Zweig macht es bereits so.
+                        _terminate_pool_workers(executor)
                         executor.shutdown(wait=False)
                         executor = ProcessPoolExecutor(**pool_kwargs_single)
                         if thread_temp_dir != temp_dir:

@@ -1685,7 +1685,23 @@ try {
         elseif ($Config.ExcelExtensions -contains $extLower) { $targetApp = "excel"; $targetPid = $excelPid; $targetStart = $excelStart }
         elseif ($Config.PptExtensions   -contains $extLower) { $targetApp = "ppt";   $targetPid = $pptPid;   $targetStart = $pptStart }
 
-        if (-not $targetApp) { continue }
+        # Heute unerreichbar: die Suche filtert gegen genau die Vereinigung
+        # der drei Endungslisten (Zeile 141), $targetApp ist also immer
+        # gesetzt. Der Zweig blieb aber ein stiller Verlust - die Datei zaehlte
+        # in "N Office-Dateien gefunden" mit, tauchte danach in keiner Zeile
+        # des Berichts auf. Wer eine Endung nur der Suchmenge hinzufuegt (oder
+        # eine aus einer App-Liste entfernt), bekaeme einen Bericht, der
+        # Vollstaendigkeit behauptet, ohne sie zu haben. Deshalb melden statt
+        # ueberspringen.
+        if (-not $targetApp) {
+            $meta = Get-FileMetadata -Path $filePath
+            $results.Add((New-ErrorRecord -Ordner $dirName -DateiPfad $comPath `
+                -Kategorie "Nicht geprüft" `
+                -Details "Endung '$extLower' ist keiner Office-Anwendung zugeordnet - Datei wurde nicht geprueft." `
+                -Dateityp $appType -SizeMB $meta.SizeMB -Modified $meta.Modified))
+            Write-Log -Message "Nicht geprüft: $fileName [Endung $extLower keiner App zugeordnet]" -Level WARN -Color Yellow
+            continue
+        }
 
         $preflight = Test-FileAccessible -Path $filePath
         if (-not $preflight.OK) {

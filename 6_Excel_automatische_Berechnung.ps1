@@ -57,11 +57,16 @@ function Confirm-Write {
         [string]$Action = 'Berechnungsmodus korrigieren'
     )
     if ($script:PreviewOnly) { return $false }
-    if ($null -eq $script:ScriptCmdlet) { return $true }
+    # Rueckfall ueber $WhatIfPreference statt hart $true: ist $PSCmdlet nicht
+    # verfuegbar (dot-sourced, ps2exe-Host) oder wirft ShouldProcess, wurde
+    # vorher trotz -WhatIf tatsaechlich geschrieben. $WhatIfPreference wird vom
+    # gemeinsamen Parameter im Skript-Scope gesetzt und ist in Funktionen
+    # sichtbar (gemessen).
+    if ($null -eq $script:ScriptCmdlet) { return (-not $WhatIfPreference) }
     try {
         return $script:ScriptCmdlet.ShouldProcess($Target, $Action)
     } catch {
-        return $true
+        return (-not $WhatIfPreference)
     }
 }
 
@@ -90,7 +95,9 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 # Vorschau-Modus: entweder per -ReadOnlyMode/-WhatIf oder interaktiv.
 # Wird weiter unten endgueltig gesetzt.
 $script:PreviewOnly = $ReadOnlyMode.IsPresent
-$ReadOnly           = $script:PreviewOnly
+# Nur fuer die Anzeige (Kopfzeile, Abschlussbericht). Der Schreibschutz selbst
+# haengt an Confirm-Write, nicht an dieser Variablen.
+$ReadOnly           = $script:PreviewOnly -or $WhatIfPreference
 
 
 # ==================================================================
@@ -448,7 +455,7 @@ if (-not $script:PreviewOnly -and -not $NoInteractive -and
         $script:PreviewOnly = $true
     }
 }
-$ReadOnly = $script:PreviewOnly
+$ReadOnly = $script:PreviewOnly -or $WhatIfPreference
 
 if (-not (Test-Path -LiteralPath $rootPath)) {
     Write-Host ""
@@ -507,8 +514,12 @@ Get-ChildItem -LiteralPath $docsFolder -Directory -Filter "6_Excel_automatische_
         }
     }
 
-if (-not (Test-Path -LiteralPath $tempFolder)) {
-    New-Item -Path $tempFolder -ItemType Directory -Force | Out-Null
+# Provider-frei: New-Item gehorcht -WhatIf und legte den Ordner dann NICHT an.
+# Die Arbeitskopie in Schritt 2 lief danach bei JEDER Datei auf
+# DirectoryNotFoundException - der Probelauf meldete lauter Fehler statt
+# Befunde. Der Tempordner ist Infrastruktur und muss auch im Probelauf stehen.
+if (-not [System.IO.Directory]::Exists($tempFolder)) {
+    [void][System.IO.Directory]::CreateDirectory($tempFolder)
 }
 
 # --- LOG-DATEI (CSV, UTF-8 ohne BOM) ---
@@ -526,7 +537,9 @@ foreach ($cand in @($scriptDir,
     if ([string]::IsNullOrWhiteSpace($cand)) { continue }
     try {
         if (-not [System.IO.Directory]::Exists($cand)) {
-            New-Item -ItemType Directory -Path $cand -Force -ErrorAction Stop | Out-Null
+            # Ebenfalls provider-frei - sonst faellt das Log unter -WhatIf
+            # stillschweigend auf den naechsten Kandidaten zurueck.
+            [void][System.IO.Directory]::CreateDirectory($cand)
         }
         $try = Join-Path $cand $logName
         [System.IO.File]::WriteAllText(
@@ -1063,7 +1076,9 @@ foreach ($file in $files) {
 
 # --- TEMP-ORDNER AUFRAEUMEN ---
 if ((Test-Path -LiteralPath $tempFolder) -and (@(Get-ChildItem -LiteralPath $tempFolder -Force).Count -eq 0)) {
-    Remove-Item -LiteralPath $tempFolder -Force -ErrorAction SilentlyContinue
+    # -WhatIf:$false, weil der Ordner oben bewusst auch im Probelauf angelegt
+    # wird - ohne das bliebe nach jedem -WhatIf-Lauf ein leerer Ordner liegen.
+    Remove-Item -LiteralPath $tempFolder -Force -ErrorAction SilentlyContinue -WhatIf:$false
 } elseif (Test-Path -LiteralPath $tempFolder) {
     Write-Host "[WARNUNG]   Temp-Ordner nicht leer, bitte manuell pruefen: $tempFolder" -ForegroundColor DarkYellow
     Write-Log -FileName "" -FilePath $tempFolder -Status "WARNUNG" -Details "Temp-Ordner nicht leer - manuelle Pruefung noetig"

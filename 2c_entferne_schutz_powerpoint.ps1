@@ -458,6 +458,17 @@ function Show-OfficeRunningWarning {
     Write-Host "  EMPFEHLUNG: Office jetzt schliessen und das Skript neu starten." -ForegroundColor Yellow
     Write-Host ("=" * 66) -ForegroundColor Yellow
     Write-Host ""
+    # Ohne echte Konsole NICHT fragen. Read-Host blockiert dort unbegrenzt
+    # (Aufgabenplanung mit angehaengter Konsole) oder liefert sofort leer -
+    # beides taugt nicht als Freigabe. Massgeblich ist die tatsaechliche
+    # Eingabefaehigkeit, nicht der Hostname (ps2exe meldet 'PSRunspace-Host').
+    $kannFragen = $false
+    try { $kannFragen = -not [Console]::IsInputRedirected } catch { $kannFragen = $false }
+    if (-not $kannFragen) {
+        Write-Warning "Keine interaktive Konsole - Abbruch zum Schutz laufender Office-Sitzungen. Fuer den unbeaufsichtigten Betrieb -NoInteractive bzw. -Automated verwenden."
+        return $false
+    }
+
     $answer = Read-Host "Trotzdem fortfahren? [j/N]"
     if ($answer -notmatch '^[JjYy]') {
         Write-Host "Abgebrochen. Bitte Office schliessen und neu starten." -ForegroundColor Cyan
@@ -835,7 +846,11 @@ function Get-FileSecuritySnapshot {
                 [System.Security.AccessControl.AccessControlSections]::Group)
         }
     } catch {
-        Write-DetailedLog "Sicherheitsinfo nicht lesbar ($Path): $_" "DEBUG"
+        # Bewusst WARN statt DEBUG: Schlaegt das Lesen fehl, werden Rechte und
+        # Eigentuemer der Datei nach der Ersetzung NICHT wiederhergestellt.
+        # Als DEBUG-Zeile ging dieser Rechteverlust im Detail-Log unter.
+        # Gleichlautend in 2a, 2b und 2c.
+        Write-Log "Sicherheitsinfo nicht lesbar - Rechte gehen bei der Ersetzung verloren ($Path): $_" "WARN"
         return $null
     }
 }
@@ -1564,7 +1579,7 @@ if (-not $NoInteractive.IsPresent) {
     Write-Host "╚════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 
     # Vor dem ersten COM-Zugriff auf laufende Office-Sitzungen hinweisen.
-    if (-not (Show-OfficeRunningWarning)) { exit 0 }
+    if (-not (Show-OfficeRunningWarning -Silent:$NoInteractive)) { exit 0 }
     Write-Host ""
     Write-Host "HINWEIS: Das Skript verwendet den Ordner 'Dokumente' als temporären" -ForegroundColor DarkYellow
     Write-Host "Arbeitsordner für die COM-Verarbeitung (PowerPoint öffnet Dateien daraus)." -ForegroundColor DarkYellow

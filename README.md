@@ -43,6 +43,7 @@ empfohlene Reihenfolge, keine Zwangsfolge — jedes Skript läuft für sich.
 |---|---|
 | `_gemeinsam.py`, `_gemeinsam.psm1` | Grundfunktionen, die vorher in jedem Skript einzeln standen: Konsolen-Encoding, Einzelinstanz-Sperre, Langpfade, Zeitstempel, Office-Sitzungswarnung, CSV-Maskierung. Die Skripte binden sie **mit Rückfall** ein — fehlt die Datei, arbeiten sie mit ihrer eingebauten Kopie weiter, und die ps2exe-Übersetzung funktioniert unverändert. |
 | `pfade.json` | Verzeichnis-Presets und Bezugsquellen an einer Stelle statt in acht Skripten. Fehlt sie, gelten die eingebauten Vorgaben. |
+| `pdf_bildcheck.py` | Zeigt, mit welcher effektiven Auflösung und in welchem Farbraum die Bilder in einer PDF liegen — für den Vorher/Nachher-Vergleich um Schritt 5 herum: „Wurde mein Foto heruntergerechnet?" Braucht `pymupdf`. |
 | `pruefe_syntax.ps1` | Parser-Lauf über alle `.ps1`. |
 | `pruefe_alles.ps1` | Sammelprüfung über beide Sprachen: Syntax, `py_compile`, optional PSScriptAnalyzer und ruff — plus Musterprüfungen auf die Fallen, die in dieser Sammlung schon einmal aufgetreten sind. **Vor jedem Einsatz laufen lassen.** |
 | `migration.jsonl` | Gemeinsames Laufprotokoll über alle Schritte, eine Zeile je Datei und Aktion. Ergänzt die skripteigenen Protokolle, ersetzt sie nicht. |

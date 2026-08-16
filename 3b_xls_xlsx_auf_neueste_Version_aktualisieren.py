@@ -1601,6 +1601,16 @@ def _excel_call_with_watchdog(call_label: str, timeout: float, excel_pid,
     """
     done_event   = threading.Event()
     timeout_flag = [False]
+    # Schloss + Fertig-Kennzeichen gegen ein schmales, aber echtes
+    # Zeitfenster: der Rueckgabewert von call_fn() steht fest, BEVOR das
+    # finally done_event setzt. Laeuft der Timeout genau dazwischen ab,
+    # toetet der Waechter Excel, obwohl der Aufruf gelungen ist - der
+    # Aufrufer bekaeme ein Ergebnis und arbeitete danach mit einer toten
+    # COM-Instanz weiter. Schloss ALLEIN genuegt nicht (nachgemessen:
+    # 43 -> 30 von 300 Faellen); erst die unteilbare Pruefung auf dem
+    # Erfolgspfad unten macht Toeten und Erfolg eindeutig (0 von 300).
+    state_lock   = threading.Lock()
+    completed    = [False]
 
     # Erstellungszeit SYNCHRON im Main-Thread erfassen, BEVOR der Watchdog-
     # Thread startet - sonst koennte Windows die PID zwischenzeitlich an
@@ -1615,7 +1625,10 @@ def _excel_call_with_watchdog(call_label: str, timeout: float, excel_pid,
 
     def watchdog():
         if not done_event.wait(timeout):
-            timeout_flag[0] = True
+            with state_lock:
+                if completed[0]:
+                    return          # Aufruf war bereits fertig
+                timeout_flag[0] = True
             if excel_pid:
                 try:
                     proc = psutil.Process(excel_pid)
@@ -1641,7 +1654,15 @@ def _excel_call_with_watchdog(call_label: str, timeout: float, excel_pid,
     wd_thread.start()
 
     try:
-        return call_fn()
+        _ergebnis = call_fn()
+        with state_lock:
+            if timeout_flag[0]:
+                # Der Waechter hat bereits zugeschlagen: die Instanz ist
+                # tot, das Ergebnis damit unbrauchbar. Als Timeout melden,
+                # statt dem Aufrufer einen Erfolg vorzuspiegeln.
+                raise TimeoutError(f"Excel Timeout bei {call_label}")
+            completed[0] = True
+        return _ergebnis
     except Exception as e:
         done_event.set()
         if timeout_flag[0]:

@@ -918,6 +918,16 @@ def _ppt_call_with_watchdog(call_label: str, timeout: float, ppt_pid,
                              call_fn, restore_fn=None):
     done_event   = threading.Event()
     timeout_flag = [False]
+    # Schloss + Fertig-Kennzeichen gegen ein schmales, aber echtes
+    # Zeitfenster: der Rueckgabewert von call_fn() steht fest, BEVOR das
+    # finally done_event setzt. Laeuft der Timeout genau dazwischen ab,
+    # toetet der Waechter PowerPoint, obwohl der Aufruf gelungen ist - der
+    # Aufrufer bekaeme ein Ergebnis und arbeitete danach mit einer toten
+    # COM-Instanz weiter. Schloss ALLEIN genuegt nicht (nachgemessen:
+    # 43 -> 30 von 300 Faellen); erst die unteilbare Pruefung auf dem
+    # Erfolgspfad unten macht Toeten und Erfolg eindeutig (0 von 300).
+    state_lock   = threading.Lock()
+    completed    = [False]
 
     # Erstellungszeit SYNCHRON im Main-Thread erfassen, BEVOR der Watchdog-
     # Thread startet. Wuerde sie erst im Thread gelesen, koennte die Skript-
@@ -934,7 +944,10 @@ def _ppt_call_with_watchdog(call_label: str, timeout: float, ppt_pid,
 
     def _watchdog():
         if not done_event.wait(timeout):
-            timeout_flag[0] = True
+            with state_lock:
+                if completed[0]:
+                    return          # Aufruf war bereits fertig
+                timeout_flag[0] = True
             if ppt_pid:
                 try:
                     proc = psutil.Process(ppt_pid)
@@ -957,7 +970,15 @@ def _ppt_call_with_watchdog(call_label: str, timeout: float, ppt_pid,
     wd_thread.start()
 
     try:
-        return call_fn()
+        _ergebnis = call_fn()
+        with state_lock:
+            if timeout_flag[0]:
+                # Der Waechter hat bereits zugeschlagen: die Instanz ist
+                # tot, das Ergebnis damit unbrauchbar. Als Timeout melden,
+                # statt dem Aufrufer einen Erfolg vorzuspiegeln.
+                raise TimeoutError(f"PowerPoint Timeout bei {call_label}")
+            completed[0] = True
+        return _ergebnis
     except Exception as e:
         done_event.set()
         if timeout_flag[0]:
@@ -1089,14 +1110,29 @@ def _verify_trust_center_for_temp(ppt_app, ppt_pid: Optional[int],
     return True, ""
 
 
-# Wird auf False gesetzt, sobald RecentFiles erstmals nicht erreichbar war
-_MRU_AVAILABLE = True
+# Sorgt dafuer, dass der folgende Hinweis nur EINMAL pro Lauf im Protokoll
+# steht - er wiederholt sich sonst bei jeder verarbeiteten Datei.
+#
+# Der frueher hier stehende Name `_MRU_AVAILABLE` samt Kommentar "wird auf
+# False gesetzt, sobald RecentFiles erstmals nicht erreichbar war" las sich wie
+# das Ergebnis einer Faehigkeitspruefung. Eine solche Pruefung gab es nie: die
+# Funktion hat noch nie etwas an ppt_app oder paths angefasst, sondern schaltet
+# beim ersten Aufruf bedingungslos um. Der Name sagt jetzt, was die Variable
+# wirklich bedeutet.
+#
+# Die Aussage im Hinweis selbst wurde nachgemessen (PowerPoint 16.0, COM):
+# Application.RecentFiles gibt es dort tatsaechlich nicht - der Zugriff
+# scheitert mit DISP_E_UNKNOWNNAME (0x80020006). Word und Excel kennen die
+# Eigenschaft, PowerPoint nicht. Es gibt hier also nichts zu bereinigen.
+_MRU_HINWEIS_GEZEIGT = False
 
 
 def _remove_from_mru(ppt_app, *paths) -> None:
-    global _MRU_AVAILABLE
-    if _MRU_AVAILABLE:
-        _MRU_AVAILABLE = False
+    # ppt_app und paths bleiben bewusst ungenutzt: die Signatur haelt die
+    # Aufrufstellen zu den Schwesterskripten (3a/Word) deckungsgleich.
+    global _MRU_HINWEIS_GEZEIGT
+    if not _MRU_HINWEIS_GEZEIGT:
+        _MRU_HINWEIS_GEZEIGT = True
         detail_logger.debug(
             "MRU-Bereinigung übersprungen: PowerPoint exponiert kein "
             "Application.RecentFiles über COM (Microsoft-Limitierung). "
@@ -2360,9 +2396,19 @@ def convert_ppt_file(
             try:
                 pres_holder = [None]
                 def _do_open():
+                    # Im Probelauf ZWINGEND schreibgeschuetzt oeffnen.
+                    # Nachgemessen an einer .ppt: PowerPoint schreibt eine
+                    # schreibend geoeffnete Datei im Altformat schon beim
+                    # Oeffnen neu auf die Platte - 258560 -> 260608 Bytes,
+                    # bei jedem Lauf ein anderer Hash. Weder ein blosses
+                    # Close() noch Saved=True verhindern das (beides
+                    # gemessen); nur ReadOnly=True tut es. Der Zeitstempel
+                    # wird spaeter wiederhergestellt, die Aenderung war
+                    # deshalb unsichtbar - der Probelauf hat seine Zusage
+                    # "es wurde NICHTS geaendert" gebrochen.
                     pres_holder[0] = ppt_app.Presentations.Open(
                         com_path,
-                        ReadOnly   = COM_FALSE,
+                        ReadOnly   = COM_TRUE if dry_run else COM_FALSE,
                         Untitled   = COM_FALSE,
                         WithWindow = COM_FALSE,
                     )
@@ -2444,7 +2490,13 @@ def convert_ppt_file(
         except Exception as _e:
             detail_logger.debug(f"convert_ppt_file: Exception verworfen: {_e!r}")
 
-        protection_removed = remove_protection(pres, original_path)
+        # Im Probelauf entfaellt das Aufheben des Schutzes: die Praesentation
+        # ist dort schreibgeschuetzt geoeffnet (siehe _do_open), und gespeichert
+        # wird ohnehin nicht. Das Ergebnis des Probelaufs haengt nicht daran -
+        # er meldet fuer jede geoeffnete Datei WOULD_UPDATE.
+        protection_removed = False
+        if not dry_run:
+            protection_removed = remove_protection(pres, original_path)
 
         reason = get_conversion_info(original_path, pres_format)
         pbar.write(f"  → {reason}")
@@ -2469,11 +2521,14 @@ def convert_ppt_file(
 
         # --- DRY-RUN: hier ist Schluss ---------------------------------
         # Ab hier wuerde gespeichert, verschoben und ggf. das Original
-        # geloescht. Im Probelauf wird die Praesentation nur geschlossen -
-        # Aenderungen aus remove_protection() bestehen nur im Arbeits-
-        # speicher und gehen dabei verloren. Anders als Word/Excel kennt
-        # PowerPoint keinen Kompatibilitaetsmodus: jede geoeffnete Datei
-        # wuerde neu serialisiert, daher gibt es hier kein ALREADY_CURRENT.
+        # geloescht. Anders als Word/Excel kennt PowerPoint keinen
+        # Kompatibilitaetsmodus: jede geoeffnete Datei wuerde neu
+        # serialisiert, daher gibt es hier kein ALREADY_CURRENT.
+        #
+        # Die Datei ist im Probelauf schreibgeschuetzt geoeffnet (siehe
+        # _do_open) - erst das macht die Zusage "es wurde NICHTS geaendert"
+        # wahr. Frueher stand hier die Annahme, ein blosses Close() verwerfe
+        # alles, weil die Aenderungen "nur im Arbeitsspeicher" bestuenden.
         if dry_run:
             pbar.write(f"  🔎 [PROBELAUF] Würde neu serialisiert → {new_ext}")
             detail_logger.info(

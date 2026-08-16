@@ -645,8 +645,15 @@ def walk_and_clean_junk(
     stats: "CleanupStats",
     dry_run: bool = False,
     done_dirs: Optional[Set[str]] = None,
-) -> Generator[Tuple[str, str], None, None]:
-    """Liefert (Verzeichnis, Dateipfad).
+) -> Generator[Tuple[str, int, Optional[str]], None, None]:
+    """Liefert (Verzeichnis, Dateizahl, Dateipfad).
+
+    Zwei Sorten von Eintraegen:
+      (verzeichnis, anzahl, None)      - Ankuendigung eines Verzeichnisses
+      (verzeichnis, 0, dateipfad)      - eine zu pruefende Datei
+
+    Die Ankuendigung kommt zuerst und meldet die VOLLE Dateizahl vorab an,
+    damit der Zaehler nicht zwischen zwei Einreihungen auf 0 faellt.
 
     Das Verzeichnis wird mitgegeben, damit der Aufrufer den Fortschritt
     auf VERZEICHNISEBENE vermerken kann. Ein Vermerk je Datei waere hier

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Gemeinsame Grundfunktionen der Migrations-Skripte (PowerShell-Teil).
 
@@ -186,6 +186,17 @@ function Show-OfficeRunningWarning {
     Write-Host "  EMPFEHLUNG: $AnwendungsName jetzt schliessen und neu starten." -ForegroundColor Yellow
     Write-Host ("=" * 66) -ForegroundColor Yellow
     Write-Host ""
+    # Ohne echte Konsole NICHT fragen. Read-Host blockiert dort unbegrenzt
+    # (Aufgabenplanung mit angehaengter Konsole) oder liefert sofort leer -
+    # beides ist als Freigabe ungeeignet. Massgeblich ist die tatsaechliche
+    # Eingabefaehigkeit, nicht der Hostname (ps2exe meldet 'PSRunspace-Host').
+    $kannFragen = $false
+    try { $kannFragen = -not [Console]::IsInputRedirected } catch { $kannFragen = $false }
+    if (-not $kannFragen) {
+        Write-Warning "Keine interaktive Konsole - Lauf wird zum Schutz laufender Sitzungen abgebrochen. Fuer den unbeaufsichtigten Betrieb -Silent bzw. -NoInteractive verwenden."
+        return $false
+    }
+
     $antwort = Read-Host "Trotzdem fortfahren? [j/N]"
     if ($antwort -notmatch '^[JjYy]') {
         Write-Host "Abgebrochen." -ForegroundColor Cyan
