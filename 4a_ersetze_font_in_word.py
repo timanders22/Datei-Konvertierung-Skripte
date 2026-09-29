@@ -85,6 +85,7 @@
 # ==================================================================
 
 import os
+import re
 import sys
 import csv
 import argparse
@@ -164,24 +165,36 @@ MSO_AUTOMATION_SECURITY_FORCE_DISABLE = 3
 FILE_READ_ATTRIBUTES  = 0x0080
 FILE_WRITE_ATTRIBUTES = 0x0100
 
+# WdRemoveDocInfoType - Nummern und Namen aus der Typbibliothek
+# MSWORD.OLB (Office 2024) ausgelesen (pythoncom.LoadTypeLib, ohne Word).
+# Die frueheren Beschriftungen waren ab Typ 4 verschoben (4 hiess
+# "Dokumenteigenschaften", 8 "Kopf-/Fußzeilen-Metadaten", 10 "XML-Teile",
+# 18 "Veröffentlichungsinfos", 19 "Persönliche Informationen" ...). Dadurch
+# liefen 18 (@-Erwähnungen) und 19 (Dokumentaufgaben) als "sichere" Typen
+# mit - obwohl beide Kommentarinhalte veraendern und die Kommentar-
+# entfernung abgelehnt sein konnte.
 METADATA_TYPES = {
-    1:  "Kommentare (Inhalte)",
-    2:  "Überarbeitungen",
-    3:  "Versionen",
-    4:  "Dokumenteigenschaften (Autor, Titel …)",
-    5:  "E-Mail-Kopfzeilen",
-    6:  "Routing-Informationen",
-    7:  "Prüfaufgaben",
-    8:  "Kopf-/Fußzeilen-Metadaten",
-    9:  "Dokumentvorlage",
-    10: "XML-Teile",
-    14: "Dokumentserver-Eigenschaften",
-    15: "Dokumentverwaltungsrichtlinie",
-    16: "Inhaltstyp",
-    18: "Veröffentlichungsinfos",
-    19: "Persönliche Informationen",
-    20: "Benutzerdefinierte Eigenschaften",
+    1:  "Kommentare (Inhalte)",                          # wdRDIComments
+    2:  "Überarbeitungen",                               # wdRDIRevisions
+    3:  "Versionen",                                     # wdRDIVersions
+    4:  "Persönliche Informationen (Autorennamen …)",     # wdRDIRemovePersonalInformation
+    5:  "E-Mail-Kopfzeilen",                             # wdRDIEmailHeader
+    6:  "Routing-Informationen",                         # wdRDIRoutingSlip
+    7:  "Zur Überprüfung senden",                        # wdRDISendForReview
+    8:  "Dokumenteigenschaften (Autor, Titel …)",        # wdRDIDocumentProperties
+    9:  "Dokumentvorlage",                               # wdRDITemplate
+    10: "Dokumentarbeitsbereich",                        # wdRDIDocumentWorkspace
+    14: "Dokumentserver-Eigenschaften",                  # wdRDIDocumentServerProperties
+    15: "Dokumentverwaltungsrichtlinie",                 # wdRDIDocumentManagementPolicy
+    16: "Inhaltstyp",                                    # wdRDIContentType
+    18: "@-Erwähnungen (in Kommentaren)",                # wdRDIAtMentions
+    19: "Dokumentaufgaben (in Kommentaren)",             # wdRDIDocumentTasks
+    20: "Dokumentintelligenz",                           # wdRDIDocumentIntelligence
 }
+
+# Typen, die Kommentarinhalte veraendern: nur zusammen mit der
+# ausdruecklichen Zustimmung zur Kommentarentfernung (Typ 1).
+METADATA_TYPES_KOMMENTARE = (1, 18, 19)
 
 DOWNLOADS_GUID = "{374DE290-123F-4565-9164-39C4925E467B}"
 
@@ -657,6 +670,66 @@ def warn_running_word(auto_mode: bool = False) -> None:
         sys.exit(0)
 
 
+def _alle_word_pids() -> set:
+    """PIDs aller WINWORD.EXE-Prozesse (jeder Benutzer) - Momentaufnahme."""
+    found = set()
+    try:
+        for p in psutil.process_iter(["pid", "name"]):
+            try:
+                if (p.info["name"] or "").upper() == "WINWORD.EXE":
+                    found.add(p.info["pid"])
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    except Exception as _e:
+        detail_logger.debug(f"_alle_word_pids: Exception verworfen: {_e!r}")
+    return found
+
+
+def _ermittle_word_pid(word, pids_vorher: set) -> Optional[int]:
+    """PID der gerade per DispatchEx gestarteten Word-Instanz.
+
+    Frueher: win32process.GetWindowThreadProcessId(word.Hwnd). Word.
+    Application HAT KEINE Hwnd-Eigenschaft - nachgeprueft in MSWORD.OLB
+    (pythoncom.LoadTypeLib, Office 2024): _Application kennt 212 Mitglieder,
+    darunter kein Hwnd; nur Window.Hwnd existiert. Der Aufruf warf also
+    immer AttributeError: im Smoke-Test blieb word_pid None und der
+    Watchdog konnte einen Haenger nie beenden.
+
+    Jetzt: 1. Momentaufnahme vor/nach DispatchEx (wie im Hauptlauf) -
+    genau EINE neue WINWORD-PID. 2. Rueckfall bei mehrdeutiger Aufnahme:
+    Documents.Add + ActiveWindow.Hwnd (Window.Hwnd laut Typbibliothek
+    vorhanden; das Laufzeitverhalten einer unsichtbaren Instanz ist hier
+    ohne Office ungemessen), nur gueltig, wenn die PID NEU ist.
+    Rueckgabe None = unbekannt - der Aufrufer muss dann sicher abbrechen."""
+    neu = _alle_word_pids() - set(pids_vorher)
+    if len(neu) == 1:
+        pid = next(iter(neu))
+        detail_logger.debug(f"Word-PID via psutil-Snapshot ermittelt: {pid}")
+        return pid
+    detail_logger.warning(
+        f"PID-Snapshot nicht eindeutig ({len(neu)} neue Prozesse) "
+        f"– versuche Fenster-Handle eines Hilfsdokuments")
+    doc = None
+    try:
+        doc = word.Documents.Add()
+        hwnd = doc.ActiveWindow.Hwnd
+        _, pid = win32process.GetWindowThreadProcessId(int(hwnd))
+        if (pid and pid not in pids_vorher
+                and psutil.Process(pid).name().upper() == "WINWORD.EXE"):
+            detail_logger.debug(f"Word-PID via Window.Hwnd ermittelt: {pid}")
+            return pid
+        detail_logger.warning(f"Window.Hwnd lieferte keine neue Word-PID ({pid})")
+    except Exception as e_hwnd:
+        detail_logger.warning(f"PID-Ermittlung via Window.Hwnd fehlgeschlagen: {e_hwnd}")
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=COM_FALSE)
+            except Exception as _e:
+                detail_logger.debug(f"_ermittle_word_pid: Exception verworfen: {_e!r}")
+    return None
+
+
 def _kill_specific_word() -> None:
     global word_pid_global, word_create_time_global
     if word_pid_global is None:
@@ -733,6 +806,49 @@ def _is_rpc_dead_error(exc: Exception) -> bool:
     if "0x800706ba" in msg or "0x80010108" in msg:
         return True
     return "rpc" in msg and ("nicht verfügbar" in msg or "unavailable" in msg)
+
+
+# Word-Laufzeitfehler 5408 ("Das Kennwort ist falsch. Word kann das
+# Dokument nicht oeffnen.") kommt per COM als DISP_E_EXCEPTION mit
+# excepinfo-scode 0x800A1520 (= 0x800A0000 + 5408).
+_WD_KENNWORT_SCODES = {-2146823904}
+
+
+def _ist_kennwortfehler(exc: Exception, pfade) -> bool:
+    """Passwortschutz erkennen - vorrangig am COM-Fehlercode.
+
+    Frueher nur per Stichwort im gesamten Fehlertext. Word nennt darin
+    aber den Pfad: "Kennwortliste.docx" oder ein Ordner "Geschützt" machten
+    JEDEN Fehler zum SKIPPED_PASSWORD - und der steht in RESUME_STATUSES,
+    die Datei wurde also dauerhaft uebersprungen. Jetzt: 1. excepinfo-scode;
+    2. Rueckfall auf Stichworte erst, nachdem alle Pfade, Dateinamen und
+    Ordnernamen der beteiligten Dateien aus dem Text entfernt sind."""
+    try:
+        if isinstance(exc, pywintypes.com_error):
+            excepinfo = exc.args[2] if len(exc.args) > 2 else None
+            if (excepinfo and len(excepinfo) > 5
+                    and excepinfo[5] in _WD_KENNWORT_SCODES):
+                return True
+    except Exception as _e:
+        detail_logger.debug(f"_ist_kennwortfehler: Exception verworfen: {_e!r}")
+    text = str(exc).lower()
+    teile = set()
+    for p in pfade:
+        if not p:
+            continue
+        sauber = _strip_long_path_prefix(str(p))
+        # str(com_error) ist die repr des Tupels - Rueckstriche doppelt.
+        teile.update({str(p), sauber, os.path.basename(sauber),
+                      sauber.replace("\\", "\\\\")})
+        teile.update(t for t in sauber.replace("/", "\\").split("\\") if len(t) >= 3)
+    # Laengste zuerst, damit ein Ordnername nicht einen Teil des vollen
+    # Pfads zerschneidet, bevor dieser als Ganzes entfernt ist.
+    for t in sorted(teile, key=len, reverse=True):
+        text = text.replace(t.lower(), " ")
+    return any(kw in text for kw in (
+        "password", "passwort", "kennwort",
+        "protected", "geschützt",
+    ))
 
 
 # ==================================================================
@@ -906,6 +1022,7 @@ def test_trust_center_smoke(timeout: float = 25.0) -> Tuple[bool, str, str]:
     pythoncom.CoInitialize()  # COM-Init fuer Main-Thread (sonst CO_E_NOTINITIALIZED bei DispatchEx)
     try:
         # Eigene kurzlebige Word-Instanz fuer den Test.
+        pids_vorher = _alle_word_pids()
         try:
             word = win32com.client.DispatchEx("Word.Application")
         except pythoncom.com_error as e:
@@ -918,16 +1035,21 @@ def test_trust_center_smoke(timeout: float = 25.0) -> Tuple[bool, str, str]:
         except Exception as e:
             return False, f"Word-Instanz konnte nicht gestartet werden: {e}", "wd"
 
-        # PID via Hwnd ermitteln (fuer Watchdog-Kill bei Timeout).
-        try:
-            _, word_pid = win32process.GetWindowThreadProcessId(word.Hwnd)
-        except Exception:
-            word_pid = None
+        # PID fuer den Watchdog-Kill bei Timeout. Frueher per word.Hwnd -
+        # das gibt es an Word.Application nicht (AttributeError, PID immer
+        # None, Watchdog wirkungslos). Siehe _ermittle_word_pid.
+        word_pid = _ermittle_word_pid(word, pids_vorher)
         if word_pid:
             try:
                 word_create_time = psutil.Process(word_pid).create_time()
             except Exception:
                 word_create_time = None
+        else:
+            # Ohne PID koennte der Watchdog einen Haenger beim Open nicht
+            # beenden - der Test haengt dann unbegrenzt. Deshalb das Open
+            # gar nicht erst versuchen, sondern als Fehlschlag melden.
+            return False, ("PID der Word-Instanz nicht ermittelbar - ohne sie "
+                           "kann der Watchdog einen Haenger nicht beenden"), "wd"
 
         # Word lautlos konfigurieren.
         try: word.Visible = False
@@ -1356,17 +1478,23 @@ def _replace_file_atomic(src: str, dst: str,
     .bak_-Reste (frueher _replace_file_with_backup) entfallen damit.
     """
     stage = dst + ".tmp_new"
-    _robust_copy(src, stage, op_name=f"{op_name}-Staging")
-    # Schreibschutz auf dem Ziel entfernen: os.replace scheitert auf
-    # NTFS an read-only-Zieldateien mit PermissionError.
     try:
-        if os.path.exists(dst):
-            dst_mode = os.stat(dst).st_mode
-            if not (dst_mode & stat.S_IWRITE):
-                os.chmod(dst, dst_mode | stat.S_IWRITE)
-    except Exception as _e:
-        detail_logger.debug(f"_replace_file_atomic: Exception verworfen: {_e!r}")
-    try:
+        # Die Staging-Kopie gehoert INS try: stand sie davor, blieb bei
+        # einem Abbruch mitten im Kopieren (Netzwerk-Drop, Strg+C) eine
+        # halbe '<name>.tmp_new' in der Ablage liegen - das Aufraeumen
+        # unten erfasste nur Fehler NACH der Kopie. Mit Attrappe
+        # nachgemessen (copy2 bricht nach der Haelfte ab): vorher blieb
+        # die halbe .tmp_new liegen, nachher nicht.
+        _robust_copy(src, stage, op_name=f"{op_name}-Staging")
+        # Schreibschutz auf dem Ziel entfernen: os.replace scheitert auf
+        # NTFS an read-only-Zieldateien mit PermissionError.
+        try:
+            if os.path.exists(dst):
+                dst_mode = os.stat(dst).st_mode
+                if not (dst_mode & stat.S_IWRITE):
+                    os.chmod(dst, dst_mode | stat.S_IWRITE)
+        except Exception as _e:
+            detail_logger.debug(f"_replace_file_atomic: Exception verworfen: {_e!r}")
         last_exc: Optional[Exception] = None
         for attempt, delay in enumerate([0.0, *AV_RETRY_DELAYS]):
             if delay > 0:
@@ -1799,15 +1927,17 @@ def ask_progress_mode() -> tuple:
 def ask_metadata_detail() -> list:
     print()
     print("  Folgende Metadaten-Kategorien werden entfernt:")
-    safe_types = [k for k in METADATA_TYPES if k not in (1, 2)]
+    safe_types = [k for k in METADATA_TYPES
+                  if k != 2 and k not in METADATA_TYPES_KOMMENTARE]
     for t in safe_types:
         print(f"    wdRDI {t:2d}: {METADATA_TYPES[t]}")
 
     selected = list(safe_types)
 
     print()
-    if ask_yes_no("  Außerdem: Kommentar-Inhalte (Typ 1) entfernen?"):
-        selected.append(1)
+    if ask_yes_no("  Außerdem: Kommentar-Inhalte (Typ 1, samt @-Erwähnungen 18 "
+                  "und Aufgaben 19) entfernen?"):
+        selected.extend(METADATA_TYPES_KOMMENTARE)
     if ask_yes_no("  Außerdem: Überarbeitungen/Tracked Changes (Typ 2) entfernen?"):
         selected.append(2)
 
@@ -2002,6 +2132,78 @@ def _process_revisions(doc, font_name: str) -> None:
 ERROR_SHARING_VIOLATION = 32
 
 
+def _besitzerdatei_kandidaten(path: str):
+    """Moegliche Namen der Word-Besitzerdatei '~$...' (siehe is_locked_by_other)."""
+    d = os.path.dirname(path)
+    b = os.path.basename(path)
+    if not d or not b:
+        return []
+    namen = {"~$" + b}
+    if len(b) > 1:
+        namen.add("~$" + b[1:])
+    if len(b) > 2:
+        namen.add("~$" + b[2:])
+    return [os.path.join(d, n) for n in namen]
+
+
+def _eigene_besitzerdatei_entfernen(path: str) -> None:
+    """Entfernt die Besitzerdatei, die eine vom Waechter beendete Word-Instanz
+    neben path hinterlassen hat. Am Anfang von replace_fonts_in_document_com
+    stellt is_locked_by_other sicher, dass es fuer diese Datei KEINE gab - eine
+    jetzt vorhandene stammt also von uns. Gemessen 29.09.2026: nach zwei
+    Stage-2-Timeouts lagen '~$sswort.docx' und '~$hreibschutz.docx' im
+    Bestand; jeder Folgelauf meldete die Dateien als "in Bearbeitung", und die
+    Reste waeren mit nach Google Drive gewandert. Eine von einer LEBENDEN
+    Word-Sitzung offengehaltene Besitzerdatei laesst sich nicht loeschen und
+    bleibt unangetastet."""
+    for owner in _besitzerdatei_kandidaten(path):
+        try:
+            lp = prepare_long_path(owner)
+            if os.path.exists(lp):
+                try:
+                    os.chmod(lp, stat.S_IWRITE)
+                except Exception as _e:
+                    detail_logger.debug(f"_eigene_besitzerdatei_entfernen: {_e!r}")
+                os.remove(lp)
+                detail_logger.warning(f"Verwaiste Besitzerdatei entfernt: {owner}")
+        except Exception as e:
+            detail_logger.warning(f"Besitzerdatei nicht entfernbar: {owner} – {e!r}")
+
+
+def _ooxml_kennwort_grund(path: str) -> str:
+    """'' wenn die OOXML-Datei ohne Kennwort zu oeffnen ist, sonst den Grund.
+
+    Hintergrund (gemessen 29.09.2026 mit Word 2024): Stage 2 oeffnet
+    schreibend. Bei einer verschluesselten .docx (Oeffnungskennwort) und bei
+    einer mit Schreibkennwort (w:writeProtection mit Kennwort-Hash) wartet
+    Word unsichtbar auf das Kennwort - jede solche Datei kostete den vollen
+    180-s-Waechter plus Word-Neustart und hinterliess eine Besitzerdatei. 2a
+    und 3a erkennen verschluesselte Dateien vorab; hier fehlte das.
+    - Verschluesselt: OOXML-Datei im CFB-Container statt ZIP.
+    - Schreibkennwort: <w:writeProtection> mit Hash-Attribut in
+      word/settings.xml (die reine Empfehlung "schreibgeschuetzt oeffnen"
+      ohne Kennwort bleibt erlaubt)."""
+    try:
+        lp = prepare_long_path(path)
+        with open(lp, "rb") as f:
+            kopf = f.read(8)
+        if kopf.startswith(b"\xD0\xCF\x11\xE0"):
+            return "verschluesselt"
+        if not kopf.startswith(b"PK"):
+            return ""
+        with zipfile.ZipFile(lp) as z:
+            try:
+                settings = z.read("word/settings.xml").decode("utf-8", errors="ignore")
+            except KeyError:
+                return ""
+        m = re.search(r"<w:writeProtection\b[^>]*>", settings)
+        if m and re.search(r"w:(hashValue|hash|cryptProviderType|salt)=", m.group(0)):
+            return "schreibkennwort"
+    except Exception as _e:
+        detail_logger.debug(f"_ooxml_kennwort_grund: {_e!r}")
+    return ""
+
+
 def is_locked_by_other(path: str) -> bool:
     try:
         d = os.path.dirname(path)
@@ -2123,6 +2325,20 @@ def replace_fonts_in_document_com(
         detail_logger.info(f"Übersprungen (OLE-verschlüsselt): {original_path}")
         return "SKIPPED_ENCRYPTED"
 
+    # ── Kennwort bei OOXML vorab erkennen (siehe _ooxml_kennwort_grund) ────
+    if ext in (".docx", ".docm", ".dotx", ".dotm"):
+        _kw_grund = _ooxml_kennwort_grund(file_path)
+        if _kw_grund == "verschluesselt":
+            pbar.write(f"  ->  ÜBERSPRUNGEN (verschlüsselt): "
+                       f"{os.path.basename(original_path)}")
+            detail_logger.info(f"Übersprungen (OOXML verschlüsselt): {original_path}")
+            return "SKIPPED_ENCRYPTED"
+        if _kw_grund == "schreibkennwort":
+            pbar.write(f"  ->  ÜBERSPRUNGEN (Schreibkennwort – vorher mit 2a entfernen): "
+                       f"{os.path.basename(original_path)}")
+            detail_logger.info(f"Übersprungen (Schreibkennwort): {original_path}")
+            return "SKIPPED_PASSWORD"
+
     # ── Schreibschutz-Prüfung (OS-Level) ───────────────────────────────────
     was_read_only = False
     try:
@@ -2208,6 +2424,9 @@ def replace_fonts_in_document_com(
                 # bereinigen, damit der Aufrufer beim naechsten File
                 # _start_word() neu aufruft.
                 word_app_global = None
+                _eigene_besitzerdatei_entfernen(file_path)
+                if file_path != original_path:
+                    _eigene_besitzerdatei_entfernen(original_path)
                 pbar.write(f"  ✕  TIMEOUT bei Stage-1-Open ({WORD_OPEN_TIMEOUT:.0f}s) – Word blockiert")
                 log_error(original_path, Exception(
                     f"Timeout bei Documents.Open (Stage 1) nach {WORD_OPEN_TIMEOUT:.0f}s "
@@ -2316,6 +2535,9 @@ def replace_fonts_in_document_com(
             )
         except TimeoutError:
             word_app_global = None
+            _eigene_besitzerdatei_entfernen(file_path)
+            if file_path != original_path:
+                _eigene_besitzerdatei_entfernen(original_path)
             pbar.write(f"  ✕  TIMEOUT bei Stage-2-Open ({WORD_OPEN_TIMEOUT:.0f}s) – Word blockiert")
             log_error(original_path, Exception(
                 f"Timeout bei Documents.Open (Stage 2) nach {WORD_OPEN_TIMEOUT:.0f}s"
@@ -2382,49 +2604,82 @@ def replace_fonts_in_document_com(
                 detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
 
         # ── 2. Story Ranges + ShapeRange + InlineShapes ───────────────────
+        # Bekannter Word-Fehler: StoryRanges/NextStoryRange ueberspringen
+        # Kopf-/Fusszeilen spaeterer Abschnitte, wenn die erste Kopfzeile
+        # leer bzw. noch nie angesprochen ist. Dokumentierter Vorgriff (Word-
+        # MVP-Muster "lngJunk = ...Sections(1).Headers(1).Range.StoryType"):
+        # die Kopfzeile einmal ansprechen, BEVOR StoryRanges gelesen wird.
+        # Zusaetzlich werden unten alle Abschnitte mit ihren drei Kopf- und
+        # Fusszeilen direkt bearbeitet - doppelt Bearbeitetes ist harmlos
+        # (_set_all_font_names setzt nur Abweichendes).
+        try:
+            _ = doc.Sections(1).Headers(1).Range.StoryType
+        except Exception as _e:
+            detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
+
+        def _story_bearbeiten(current):
+            _set_font_on_range(current, font_name)
+
+            try:
+                for shape in current.ShapeRange:
+                    try:
+                        _set_font_on_shape(shape, font_name)
+                    except Exception as _e:
+                        detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
+
+            try:
+                for ishape in current.InlineShapes:
+                    try:
+                        if ishape.HasSmartArt:
+                            for node in ishape.SmartArt.Nodes:
+                                try:
+                                    _apply_smartart_node(node, font_name)
+                                except Exception as _e:
+                                    detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
+                        else:
+                            try:
+                                if ishape.HasTextFrame:
+                                    _set_font_on_range(
+                                        ishape.TextFrame.TextRange, font_name)
+                            except Exception as _e:
+                                detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
+                            try:
+                                _set_font_on_range(ishape.Range, font_name)
+                            except Exception as _e:
+                                detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
+                    except Exception as _e:
+                        detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
+
         for story in doc.StoryRanges:
             current = story
             while current is not None:
-                _set_font_on_range(current, font_name)
-
-                try:
-                    for shape in current.ShapeRange:
-                        try:
-                            _set_font_on_shape(shape, font_name)
-                        except Exception as _e:
-                            detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
-                except Exception as _e:
-                    detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
-
-                try:
-                    for ishape in current.InlineShapes:
-                        try:
-                            if ishape.HasSmartArt:
-                                for node in ishape.SmartArt.Nodes:
-                                    try:
-                                        _apply_smartart_node(node, font_name)
-                                    except Exception as _e:
-                                        detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
-                            else:
-                                try:
-                                    if ishape.HasTextFrame:
-                                        _set_font_on_range(
-                                            ishape.TextFrame.TextRange, font_name)
-                                except Exception as _e:
-                                    detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
-                                try:
-                                    _set_font_on_range(ishape.Range, font_name)
-                                except Exception as _e:
-                                    detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
-                        except Exception as _e:
-                            detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
-                except Exception as _e:
-                    detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
-
+                _story_bearbeiten(current)
                 try:
                     current = current.NextStoryRange
                 except Exception:
                     current = None
+
+        # Zusaetzlich jede Kopf-/Fusszeile jedes Abschnitts direkt
+        # (wdHeaderFooterPrimary/FirstPage/EvenPages = 1/2/3) - greift auch,
+        # falls der Vorgriff oben in einer Word-Fassung nicht genuegt.
+        # Verknuepfte (LinkToPrevious) zeigen denselben Inhalt wie im
+        # Vorabschnitt und werden nicht erneut bearbeitet.
+        try:
+            for section in doc.Sections:
+                for sammlung in (section.Headers, section.Footers):
+                    for idx in (1, 2, 3):
+                        try:
+                            hf = sammlung(idx)
+                            if hf.Exists and not hf.LinkToPrevious:
+                                _story_bearbeiten(hf.Range)
+                        except Exception as _e:
+                            detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
+        except Exception as _e:
+            detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
 
         # ── 3. Tabellen ───────────────────────────────────────────────────
         for table in doc.Tables:
@@ -2645,7 +2900,17 @@ def replace_fonts_in_document_com(
                 new_path = unique_new_path
                 safe_new = prepare_long_path(new_path)
 
-                _robust_move(temp_stage1_path, safe_new, op_name="Stage-1-Move")
+                # Staging auf dem Zielvolume + os.replace statt shutil.move:
+                # Temp (Dokumente, C:) und Ablage (Q:/R:/UNC) liegen auf
+                # verschiedenen Volumes, shutil.move kopiert dann per copy2
+                # direkt unter dem Zielnamen - ein Abbruch mittendrin liess
+                # eine halbe X.docx neben der X.doc zurueck (der Folgelauf
+                # wich dann auf "X (konvertiert).docx" aus). Jetzt entsteht
+                # X.docx erst mit dem atomaren os.replace; eine halbe
+                # Staging-Datei raeumt _replace_file_atomic selbst ab.
+                # ACL folgt unten (sd=None hier, sonst doppelt).
+                _replace_file_atomic(temp_stage1_path, safe_new,
+                                     op_name="Stage-1-Move", sd=None)
                 temp_stage1_path = None
 
                 if not (os.path.exists(safe_new) and os.path.getsize(safe_new) > 0):
@@ -2814,12 +3079,9 @@ def replace_fonts_in_document_com(
         return "SUCCESS"
 
     except Exception as e:
-        err_msg = str(e).lower()
-
-        is_password_error = any(kw in err_msg for kw in (
-            "password", "passwort", "kennwort",
-            "protected", "geschützt",
-        ))
+        is_password_error = _ist_kennwortfehler(
+            e, (original_path, file_path, new_path,
+                temp_stage1_path, temp_stage2_path))
 
         if is_password_error:
             pbar.write(f"  ->  ÜBERSPRUNGEN (Passwort): {os.path.basename(original_path)}")
@@ -3005,33 +3267,22 @@ def process_directory(
         except Exception as e_ver:
             detail_logger.debug(f"Word-Version nicht ermittelbar: {e_ver}")
 
-        try:
-            _pids_now = {
-                p.pid for p in psutil.process_iter(["name"])
-                if p.info["name"] and p.info["name"].upper() == "WINWORD.EXE"
-            }
-            _new_pids = _pids_now - _word_pids_before
-            if len(_new_pids) == 1:
-                word_pid_global = _new_pids.pop()
-                detail_logger.debug(
-                    f"Word-PID via psutil-Snapshot ermittelt: {word_pid_global}")
-            else:
-                word_pid_global = None
-                detail_logger.warning(
-                    f"PID-Snapshot nicht eindeutig ({len(_new_pids)} neue Prozesse) "
-                    f"– versuche Hwnd-Fallback")
-        except Exception as e_snap:
-            word_pid_global = None
-            detail_logger.warning(f"PID-Snapshot fehlgeschlagen: {e_snap}")
-
-        try:
-            _, pid = win32process.GetWindowThreadProcessId(word.Hwnd)
-            word_pid_global = pid
-            detail_logger.debug(f"Word-PID via Hwnd bestätigt: {pid}")
-        except Exception as e_pid:
-            detail_logger.debug(
-                f"PID-Ermittlung via Hwnd fehlgeschlagen: {e_pid}"
-                + (" – Snapshot-PID wird verwendet" if word_pid_global else " – kein Zombie-Schutz"))
+        # Der fruehere "Hwnd-Fallback" (word.Hwnd) scheiterte immer:
+        # Word.Application hat keine Hwnd-Eigenschaft (MSWORD.OLB). War der
+        # Snapshot mehrdeutig, lief der Hauptlauf ohne PID weiter - ohne
+        # Watchdog-Kill und ohne Zombie-Schutz, ein Haenger blieb
+        # unbegrenzt. Jetzt: _ermittle_word_pid, und ohne PID kein Lauf.
+        word_pid_global = _ermittle_word_pid(word, _word_pids_before)
+        if word_pid_global is None:
+            try:
+                word.Quit(SaveChanges=COM_FALSE)
+            except Exception as _e:
+                detail_logger.debug(f"_start_word: Exception verworfen: {_e!r}")
+            word            = None
+            word_app_global = None
+            raise RuntimeError(
+                "PID der Word-Instanz nicht ermittelbar – ohne sie kann der "
+                "Watchdog einen Hänger nicht beenden; Lauf abgebrochen")
 
         # Erstellungszeit der Word-Instanz sichern (PID-Recycling-Schutz
         # fuer Watchdog-Kill und _kill_specific_word).

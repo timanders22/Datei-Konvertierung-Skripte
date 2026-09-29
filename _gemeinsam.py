@@ -134,58 +134,125 @@ class Einzelinstanz:
             # Ohne psutil lieber nicht sperren, als faelschlich aussperren.
             return False
 
-    # -- oeffentlich -----------------------------------------------
-    def belegen(self) -> bool:
-        """True, wenn die Sperre uns gehoert; False, wenn ein anderer Lauf laeuft."""
-        eigener_name = self._prozessname(os.getpid())
+    def _inhalt_lesen(self, versuche: int = 5) -> Optional[str]:
+        """Inhalt der Sperrdatei; None, wenn sie (nicht mehr) da ist.
 
-        if os.path.exists(self.pfad):
+        Ein soeben per O_EXCL angelegter, noch leerer Sperrsatz gehoert
+        einem Lauf, der gerade schreibt - kurz nachfassen, statt ihn als
+        verwaist zu werten.
+        """
+        inhalt = ""
+        for _ in range(max(1, versuche)):
             try:
                 with open(self.pfad, "r", encoding="utf-8") as fh:
-                    zeilen = [z.strip() for z in fh.read().splitlines() if z.strip()]
-                if zeilen:
-                    alte_pid = int(zeilen[0])
-                    alter_name = zeilen[1].lower() if len(zeilen) > 1 else ""
-                    alte_ct: Optional[float] = None
-                    if len(zeilen) > 2:
-                        try:
-                            alte_ct = float(zeilen[2])
-                        except ValueError:
-                            alte_ct = None
+                    inhalt = fh.read()
+            except FileNotFoundError:
+                return None
+            except (OSError, ValueError):
+                inhalt = ""
+            if inhalt.strip():
+                return inhalt
+            time.sleep(0.2)
+        return inhalt
 
-                    if alte_pid != os.getpid() and self._lebt(alte_pid):
-                        name_jetzt = self._prozessname(alte_pid)
-                        passt = (
-                            name_jetzt == eigener_name
-                            or (alter_name and name_jetzt == alter_name)
-                            or "python" in name_jetzt
-                        )
-                        if passt:
-                            if alte_ct is not None:
-                                ct_jetzt = self._erstellungszeit(alte_pid)
-                                if ct_jetzt is not None and abs(ct_jetzt - alte_ct) < 1.0:
-                                    return False
-                            else:
-                                # Altes Format ohne Erstellungszeit -
-                                # konservativ als belegt behandeln.
-                                return False
-            except (ValueError, OSError, IndexError):
-                pass
+    def _ist_fremd_belegt(self, inhalt: str, eigener_name: str) -> bool:
+        try:
+            zeilen = [z.strip() for z in inhalt.splitlines() if z.strip()]
+            if not zeilen:
+                return False
+            alte_pid = int(zeilen[0])
+            alter_name = zeilen[1].lower() if len(zeilen) > 1 else ""
+            alte_ct: Optional[float] = None
+            if len(zeilen) > 2:
+                try:
+                    alte_ct = float(zeilen[2])
+                except ValueError:
+                    alte_ct = None
+
+            if alte_pid != os.getpid() and self._lebt(alte_pid):
+                name_jetzt = self._prozessname(alte_pid)
+                passt = (
+                    name_jetzt == eigener_name
+                    or (alter_name and name_jetzt == alter_name)
+                    or "python" in name_jetzt
+                )
+                if passt:
+                    if alte_ct is not None:
+                        ct_jetzt = self._erstellungszeit(alte_pid)
+                        if ct_jetzt is not None and abs(ct_jetzt - alte_ct) < 1.0:
+                            return True
+                    else:
+                        # Altes Format ohne Erstellungszeit -
+                        # konservativ als belegt behandeln.
+                        return True
+        except (ValueError, IndexError):
+            pass
+        return False
+
+    # -- oeffentlich -----------------------------------------------
+    def belegen(self) -> bool:
+        """True, wenn die Sperre uns gehoert; False, wenn ein anderer Lauf laeuft.
+
+        Frueher: os.path.exists pruefen, dann open(..., "w"). Zwei
+        gleichzeitig gestartete Laeufe sahen beide keine Sperrdatei und
+        schrieben beide - der zweite ueberschrieb den ersten, beide liefen
+        (nachgestellt 29.09.: sechs Prozesse mit gemeinsamem Startzeitpunkt,
+        fuenf Runden - jedes Mal belegten alle sechs).
+        Jetzt legt os.open(O_CREAT|O_EXCL) die Datei atomar an: genau einer
+        gewinnt. Eine vorhandene Sperre wird wie bisher auf ihren Besitzer
+        geprueft (PID, Prozessname, Erstellungszeit); ist sie verwaist,
+        wird sie entfernt - aber nur, wenn ihr Inhalt unmittelbar vorher
+        noch derselbe ist - und das atomare Anlegen erneut versucht.
+        Restrisiko: zwei Laeufe, die DIESELBE verwaiste Sperre im selben
+        Augenblick entfernen, koennen sich in einem Fenster von Mikro-
+        sekunden noch ueberholen.
+        """
+        eigener_name = self._prozessname(os.getpid())
+        eigene_ct = self._erstellungszeit(os.getpid())
+        satz = (f"{os.getpid()}\n{eigener_name}\n"
+                f"{repr(eigene_ct) if eigene_ct is not None else ''}\n")
 
         try:
             ordner = os.path.dirname(self.pfad)
             if ordner:
                 os.makedirs(ordner, exist_ok=True)
-            eigene_ct = self._erstellungszeit(os.getpid())
-            with open(self.pfad, "w", encoding="utf-8") as fh:
-                fh.write(f"{os.getpid()}\n{eigener_name}\n"
-                         f"{repr(eigene_ct) if eigene_ct is not None else ''}\n")
-            self._belegt = True
         except OSError:
-            # Keine Sperrdatei schreibbar: lieber weiterarbeiten als
-            # blockieren - die Sperre ist eine Vorsichtsmassnahme,
-            # keine Voraussetzung.
+            pass
+
+        for _ in range(5):
+            try:
+                fd = os.open(self.pfad, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                inhalt = self._inhalt_lesen()
+                if inhalt is None:
+                    continue            # inzwischen entfernt - neu versuchen
+                if self._ist_fremd_belegt(inhalt, eigener_name):
+                    return False
+                # Verwaist (tote PID, fremder Prozess, eigene PID, leer oder
+                # unlesbar): nur entfernen, wenn noch derselbe Inhalt drinsteht.
+                if self._inhalt_lesen(versuche=1) == inhalt:
+                    try:
+                        os.remove(self.pfad)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        break
+                continue
+            except OSError:
+                break
+            try:
+                os.write(fd, satz.encode("utf-8"))
+            except OSError:
+                pass
+            finally:
+                os.close(fd)
             self._belegt = True
+            return True
+
+        # Keine Sperrdatei anlegbar: lieber weiterarbeiten als blockieren -
+        # die Sperre ist eine Vorsichtsmassnahme, keine Voraussetzung (wie
+        # bisher). Ein lebender Besitzer hat oben bereits False geliefert.
+        self._belegt = True
         return True
 
     def freigeben(self) -> None:
@@ -351,15 +418,37 @@ class Laufprotokoll:
 
     def __init__(self, skript: str, pfad: Optional[str] = None) -> None:
         self.skript = skript
+        self.aktiv = True
+        # Abschnitt "protokoll" aus pfade.json. Die Datei beschreibt ihn
+        # ("datei": leer = neben den Skripten, "aktiv"), gelesen wurde er
+        # aber nie - weder "aktiv": false noch ein eigener Pfad hatten eine
+        # Wirkung. Ein ausdruecklich uebergebener pfad geht weiter vor.
+        einstellung: Dict[str, Any] = {}
+        try:
+            roh = lade_pfade().get("protokoll")
+            if isinstance(roh, dict):
+                einstellung = roh
+        except Exception:
+            einstellung = {}
+        aktiv = einstellung.get("aktiv", True)
+        if aktiv in (False, 0) or str(aktiv).strip().lower() in ("false", "nein", "0"):
+            self.aktiv = False
+        datei = str(einstellung.get("datei") or "").strip()
         if pfad:
             self.pfad = pfad
+        elif datei:
+            datei = os.path.expandvars(datei)
+            if not os.path.isabs(datei):
+                datei = os.path.join(os.path.dirname(os.path.abspath(__file__)), datei)
+            if os.path.isdir(datei):
+                datei = os.path.join(datei, "migration.jsonl")
+            self.pfad = datei
         else:
             basis = os.path.dirname(os.path.abspath(__file__))
             if not os.access(basis, os.W_OK):
                 basis = (os.environ.get("LOCALAPPDATA")
                          or os.environ.get("TEMP") or ".")
             self.pfad = os.path.join(basis, "migration.jsonl")
-        self.aktiv = True
 
     def schreibe(self, pfad_datei: str, aktion: str, status: str,
                  detail: str = "", **weitere: Any) -> None:

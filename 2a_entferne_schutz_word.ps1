@@ -270,6 +270,8 @@ $script:SkipPreScan     = $false
 $script:TotalFiles      = 0
 $script:ProcessedCount  = 0
 $script:TrackedWordPids = [System.Collections.Generic.List[int]]::new()
+# Startzeit je verfolgter PID (PID -> StartTime), siehe Add-TrackedWordPid.
+$script:TrackedWordStart = @{}
 $script:RetryStats      = @{ Recovered = 0; Failed = 0 }
 $script:RestorePrivilegesEnabled = $false
 $script:LastProgressUpdate    = [DateTime]::MinValue
@@ -390,13 +392,23 @@ function Test-IsOwnWordProcess {
         gehoert. Windows vergibt PIDs wieder; ohne den Startzeit-Vergleich
         koennte Cleanup-AllWord eine zwischenzeitlich vom Nutzer geoeffnete
         Word-Sitzung abschiessen, die zufaellig dieselbe PID bekommen hat.
+
+        Verglichen wird EXAKT mit der Startzeit, die Add-TrackedWordPid beim
+        Aufnehmen der PID gemerkt hat (wie Stop-TrackedOfficeProcess
+        -StartTime in _gemeinsam.psm1). Vorher genuegte 'StartTime nach
+        Skriptstart': eine Word-Sitzung, die der Anwender waehrend des Laufs
+        oeffnet und die eine frei gewordene, noch in der Liste stehende PID
+        erbt, bestand diese Pruefung ebenfalls und wurde von Cleanup-AllWord
+        per Stop-Process -Force beendet (samt ungespeicherter Dokumente).
+        Nicht gemerkte PIDs gelten nie als eigene.
     #>
     param([int]$ProcessId)
+    if (-not $script:TrackedWordStart.ContainsKey($ProcessId)) { return $false }
     try {
         $proc = Get-Process -Id $ProcessId -ErrorAction Stop
         if ($proc.Name -ne 'WINWORD') { return $false }
         try {
-            if ($proc.StartTime -lt $ScriptStartTime) { return $false }
+            if ($proc.StartTime -ne $script:TrackedWordStart[$ProcessId]) { return $false }
         } catch {
             # StartTime nicht lesbar (Rechte) - im Zweifel nicht anfassen
             return $false
@@ -405,6 +417,27 @@ function Test-IsOwnWordProcess {
     } catch {
         return $false
     }
+}
+
+function Add-TrackedWordPid {
+    <#
+        Nimmt eine PID in die Aufraeumliste auf und merkt sich ihre Startzeit.
+        Aufgenommen wird nur ein laufender WINWORD-Prozess, der nach dem
+        Skriptstart gestartet wurde; eine bereits beendete PID kommt gar nicht
+        erst auf die Liste (sonst koennte sie spaeter wiedervergeben werden).
+    #>
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) { return }
+    try {
+        $proc = Get-Process -Id $ProcessId -ErrorAction Stop
+        if ($proc.Name -ne 'WINWORD') { return }
+        $start = $proc.StartTime
+        if ($start -lt $ScriptStartTime) { return }
+    } catch {
+        return
+    }
+    $script:TrackedWordStart[$ProcessId] = $start
+    if (-not $script:TrackedWordPids.Contains($ProcessId)) { $script:TrackedWordPids.Add($ProcessId) }
 }
 
 # ==================================================================
@@ -471,6 +504,7 @@ function Cleanup-AllWord {
     }
     [System.GC]::Collect()
     $script:TrackedWordPids.Clear()
+    $script:TrackedWordStart.Clear()
 }
 
 function Sweep-DeadPids {
@@ -481,24 +515,28 @@ function Sweep-DeadPids {
     }
     $script:TrackedWordPids.Clear()
     foreach ($id in $alive) { $script:TrackedWordPids.Add($id) }
+    # Gemerkte Startzeiten toter PIDs mit entfernen.
+    foreach ($id in @($script:TrackedWordStart.Keys)) {
+        if (-not $alive.Contains([int]$id)) { $script:TrackedWordStart.Remove($id) }
+    }
 }
 
 # ==================================================================
 # ABBRUCH-HANDLER & TRAP
 # ==================================================================
-try {
-    if ($Host.Name -eq 'ConsoleHost') {
-        [Console]::TreatControlCAsInput = $false
-        [Console]::add_CancelKeyPress([System.ConsoleCancelEventHandler]{
-            param($sender, $e)
-            $e.Cancel = $true
-            Write-Host "`n⚠️  ABBRUCH angefordert – laufende Datei wird noch fertiggestellt..." -ForegroundColor Yellow
-            $script:ShouldStop = $true
-        })
-    }
-} catch {}
+# Hier stand ein [Console]::add_CancelKeyPress-Handler als ScriptBlock. Der
+# Handler laeuft auf einem Threadpool-Thread ohne PowerShell-Runspace: Strg+C
+# setzte nicht $script:ShouldStop, sondern warf dort eine
+# PSInvalidOperationException (ScriptBlock.GetContextFromTLS) und riss
+# powershell.exe hart herunter - mitten in einer Datei-Ersetzung
+# (nachgestellt per GenerateConsoleCtrlEvent, WER-Bericht). Jetzt wie in 7/9:
+# Strg+C als Eingabe behandeln und zusammen mit ESC in der Hauptschleife
+# abfragen. Eingeschaltet wird das erst unmittelbar vor der Hauptschleife,
+# damit Strg+C in den Eingabeaufforderungen davor wie gewohnt abbricht.
+$script:CtrlCAsInput = $false
 
 trap {
+    try { if ($script:CtrlCAsInput) { [Console]::TreatControlCAsInput = $false } } catch {}
     Write-Warning "Unerwarteter Fehler: $_"
     Start-Sleep -Milliseconds 200
     if (Test-Path -LiteralPath $TempPath) {
@@ -506,7 +544,7 @@ trap {
             ForEach-Object {
                 try {
                     $p = [int][System.IO.File]::ReadAllText($_.FullName).Trim()
-                    if ($p -gt 0) { $script:TrackedWordPids.Add($p) }
+                    if ($p -gt 0) { Add-TrackedWordPid -ProcessId $p }
                 } catch {}
             }
     }
@@ -673,8 +711,15 @@ function Test-FileIsLocked {
     try {
         $fi = New-Object System.IO.FileInfo $lp
         if (-not $fi.Exists) { return $false }
+        # Das ReadOnly-Attribut ist keine Sperre. Ein Oeffnen mit ReadWrite
+        # scheitert daran mit UnauthorizedAccessException, und die Datei
+        # wurde als 'Zugriff verweigert' uebersprungen - im Probelauf immer
+        # (dort wird das Attribut nicht entfernt), statt 'Wuerde aendern' zu
+        # melden (nachgestellt). Fuer schreibgeschuetzte Dateien daher nur
+        # lesend oeffnen; FileShare.None erkennt fremde Handles weiterhin.
+        $zugriff = if ($fi.IsReadOnly) { [System.IO.FileAccess]::Read } else { [System.IO.FileAccess]::ReadWrite }
         $stream = $fi.Open([System.IO.FileMode]::Open,
-                           [System.IO.FileAccess]::ReadWrite,
+                           $zugriff,
                            [System.IO.FileShare]::None)
         $stream.Close()
         return $false
@@ -1075,8 +1120,15 @@ function Remove-OrphanedBackups {
                 continue
             }
 
-            # Regel 3: Mindestalter
-            if ($fi.LastWriteTime -gt $cutoff) {
+            # Regel 3: Mindestalter - an der CreationTime gemessen (wie 2b),
+            # NICHT an der LastWriteTime. Das Backup entsteht per
+            # [System.IO.File]::Copy, und Copy uebernimmt die LastWriteTime der
+            # QUELLE. Auf Archiv-Ablagen ist die Jahre alt; ein Sekunden altes
+            # .bak (abgebrochener oder parallel laufender Durchgang) galt damit
+            # sofort als verwaist und wurde geloescht (nachgestellt: Quelle mit
+            # LastWriteTime 2019 kopiert -> Kopie LastWriteTime 2019,
+            # CreationTime jetzt). Die Frist war wirkungslos.
+            if ($fi.CreationTime -gt $cutoff) {
                 $res.Kept++
                 Write-DetailedLog "Backup zu jung, behalten: $(Remove-LongPathPrefix $bak)" "DEBUG"
                 continue
@@ -1298,7 +1350,7 @@ function Convert-DocToDocx {
         if ([System.IO.File]::Exists($pidFile)) {
             try {
                 $savedPid = [int][System.IO.File]::ReadAllText($pidFile).Trim()
-                if ($savedPid -gt 0) { $script:TrackedWordPids.Add($savedPid) }
+                if ($savedPid -gt 0) { Add-TrackedWordPid -ProcessId $savedPid }
             } catch {}
             try { [System.IO.File]::Delete($pidFile) } catch {}
         }
@@ -1309,9 +1361,8 @@ function Convert-DocToDocx {
     try { Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
     if ([System.IO.File]::Exists($pidFile)) { try { [System.IO.File]::Delete($pidFile) } catch {} }
 
-    if ($result.WordPid -and (Test-IsOwnWordProcess -ProcessId ([int]$result.WordPid))) {
-        $script:TrackedWordPids.Add([int]$result.WordPid)
-    }
+    # Add-TrackedWordPid prueft Name und Startzeit selbst.
+    if ($result.WordPid) { Add-TrackedWordPid -ProcessId ([int]$result.WordPid) }
 
     if ($result.Status -eq "OK") {
         Start-Sleep -Milliseconds $PostComStabilizeMs
@@ -1421,10 +1472,19 @@ function Remove-OpenPassword {
         if ([System.IO.File]::Exists($pidFile)) {
             try {
                 $savedPid = [int][System.IO.File]::ReadAllText($pidFile).Trim()
-                if ($savedPid -gt 0) { $script:TrackedWordPids.Add($savedPid) }
+                if ($savedPid -gt 0) { Add-TrackedWordPid -ProcessId $savedPid }
             } catch {}
             try { [System.IO.File]::Delete($pidFile) } catch {}
         }
+        # Haengende Instanz sofort abraeumen. Stop-Job beendet nur den
+        # Job-Prozess, nicht das per DCOM gestartete WINWORD. Der Aufrufer
+        # bucht den Timeout als 'SKIP (Passwort)' und macht weiter - anders als
+        # der Konvertierungspfad ruft er Cleanup-AllWord NICHT auf. Das Word
+        # (ggf. mit sichtbarem Kennwortdialog) lief so bis zum Laufende weiter,
+        # hielt die Temp-Kopie offen, und jeder weitere Timeout kam eine
+        # Instanz dazu. Es laeuft immer nur ein Job zugleich; die Liste
+        # enthaelt hier also keine noch gebrauchte Instanz.
+        Cleanup-AllWord
         # Einheitliches Rueckgabeformat auch im Timeout-Fall: der Aufrufer
         # greift auf .Success zu, ein nacktes $false haette dort still $null
         # ergeben.
@@ -1435,9 +1495,8 @@ function Remove-OpenPassword {
     try { Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
     if ([System.IO.File]::Exists($pidFile)) { try { [System.IO.File]::Delete($pidFile) } catch {} }
 
-    if ($result.WordPid -and (Test-IsOwnWordProcess -ProcessId ([int]$result.WordPid))) {
-        $script:TrackedWordPids.Add([int]$result.WordPid)
-    }
+    # Add-TrackedWordPid prueft Name und Startzeit selbst.
+    if ($result.WordPid) { Add-TrackedWordPid -ProcessId ([int]$result.WordPid) }
 
     if ($result.Status -eq "OK") {
         Start-Sleep -Milliseconds $PostComStabilizeMs
@@ -1661,8 +1720,13 @@ function Test-WordTrustCenter {
             try {
                 $savedPid = [int][System.IO.File]::ReadAllText($pidFile).Trim()
                 if ($savedPid -gt 0) {
-                    $script:TrackedWordPids.Add($savedPid)
-                    try { Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
+                    Add-TrackedWordPid -ProcessId $savedPid
+                    # Nur beenden, wenn es noch derselbe Prozess ist (Name und
+                    # gemerkte Startzeit) - hier stand ein ungeprueftes
+                    # Stop-Process auf die PID aus der Datei.
+                    if (Test-IsOwnWordProcess -ProcessId $savedPid) {
+                        try { Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
+                    }
                 }
             } catch {}
             try { [System.IO.File]::Delete($pidFile) } catch {}
@@ -1675,7 +1739,7 @@ function Test-WordTrustCenter {
     try { Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
     if ([System.IO.File]::Exists($pidFile)) { try { [System.IO.File]::Delete($pidFile) } catch {} }
     try { [System.IO.File]::Delete($testDocx) } catch {}
-    if ($result -and $result.WordPid) { $script:TrackedWordPids.Add([int]$result.WordPid) }
+    if ($result -and $result.WordPid) { Add-TrackedWordPid -ProcessId ([int]$result.WordPid) }
 
     if ($result -and $result.Ok) {
         return @{ Ok = $true }
@@ -1959,9 +2023,35 @@ $stats = @{
 # ==================================================================
 Write-Host "Starte Verarbeitung..." -ForegroundColor Cyan
 
+# Strg+C als Eingabe behandeln (Begruendung beim Trap oben); nur interaktiv
+# an der Konsole - im Modus -NoInteractive fragt niemand die Tasten ab.
+try {
+    if (-not $NoInteractive -and $Host.Name -eq 'ConsoleHost') {
+        [Console]::TreatControlCAsInput = $true
+        $script:CtrlCAsInput = $true
+        Write-Host "Abbruch mit ESC oder Strg+C (nach der laufenden Datei)." -ForegroundColor DarkGray
+    }
+} catch {}
+
 try {
 Get-WordFilesRobust (Add-LongPathPrefix $TargetPath) "^\.do[ct][xm]?$" |
     ForEach-Object {
+
+    # ESC / Strg+C abfragen (wie 7): wirkt vor der naechsten Datei, die
+    # laufende wird nie mittendrin verlassen.
+    if ($script:CtrlCAsInput) {
+        try {
+            while ([Console]::KeyAvailable) {
+                $key = [Console]::ReadKey($true)
+                if ($key.Key -eq 'Escape' -or
+                    ($key.Key -eq [ConsoleKey]::C -and
+                     (($key.Modifiers -band [ConsoleModifiers]::Control) -ne 0))) {
+                    $script:ShouldStop = $true
+                    break
+                }
+            }
+        } catch {}
+    }
 
     if ($script:ShouldStop) { throw [System.OperationCanceledException]::new() }
 
@@ -2026,12 +2116,21 @@ Get-WordFilesRobust (Add-LongPathPrefix $TargetPath) "^\.do[ct][xm]?$" |
     # und damit auch Hidden, System, Archive und NotContentIndexed entfernt -
     # ein stiller Nebeneffekt, der z. B. Backup-Werkzeuge und Suchindizes
     # durcheinanderbringt.
+    # $roEntfernt/$zurueckgeschrieben: Das Attribut wird hier entfernt, bevor
+    # feststeht, ob die Datei ueberhaupt geaendert wird. Endete die Datei
+    # danach als 'Kein Schutz', SKIP oder Fehler, blieb sie ohne
+    # Schreibschutz zurueck, obwohl das Protokoll 'keine Aenderung' meldete.
+    # Deshalb wird das Attribut wiederhergestellt, wenn nicht erfolgreich
+    # zurueckgeschrieben wurde (Sperr-Check unten und finally).
+    $roEntfernt         = $false
+    $zurueckgeschrieben = $false
     if ($file.IsReadOnly) {
         if (Confirm-Write (Remove-LongPathPrefix $srcLong) 'Schreibschutz-Attribut entfernen') {
             try {
                 $srcAttrs = [System.IO.File]::GetAttributes($srcLong)
                 [System.IO.File]::SetAttributes(
                     $srcLong, $srcAttrs -band (-bnot [System.IO.FileAttributes]::ReadOnly))
+                $roEntfernt = $true
                 Write-DetailedLog "Schreibschutz (Attribut) entfernt: $($file.FullName)" "DEBUG"
             } catch {
                 Write-DetailedLog "Attribut-Reset fehlgeschlagen: $($file.FullName) - $_" "WARN"
@@ -2042,6 +2141,9 @@ Get-WordFilesRobust (Add-LongPathPrefix $TargetPath) "^\.do[ct][xm]?$" |
     # --- Sperr-Check ---
     $lockResult = Test-FileIsLocked -FilePath $file.FullName
     if ($lockResult) {
+        if ($roEntfernt) {
+            try { [System.IO.File]::SetAttributes($srcLong, [System.IO.File]::GetAttributes($srcLong) -bor [System.IO.FileAttributes]::ReadOnly) } catch {}
+        }
         $stats.Locked++
         $stats.Skipped++
         if ($lockResult -eq "AccessDenied") {
@@ -2283,6 +2385,11 @@ Get-WordFilesRobust (Add-LongPathPrefix $TargetPath) "^\.do[ct][xm]?$" |
             Invoke-WithRetry -Context "Backup src" -Action {
                 [System.IO.File]::Copy($srcLong, $backupPath, $true)
             } | Out-Null
+            # Erzeugungszeit ausdruecklich stempeln (wie 2b): Remove-OrphanedBackups
+            # misst das Alter daran. Musste ein vorhandenes .bak oben
+            # ueberschrieben werden (Move fehlgeschlagen), behielte die Datei
+            # sonst die ALTE CreationTime.
+            try { [System.IO.File]::SetCreationTime($backupPath, (Get-Date)) } catch {}
 
             try {
                 Invoke-WithRetry -Context "Copy work->final" -Action {
@@ -2307,7 +2414,19 @@ Get-WordFilesRobust (Add-LongPathPrefix $TargetPath) "^\.do[ct][xm]?$" |
                 # --- Backup + ggf. alte .doc entfernen ---
                 try { [System.IO.File]::Delete($backupPath) } catch {}
                 if ($wasConverted -and $srcLong -ne $finalDest -and [System.IO.File]::Exists($srcLong)) {
-                    try { [System.IO.File]::Delete($srcLong) } catch {}
+                    # Mit Retry und Protokoll wie 2b. Vorher lief der Delete in
+                    # ein leeres catch: hielt z. B. der Virenscanner die alte .doc
+                    # kurz offen, blieb sie ohne jeden Hinweis neben der neuen
+                    # .docx liegen - und der naechste Lauf konvertierte sie
+                    # erneut, in eine '_2'-Variante (Doppel auf der Ablage).
+                    try {
+                        Invoke-WithRetry -Context "Delete original" -Action {
+                            [System.IO.File]::Delete($srcLong)
+                        } | Out-Null
+                    } catch {
+                        Write-DetailedLog "Alte Quelldatei konnte nicht geloescht werden (wird beibehalten): $srcLong - $_" "WARN"
+                        Write-Log "Quelldatei beibehalten: $($file.FullName) - $_" "WARN"
+                    }
                 }
 
                 # --- Zeitstempel wiederherstellen ---
@@ -2323,6 +2442,7 @@ Get-WordFilesRobust (Add-LongPathPrefix $TargetPath) "^\.do[ct][xm]?$" |
                     [System.IO.File]::SetLastAccessTimeUtc($finalDest, $origLastAccessTime.ToUniversalTime())
                 } catch {}
 
+                $zurueckgeschrieben = $true
                 $stats.Unlocked++
                 $actionStr = $actions -join ', '
                 if (-not $script:UseProgress) {
@@ -2414,6 +2534,16 @@ Get-WordFilesRobust (Add-LongPathPrefix $TargetPath) "^\.do[ct][xm]?$" |
         if (-not [string]::IsNullOrWhiteSpace($workFile)) {
             Remove-Item -LiteralPath $workFile -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
         }
+        # Oben entferntes ReadOnly-Attribut zuruecksetzen, wenn die Datei
+        # nicht ersetzt wurde (Kein Schutz, SKIP, WHATIF, Fehler/Rollback).
+        if ($roEntfernt -and -not $zurueckgeschrieben -and [System.IO.File]::Exists($srcLong)) {
+            try {
+                [System.IO.File]::SetAttributes($srcLong, [System.IO.File]::GetAttributes($srcLong) -bor [System.IO.FileAttributes]::ReadOnly)
+                Write-DetailedLog "Schreibschutz (Attribut) wiederhergestellt, Datei unveraendert: $($file.FullName)" "DEBUG"
+            } catch {
+                Write-DetailedLog "Schreibschutz-Attribut nicht wiederherstellbar: $($file.FullName) - $_" "WARN"
+            }
+        }
         # Reservierten Platzhalter nur entfernen, wenn er leer geblieben ist -
         # eine Datei mit Inhalt wird niemals angefasst.
         if ($reservedPlaceholder) {
@@ -2431,6 +2561,8 @@ Get-WordFilesRobust (Add-LongPathPrefix $TargetPath) "^\.do[ct][xm]?$" |
     Write-Host "`nVerarbeitung durch Nutzer abgebrochen." -ForegroundColor Yellow
     Write-Log "Verarbeitung durch Nutzer abgebrochen." "WARN"
 }
+
+try { if ($script:CtrlCAsInput) { [Console]::TreatControlCAsInput = $false; $script:CtrlCAsInput = $false } } catch {}
 
 # ==================================================================
 # AUFRÄUMEN & STATISTIK

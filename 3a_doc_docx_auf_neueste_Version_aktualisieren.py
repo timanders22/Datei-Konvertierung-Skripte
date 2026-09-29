@@ -839,6 +839,103 @@ def robust_move(src: str, dst: str, max_retries: int = MAX_RETRIES) -> bool:
 # Lock-Detection für Pre-Flight (Word-Owner-Datei + Probe-Open)
 # ==================================================================
 
+# Eine Besitzerdatei '~$...' gilt erst nach dieser Zeit ohne Aenderung als
+# moeglicherweise verwaist (zusaetzlich zu: eigener Name, kein Prozess haelt
+# sie). Grosszuegig gewaehlt - eine gerade entstehende fremde Sperre darf
+# nie uebersehen werden.
+BESITZERDATEI_VERWAIST_NACH_S = 2 * 3600
+
+
+def _eigene_office_namen() -> set:
+    """Namen, unter denen Word fuer diesen Benutzer Besitzerdateien schreibt."""
+    namen = set()
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Office\Common\UserInfo") as k:
+            wert, _typ = winreg.QueryValueEx(k, "UserName")
+            if wert:
+                namen.add(str(wert).strip().casefold())
+    except Exception as _e:
+        detail_logger.debug(f"_eigene_office_namen: Exception verworfen: {_e!r}")
+    try:
+        u = os.environ.get("USERNAME") or ""
+        if u:
+            namen.add(u.strip().casefold())
+    except Exception as _e:
+        detail_logger.debug(f"_eigene_office_namen: Exception verworfen: {_e!r}")
+    namen.discard("")
+    return namen
+
+
+def _besitzername_lesen(daten: bytes) -> set:
+    """Liest den/die Benutzernamen aus einer Word-Besitzerdatei.
+
+    Aufbau (nachgemessen an einer echten ~$Normal.dotm, 162 Byte):
+    Byte 0 = Laenge N, Byte 1..N = Name (ANSI); ab Offset 54 eine
+    16-Bit-Laenge M, ab Offset 56 der Name als UTF-16LE (2*M Byte).
+    """
+    namen = set()
+    try:
+        n = daten[0]
+        if 0 < n < 54 and len(daten) >= 1 + n:
+            namen.add(daten[1:1 + n].decode("cp1252", "replace").strip().casefold())
+    except Exception as _e:
+        detail_logger.debug(f"_besitzername_lesen: Exception verworfen: {_e!r}")
+    try:
+        if len(daten) >= 56:
+            m = daten[54] | (daten[55] << 8)
+            if 0 < m < 256 and len(daten) >= 56 + 2 * m:
+                namen.add(daten[56:56 + 2 * m].decode("utf-16-le", "replace").strip().casefold())
+    except Exception as _e:
+        detail_logger.debug(f"_besitzername_lesen: Exception verworfen: {_e!r}")
+    namen.discard("")
+    return namen
+
+
+def _besitzerdatei_ist_verwaist(owner_path: str) -> bool:
+    """True nur, wenn eine Besitzerdatei sicher eine liegengebliebene EIGENE ist.
+
+    Hintergrund: Bis zur Umstellung auf ReadOnly=True legte das Skript fuer
+    OOXML-Dateien selbst '~$'-Dateien auf der Ablage an. Wurde Word dabei
+    beendet (Waechter, Absturz, Strg+C), blieben sie liegen, und die Datei
+    galt in JEDEM Folgelauf als 'von anderem Benutzer bearbeitet'.
+
+    Alle drei Bedingungen muessen gelten, sonst bleibt es eine Sperre:
+      1. der Name in der Datei ist der eigene (Office-Benutzername oder
+         Windows-Anmeldename) - fremde Sperren werden nie uebergangen;
+      2. sie ist aelter als BESITZERDATEI_VERWAIST_NACH_S;
+      3. kein Prozess haelt sie offen: ein Oeffnen OHNE Freigabe gelingt.
+         Word haelt die Besitzerdatei offen, solange das Dokument offen ist
+         (lokal wie ueber SMB) - dann scheitert dieses Oeffnen.
+    Die Datei wird NICHT geloescht, nur nicht als Sperre gewertet.
+    Jeder Fehler beim Pruefen zaehlt als 'nicht verwaist'.
+    """
+    try:
+        lp = long_path(owner_path)
+        alter = time.time() - os.path.getmtime(lp)
+        if alter < BESITZERDATEI_VERWAIST_NACH_S:
+            return False
+        with open(lp, "rb") as fh:
+            daten = fh.read(512)
+        eigene = _eigene_office_namen()
+        if not eigene or not (_besitzername_lesen(daten) & eigene):
+            return False
+        import win32file
+        import win32con
+        h = win32file.CreateFile(
+            lp, win32con.GENERIC_READ, 0,   # 0 = keine Freigabe
+            None, win32con.OPEN_EXISTING, 0, None)
+        h.Close()
+        detail_logger.info(
+            f"Eigene verwaiste Besitzerdatei (Alter {alter / 3600:.1f} h, "
+            f"von keinem Prozess gehalten) - keine Sperre: {owner_path}")
+        return True
+    except Exception as _e:
+        detail_logger.debug(f"_besitzerdatei_ist_verwaist: {owner_path}: {_e!r}")
+        return False
+
+
 def is_locked_by_other(path: str) -> bool:
     try:
         d = os.path.dirname(path)
@@ -850,7 +947,8 @@ def is_locked_by_other(path: str) -> bool:
             if len(b) > 1:
                 owner_candidates.append("~$" + b[1:])
             for oc in owner_candidates:
-                if safe_exists(os.path.join(d, oc)):
+                oc_pfad = os.path.join(d, oc)
+                if safe_exists(oc_pfad) and not _besitzerdatei_ist_verwaist(oc_pfad):
                     return True
     except Exception as _e:
         detail_logger.debug(f"is_locked_by_other: Exception verworfen: {_e!r}")
@@ -904,6 +1002,42 @@ def is_transient_error(exc: Exception) -> bool:
     return False
 
 
+_KENNWORT_STICHWORTE = ("kennwort", "passwort", "password")
+
+
+def _ist_kennwortfehler(exc: Exception, file_path: str = "") -> bool:
+    """True nur, wenn Word das Oeffnen wegen eines Kennworts ablehnt.
+
+    Frueher galt JEDER gescheiterte Open eines .doc als Kennwortfehler,
+    sobald Kennwoerter hinterlegt waren - auch ein Netz- oder Sperrfehler.
+    Das Ergebnis 'SKIPPED' landet in der Resume-Datei, die Datei wurde
+    danach in keinem Folgelauf mehr angefasst.
+
+    Geprueft wird der Fehlertext, den Word liefert (bei com_error die
+    Beschreibung in excepinfo[2], sonst str(exc)), z.B. "Das Kennwort ist
+    falsch. Word kann das Dokument nicht oeffnen." bzw. "The password is
+    incorrect". Word haengt dort oft den Dateipfad an - ein Ordner namens
+    'Kennwoerter' soll keinen Treffer ausloesen, daher werden Pfad,
+    Klammerzusaetze und pfadartige Woerter vorher entfernt.
+    """
+    text = ""
+    try:
+        ei = getattr(exc, "excepinfo", None)
+        if ei and len(ei) > 2 and ei[2]:
+            text = str(ei[2])
+    except Exception as _e:
+        detail_logger.debug(f"_ist_kennwortfehler: Exception verworfen: {_e!r}")
+    if not text:
+        text = str(exc)
+    text = text.lower()
+    for teil in (file_path, os.path.basename(file_path or "")):
+        if teil:
+            text = text.replace(teil.lower(), " ")
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = re.sub(r"\S*[\\/]\S*", " ", text)
+    return any(k in text for k in _KENNWORT_STICHWORTE)
+
+
 def is_permanent_error(exc: Exception) -> bool:
     if isinstance(exc, (PermissionError, FileNotFoundError)):
         return True
@@ -946,19 +1080,22 @@ def _normalize_user(u: str) -> set:
 # Vor dem Start der eigenen COM-Instanz wird deshalb einmal festgehalten,
 # welche Word-Prozesse es bereits gab. Diese gelten dauerhaft als fremd
 # und werden nie beendet.
-_FOREIGN_WORD_PIDS: set = set()
+# PID -> Erstellungszeit. Mit Erstellungszeit, damit eine nach Ende der
+# fremden Sitzung neu vergebene PID die eigene Instanz nicht als 'fremd'
+# (und damit unueberwacht) erscheinen laesst.
+_FOREIGN_WORD_PIDS: dict = {}
 
 
 def snapshot_foreign_word_pids() -> None:
     """Merkt sich alle Word-Prozesse, die vor dem Skriptstart liefen."""
     global _FOREIGN_WORD_PIDS
-    found = set()
+    found = {}
     try:
-        for p in psutil.process_iter(["pid", "name"]):
+        for p in psutil.process_iter(["pid", "name", "create_time"]):
             try:
                 nm = p.info.get("name") or ""
                 if "WINWORD.EXE" in nm.upper():
-                    found.add(p.info["pid"])
+                    found[p.info["pid"]] = p.info.get("create_time")
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
     except Exception as _e:
@@ -971,8 +1108,15 @@ def snapshot_foreign_word_pids() -> None:
             f"- diese werden nicht beendet: {sorted(found)}")
 
 
-def is_foreign_word_pid(pid) -> bool:
-    return pid in _FOREIGN_WORD_PIDS
+def is_foreign_word_pid(pid, ct=None) -> bool:
+    """PID stammt aus der Start-Momentaufnahme. Mit ct nur bei gleicher
+    Erstellungszeit (sonst ist die PID inzwischen neu vergeben)."""
+    if pid not in _FOREIGN_WORD_PIDS:
+        return False
+    alt_ct = _FOREIGN_WORD_PIDS.get(pid)
+    if ct is None or alt_ct is None:
+        return True
+    return abs(alt_ct - ct) <= 0.001
 
 
 # ==================================================================
@@ -1049,63 +1193,79 @@ def warn_running_word(auto_mode: bool = False) -> None:
         sys.exit(0)
 
 
+# Eigene Word-Prozesse: PID -> Erstellungszeit (psutil create_time).
+# _kill_orphaned_word() beendete bisher jeden WINWORD.EXE des Benutzers, der
+# nicht in der Start-Momentaufnahme stand - also auch eine Word-Sitzung, die
+# der Anwender WAEHREND des Laufs oeffnet, und die Instanz eines parallel
+# laufenden Skripts (4a, zweiter 3a-Lauf auf anderem Ordner). Beendet wird
+# jetzt nur noch, was _init_word_app() selbst gestartet und hier eingetragen
+# hat - und nur, solange PID UND Erstellungszeit passen (PID-Recycling).
+_EIGENE_WORD_PROZESSE: dict = {}
+
+
+def _word_prozesse() -> dict:
+    """Alle laufenden WINWORD.EXE als {PID: Erstellungszeit}."""
+    gefunden = {}
+    try:
+        for p in psutil.process_iter(["pid", "name", "create_time"]):
+            try:
+                nm = p.info.get("name") or ""
+                if "WINWORD.EXE" in nm.upper():
+                    gefunden[p.info["pid"]] = p.info.get("create_time")
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    except Exception as _e:
+        detail_logger.debug(f"_word_prozesse: Exception verworfen: {_e!r}")
+    return gefunden
+
+
 def _kill_orphaned_word() -> None:
-    try:
-        cur_user_forms = _normalize_user(psutil.Process().username())
-    except Exception:
+    """Beendet liegengebliebene EIGENE Word-Prozesse - nie fremde."""
+    for pid, ct in list(_EIGENE_WORD_PROZESSE.items()):
+        try:
+            proc = psutil.Process(pid)
+            if "WINWORD.EXE" not in (proc.name() or "").upper():
+                _EIGENE_WORD_PROZESSE.pop(pid, None)
+                continue
+            if ct is None or abs(proc.create_time() - ct) > 0.001:
+                # PID inzwischen an einen anderen Prozess vergeben.
+                _EIGENE_WORD_PROZESSE.pop(pid, None)
+                continue
+            if is_foreign_word_pid(pid, ct):
+                _EIGENE_WORD_PROZESSE.pop(pid, None)
+                continue
+            proc.kill()
+            proc.wait(timeout=3)
+            _EIGENE_WORD_PROZESSE.pop(pid, None)
+            detail_logger.debug(f"Eigener Word-Prozess beendet: PID {pid}")
+        except psutil.NoSuchProcess:
+            _EIGENE_WORD_PROZESSE.pop(pid, None)
+        except psutil.AccessDenied:
+            detail_logger.warning(f"Kein Zugriff auf PID {pid}")
+        except psutil.TimeoutExpired:
+            detail_logger.warning(f"Prozess reagiert nicht: PID {pid}")
+        except Exception as _e:
+            detail_logger.debug(f"_kill_orphaned_word: Exception verworfen: {_e!r}")
+
+
+def _find_newest_word_pid(vorher: Optional[dict] = None) -> Optional[int]:
+    """Rueckfall der PID-Ermittlung: der NEU entstandene Word-Prozess.
+
+    Frueher: der juengste WINWORD.EXE des Benutzers ueberhaupt - das konnte
+    eine gerade vom Anwender gestartete Sitzung sein, die danach als
+    'eigene' galt (Waechter-Kill). Jetzt nur ein Prozess, der vor dem
+    DispatchEx noch nicht lief, und nur wenn es genau EINER ist.
+    """
+    vorher = vorher or {}
+    neu = [pid for pid, ct in _word_prozesse().items()
+           if not (pid in vorher and vorher[pid] == ct)
+           and not is_foreign_word_pid(pid, ct)]
+    if len(neu) == 1:
+        return neu[0]
+    if neu:
         detail_logger.warning(
-            "_kill_orphaned_word: Benutzerermittlung fehlgeschlagen – "
-            "Prozesse werden nicht beendet.")
-        return
-
-    for proc in psutil.process_iter(["pid", "name"]):
-        try:
-            if not (proc.info["name"] and "WINWORD.EXE" in proc.info["name"].upper()):
-                continue
-            try:
-                proc_user_forms = _normalize_user(proc.username())
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-            if not (cur_user_forms & proc_user_forms):
-                continue
-            if is_foreign_word_pid(proc.info["pid"]):
-                continue
-            try:
-                proc.kill()
-                proc.wait(timeout=3)
-                detail_logger.debug(f"Word-Prozess beendet: PID {proc.info['pid']}")
-            except psutil.AccessDenied:
-                detail_logger.warning(f"Kein Zugriff auf PID {proc.info['pid']}")
-            except psutil.NoSuchProcess:
-                pass
-            except psutil.TimeoutExpired:
-                detail_logger.warning(f"Prozess reagiert nicht: PID {proc.info['pid']}")
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-
-
-def _find_newest_word_pid() -> Optional[int]:
-    try:
-        cur_user_forms = _normalize_user(psutil.Process().username())
-    except Exception:
-        return None
-    candidates = []
-    for p in psutil.process_iter(["pid", "name", "create_time"]):
-        try:
-            if not (p.info["name"] and "WINWORD.EXE" in p.info["name"].upper()):
-                continue
-            try:
-                u = _normalize_user(p.username())
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-            if cur_user_forms & u:
-                ct = p.info.get("create_time") or 0.0
-                candidates.append((ct, p.info["pid"]))
-        except Exception:
-            continue
-    if candidates:
-        candidates.sort(reverse=True)
-        return candidates[0][1]
+            f"Eigene Word-PID nicht eindeutig (neue Prozesse: {sorted(neu)}) "
+            f"- keine PID, kein Waechter-Kill.")
     return None
 
 
@@ -1233,6 +1393,8 @@ def _cleanup_user_recent() -> None:
 
 
 def _init_word_app() -> tuple:
+    # Momentaufnahme direkt vor dem Start: was danach neu ist, ist unseres.
+    vorher = _word_prozesse()
     app = win32com.client.DispatchEx("Word.Application")
     time.sleep(0.3)
 
@@ -1247,7 +1409,25 @@ def _init_word_app() -> tuple:
         pid = None
 
     if not pid:
-        pid = _find_newest_word_pid()
+        pid = _find_newest_word_pid(vorher)
+
+    # Als eigene Instanz eintragen (PID + Erstellungszeit) - nur dann darf
+    # _kill_orphaned_word() sie spaeter beenden. Lief der Prozess schon vor
+    # dem DispatchEx oder gehoert er zur Start-Momentaufnahme, ist er
+    # fremd: keine Eintragung und keine PID fuer den Waechter.
+    if pid:
+        try:
+            ct = psutil.Process(pid).create_time()
+            if (pid in vorher and vorher[pid] == ct) or is_foreign_word_pid(pid, ct):
+                detail_logger.warning(
+                    f"Word-PID {pid} lief bereits vor dem Start - nicht die "
+                    f"eigene Instanz; wird weder ueberwacht noch beendet.")
+                pid = None
+            else:
+                _EIGENE_WORD_PROZESSE[pid] = ct
+        except Exception as _e:
+            detail_logger.debug(f"_init_word_app: PID {pid} nicht pruefbar: {_e!r}")
+            pid = None
 
     app.Visible            = COM_FALSE
     app.DisplayAlerts      = COM_FALSE
@@ -1383,12 +1563,14 @@ def _word_call_with_watchdog(call_label: str, timeout: float, word_pid,
     # PID an eine neue (vom Benutzer geoeffnete) Word-Sitzung vergeben - und
     # der Watchdog merkte sich deren create_time als "erwartet" und wuerde
     # nach Timeout den falschen, unbeteiligten Prozess killen.
-    expected_ct = None
-    if word_pid:
-        try:
-            expected_ct = psutil.Process(word_pid).create_time()
-        except Exception:
-            expected_ct = None
+    # Massgeblich ist die beim Start eingetragene Erstellungszeit der
+    # EIGENEN Instanz (_EIGENE_WORD_PROZESSE). Ist die PID dort nicht
+    # eingetragen, wird nicht getoetet (siehe _kill_orphaned_word).
+    expected_ct = _EIGENE_WORD_PROZESSE.get(word_pid) if word_pid else None
+    if word_pid and expected_ct is None:
+        detail_logger.debug(
+            f"Waechter: PID {word_pid} ist keine eingetragene eigene "
+            f"Word-Instanz - kein Kill bei Zeitueberschreitung.")
 
     def watchdog():
         if not done_event.wait(timeout):
@@ -1405,12 +1587,13 @@ def _word_call_with_watchdog(call_label: str, timeout: float, word_pid,
                         proc_name = ""
                     if proc_name != "WINWORD.EXE":
                         return
-                    if expected_ct is not None:
-                        try:
-                            if abs(proc.create_time() - expected_ct) > 0.001:
-                                return
-                        except Exception:
+                    if expected_ct is None:
+                        return
+                    try:
+                        if abs(proc.create_time() - expected_ct) > 0.001:
                             return
+                    except Exception:
+                        return
                     proc.kill()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
@@ -1456,18 +1639,30 @@ def safe_word_open(word_app, file_path, pw, is_binary,
     except Exception as _e:
         detail_logger.debug(f"safe_word_open: Exception verworfen: {_e!r}")
 
+    # IMMER schreibgeschuetzt oeffnen, auch OOXML. Frueher ReadOnly=False
+    # fuer .docx/.docm/.dotx/.dotm: Word legt dann neben der Datei auf der
+    # Ablage die Besitzerdatei '~$...' an - auch im Probelauf, der zusagt,
+    # nichts anzufassen. Wird Word dabei vom Waechter beendet, bleibt sie
+    # liegen, und is_locked_by_other() meldet die Datei in jedem Folgelauf
+    # als 'von anderem Benutzer bearbeitet'. Schreibzugriff braucht das
+    # Skript nicht: gespeichert wird ausschliesslich per SaveAs2 in den
+    # Temp-Ordner (temp_save_path), die Ablage wird danach per robust_move
+    # beschrieben. Ein schreibgeschuetzt geoeffnetes Dokument laesst sich
+    # im Speicher aendern (Convert) und unter anderem Namen speichern;
+    # .doc/.dot liefen schon immer so. Das Schreibkennwort wird mit
+    # ReadOnly nicht gebraucht (wie bisher bei .doc).
     def _open():
         return word_app.Documents.Open(
             file_path,
             ConfirmConversions    = COM_FALSE,
-            ReadOnly              = COM_TRUE if is_binary else COM_FALSE,
+            ReadOnly              = COM_TRUE,
             OpenAndRepair         = COM_FALSE,
             AddToRecentFiles      = COM_FALSE,
             NoEncodingDialog      = COM_TRUE,
             PasswordDocument      = pw,
             PasswordTemplate      = pw,
-            WritePasswordDocument = "" if is_binary else pw,
-            WritePasswordTemplate = "" if is_binary else pw,
+            WritePasswordDocument = "",
+            WritePasswordTemplate = "",
         )
 
     def _restore():
@@ -2577,6 +2772,14 @@ def end_compatibility_mode(
     # echte Datei ersetzt wurde - siehe Freigabe im finally.
     target_was_reserved = False
     converted_ok        = False
+    # Die Zieldatei wurde in diesem Lauf angefasst (eigener Platzhalter
+    # reserviert oder robust_move begonnen). Nur dann darf der Fehlerpfad
+    # sie als 'Fragment' entfernen. Frueher genuegte 'existiert und heisst
+    # anders als das Original': bei X.doc + fremder X.docx und
+    # erfolgloser Ausweichnamensuche zeigte target_path beim raise auf die
+    # FREMDE X.docx - der Fehlerpfad loeschte sie, der Wiederholungsversuch
+    # schrieb danach an ihre Stelle. 3c schuetzt sich genauso.
+    target_touched      = False
     ext            = os.path.splitext(file_path)[1].lower()
     is_template    = ext in (".dot", ".dotx", ".dotm")
     new_ext        = ext
@@ -2815,16 +3018,33 @@ def end_compatibility_mode(
             # der ausdruecklich nur dauerhaft erledigte Dateien vorsieht.
             # Ein fehlendes Passwort ist dauerhaft (SKIPPED), ein
             # Zugriffs-/Sperrfehler nicht (SKIPPED_TRANSIENT).
-            if needs_password_check and passwords and last_exception:
-                pbar.write("  → ÜBERSPRUNGEN: Passwort erforderlich (keines der hinterlegten Passwörter passt).")
-                detail_logger.warning(f"Übersprungen (Passwort): {original_path}")
+            # Als Kennwortfehler zaehlt nur, was Word ausdruecklich als
+            # solchen meldet (_ist_kennwortfehler). Frueher genuegte
+            # 'needs_password_check and passwords and last_exception': mit
+            # hinterlegten Kennwoertern wurde jeder Open-Fehler eines .doc
+            # (auch Netz-/Sperrfehler) dauerhaft uebersprungen, und eine
+            # verschluesselte Datei mit falschem Kennwort landete umgekehrt
+            # als LOCKED/voruebergehend in der Statistik.
+            if (last_exception is not None
+                    and (needs_password_check or is_encrypted)
+                    and _ist_kennwortfehler(last_exception, file_path)):
+                if is_encrypted:
+                    pbar.write("  → ÜBERSPRUNGEN: Kennwortgeschützt (keines der hinterlegten Passwörter passt).")
+                    file_logger.error(f"Datei: {original_path}\n  -> Übersprungen (Passwortgeschützt, Kennwort falsch)\n")
+                    zaehler = "ENCRYPTED_SKIPPED"
+                else:
+                    pbar.write("  → ÜBERSPRUNGEN: Passwort erforderlich (keines der hinterlegten Passwörter passt).")
+                    zaehler = "PROTECTED_SKIPPED"
+                detail_logger.warning(
+                    f"Übersprungen (Passwort): {original_path} ({last_exception})")
                 if info_counters is not None:
-                    info_counters["PROTECTED_SKIPPED"] += 1
+                    info_counters[zaehler] += 1
                 return "SKIPPED", original_path
 
             pbar.write("  → ÜBERSPRUNGEN: Zugriff verweigert (wird beim nächsten Lauf erneut versucht).")
             detail_logger.warning(
-                f"Übersprungen (kein Zugriff, voruebergehend): {original_path}")
+                f"Übersprungen (kein Zugriff, voruebergehend): {original_path}"
+                f" ({last_exception})")
             if info_counters is not None:
                 info_counters["LOCKED_SKIPPED"] += 1
             return "SKIPPED_TRANSIENT", original_path
@@ -2838,29 +3058,29 @@ def end_compatibility_mode(
         except Exception as _e:
             detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
 
-        # --- Bearbeitungsschutz aufheben ---
+        # --- Bearbeitungsschutz: NICHT aufheben ---
+        # Frueher stand hier doc.Unprotect() (ohne und mit jedem hinterlegten
+        # Kennwort). Der Schutz wurde danach nie wieder gesetzt: Formular-,
+        # Kommentar-, Nur-Lesen- und Aenderungsnachverfolgungsschutz gingen
+        # mit dem SaveAs2 stillschweigend verloren. Fuer den Zweck dieses
+        # Skripts ist das nicht noetig: SaveAs2 speichert geschuetzte
+        # Dokumente (der Schutz beschraenkt das Bearbeiten, nicht das
+        # Speichern) und hebt den Kompatibilitaetsmodus ueber seinen
+        # Parameter CompatibilityMode an. Zudem machte Unprotect() das
+        # Dokument 'geaendert' (Saved=False) - jede geschuetzte, laengst
+        # aktuelle Datei galt dadurch als 'Word-Auto-Reparatur' und wurde
+        # neu gespeichert. Schutz entfernen ist Aufgabe von 2a, nicht von 3a.
+        # Der Schutztyp wird nur gemerkt, damit nach dem Speichern geprueft
+        # werden kann, ob der Modus trotz Schutz angehoben wurde.
+        protection_type = -1
         try:
-            if doc.ProtectionType != -1:
-                unprotect_succeeded = False
-                try:
-                    doc.Unprotect()
-                    unprotect_succeeded = True
-                except Exception:
-                    for pw in passwords:
-                        try:
-                            doc.Unprotect(pw)
-                            unprotect_succeeded = True
-                            detail_logger.debug(
-                                "Bearbeitungsschutz mit bekanntem Passwort entfernt.")
-                            break
-                        except Exception as _e:
-                            detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
-                if not unprotect_succeeded:
-                    detail_logger.warning(
-                        f"Bearbeitungsschutz konnte nicht entfernt werden "
-                        f"(kein passendes Passwort): {original_path}")
+            protection_type = doc.ProtectionType
         except Exception as _e:
             detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
+        if protection_type != -1:
+            detail_logger.info(
+                f"Bearbeitungsschutz (Typ {protection_type}) bleibt erhalten: "
+                f"{original_path}")
 
         # --- Migration-First: doc.Convert() ---
         needs_convert_call = (
@@ -3025,6 +3245,22 @@ def end_compatibility_mode(
             else:
                 raise
 
+        # Geschuetztes Dokument: pruefen, ob SaveAs2 den Modus trotz Schutz
+        # angehoben hat (frueher war der Schutz an dieser Stelle schon
+        # entfernt). Nur Protokoll - das Ergebnis bleibt gueltig, denn die
+        # Datei ist neu serialisiert und der Schutz erhalten. Vom
+        # Auftraggeber an Office zu bestaetigen (kein Office im Pruefstand).
+        if protection_type != -1:
+            try:
+                mode_after = doc.CompatibilityMode
+                if mode_after is not None and mode_after < max_compat_mode:
+                    detail_logger.warning(
+                        f"Geschuetztes Dokument: Modus nach SaveAs2 {mode_after} "
+                        f"< {max_compat_mode} (Schutz Typ {protection_type}): "
+                        f"{original_path}")
+            except Exception as _e:
+                detail_logger.debug(f"end_compatibility_mode: Exception verworfen: {_e!r}")
+
         doc.Close(SaveChanges=COM_FALSE)
         doc = None
         time.sleep(0.3)
@@ -3060,6 +3296,7 @@ def end_compatibility_mode(
                 os.close(fd)
                 reserviert_direkt = True
                 target_was_reserved = True
+                target_touched = True
             except FileExistsError:
                 pass
             except OSError as e_res:
@@ -3075,6 +3312,7 @@ def end_compatibility_mode(
                     )
                 target_path = reserved
                 target_was_reserved = True
+                target_touched = True
                 pbar.write(
                     f"  ⚠  Ziel existiert bereits – speichere als "
                     f"'{os.path.basename(target_path)}'"
@@ -3118,6 +3356,9 @@ def end_compatibility_mode(
             is_temp_copy = False
 
         # --- Konvertierte Datei an den Zielort verschieben ---
+        # Ab hier kann die Zieldatei veraendert sein - auch wenn robust_move
+        # scheitert (Cross-Volume-Rueckfall schreibt in Etappen).
+        target_touched = True
         if not robust_move(temp_save_path, target_path):
             raise Exception("Verschieben der konvertierten Datei fehlgeschlagen")
         temp_save_path = None
@@ -3201,7 +3442,8 @@ def end_compatibility_mode(
                     "    ⚠ KRITISCH: Rollback fehlgeschlagen! "
                     "Backup-Datei aus Sicherheitsgründen bewahrt."
                 )
-        elif not backup_path and target_path and safe_exists(target_path) \
+        elif not backup_path and target_touched and target_path \
+                and safe_exists(target_path) \
                 and target_path.lower() != original_path.lower():
             safe_remove(target_path)
             pbar.write("    → Korruptes Dateifragment nach Abbruch sicher entfernt.")
@@ -3687,15 +3929,18 @@ if __name__ == "__main__":
     # angeboten und nach vollstaendigem Lauf geloescht.
     resume_file       = args.resume
     auto_resume_owned = False
-    # Im Probelauf wird KEINE Resume-Datei verwendet oder geschrieben -
-    # ein Dry-Run soll den echten Lauf nicht praejudizieren.
-    if args.dry_run:
-        resume_file = None
     if not auto_mode and not args.dry_run:
         args.dry_run = ask_yes_no(
             "\nProbelauf (Dry-Run)? Es wird geprüft, aber NICHTS gespeichert.\n"
             "  (Empfohlen vor dem ersten Echt-Lauf auf einer neuen Ablage)"
         )
+    # Im Probelauf wird KEINE Resume-Datei verwendet oder geschrieben -
+    # ein Dry-Run soll den echten Lauf nicht praejudizieren. Steht NACH der
+    # Frage: davor war args.dry_run im interaktiven Modus noch False, und
+    # ein per --resume uebergebener Pfad wurde im Probelauf gelesen und
+    # fortgeschrieben (ALREADY_CURRENT/SKIPPED galten danach als erledigt).
+    if args.dry_run:
+        resume_file = None
 
     if resume_file is None and not args.dry_run and not auto_mode:
         candidate = get_auto_resume_path(start_dir, log_dir)
@@ -3860,7 +4105,12 @@ if __name__ == "__main__":
         print("=" * 66)
 
         if not auto_mode:
-            print("\n⚠ WARNUNG: Alle offenen Word-Fenster werden OHNE SPEICHERN geschlossen!")
+            # Seit 29.09.2026 beendet das Skript nur noch seine EIGENE
+            # Word-Instanz (PID + Erstellungszeit), nie die Sitzung des
+            # Anwenders - die fruehere Warnung "alle Word-Fenster werden
+            # ohne Speichern geschlossen" traf nicht mehr zu.
+            print("\nHinweis: Das Skript beendet nur seine eigene Word-Instanz. "
+                  "Bitte waehrend des Laufs trotzdem kein Word starten.")
             if not ask_yes_no("\nJetzt starten?"):
                 print("Abgebrochen.")
                 sys.exit(0)

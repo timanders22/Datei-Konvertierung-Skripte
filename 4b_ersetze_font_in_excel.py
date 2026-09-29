@@ -1897,6 +1897,42 @@ def is_locked_by_other(path: str) -> bool:
         return False
 
 
+def _verwaiste_besitzerdatei_entfernen(path: str) -> None:
+    """Entfernt die Office-Besitzerdatei '~$<name>' neben path, die eine
+    getoetete Excel-Instanz hinterlassen hat. Ohne das meldete
+    is_locked_by_other die Mappe in Versuch 2 und in jedem Folgelauf als
+    'in Excel geöffnet'. Eine von einer lebenden Excel-Sitzung offen-
+    gehaltene Besitzerdatei laesst sich nicht loeschen (Freigabeverletzung)
+    und bleibt unangetastet. Kein _av_safe_remove: dessen Wiederholungen
+    wuerden eine echte fremde Sperre nur abwarten."""
+    try:
+        d = os.path.dirname(path)
+        b = os.path.basename(path)
+        if not d or not b:
+            return
+        besitzer = prepare_long_path(os.path.join(d, "~$" + b))
+        if not os.path.exists(besitzer):
+            return
+        try:
+            os.chmod(besitzer, stat.S_IWRITE)
+        except Exception as _e:
+            detail_logger.debug(f"_verwaiste_besitzerdatei_entfernen: {_e!r}")
+        os.remove(besitzer)
+        detail_logger.warning(f"Verwaiste Besitzerdatei entfernt: {os.path.join(d, '~$' + b)}")
+    except Exception as e:
+        detail_logger.warning(
+            f"Besitzerdatei nicht entfernbar (von Excel belegt?): "
+            f"{os.path.join(os.path.dirname(path), '~$' + os.path.basename(path))} – {e}")
+
+
+def _excel_antwortet(excel_app) -> bool:
+    try:
+        _ = excel_app.Version
+        return True
+    except Exception:
+        return False
+
+
 def dry_run_directory(directory: str) -> dict:
     """Listet auf, was der Echtlauf tun WUERDE - insbesondere welche
     .xls/.xlt konvertiert (und deren Originale ersetzt) wuerden.
@@ -2370,6 +2406,96 @@ def _workbook_has_real_macros(workbook) -> tuple:
     except Exception:
         return (True, False)
 
+
+# ==================================================================
+# XLM-Funktionen in definierten Namen (gleiche Regel wie 3b)
+# ==================================================================
+# Excel-4.0-Makrofunktionen (XLM) stehen nicht nur auf Makroblaettern,
+# sondern auch in definierten Namen - verbreitet fuer Blattlisten
+# (GET.WORKBOOK), Zellformat-Abfragen (GET.CELL) und Textformeln
+# (EVALUATE). Beim Speichern in ein makrofreies Format (.xlsx/.xltx)
+# nennt Excel sie als nicht speicherbar ("Excel 4.0-Funktionen, die in
+# definierten Namen gespeichert sind"); mit DisplayAlerts=False wird ohne
+# Rueckfrage makrofrei gespeichert, jede Zelle mit Bezug auf einen solchen
+# Namen zeigt danach #NAME?. Die VBA-Pruefung sieht davon nichts - Stage 1
+# muss solche .xls/.xlt deshalb wie VBA-Mappen als .xlsm/.xltm sichern.
+#
+# Auswahl der Muster (Gross/Klein egal):
+#   - GET.<...>(       alle XLM-Abfragefunktionen heissen GET.* (GET.CELL,
+#                      GET.WORKBOOK, GET.DOCUMENT, GET.WORKSPACE,
+#                      GET.FORMULA, GET.NAME, GET.DEF, GET.OBJECT,
+#                      GET.WINDOW, GET.NOTE, GET.LINK.INFO ...). Keine
+#                      Tabellenfunktion beginnt mit "GET." (GETPIVOTDATA
+#                      hat keinen Punkt).
+#   - <...>.ZUORDNEN(  deutsche Form derselben Familie (ZELLE.ZUORDNEN,
+#                      ARBEITSMAPPE.ZUORDNEN, DOKUMENT.ZUORDNEN ...); keine
+#                      Tabellenfunktion endet so.
+#   - einzeln          XLM-Funktionen ohne GET, die in Namen vorkommen und
+#                      KEINE gleichnamige Tabellenfunktion haben:
+#                      EVALUATE/AUSWERTEN, FILES/DATEIEN, DOCUMENTS/
+#                      DOKUMENTE, DIRECTORY/VERZEICHNIS, ACTIVE.CELL/
+#                      AKTIVE.ZELLE, CALLER/AUFRUFER, SELECTION, NAMES/
+#                      NAMEN, LINKS, WINDOWS, REFTEXT, TEXTREF, ABSREF,
+#                      RELREF, DEREF, CALL, REGISTER.ID.
+#                      Bewusst NICHT: CELL/ZELLE, INFO (Tabellenfunktionen).
+# Name.RefersTo liefert die Formel laut Dokumentation in der Makrosprache
+# (englisch); die deutschen Formen sind Absicherung. Sie stammen aus
+# Literatur/Foren, nicht aus einer Messung an diesem Rechner - ein
+# Fehlgriff kostet hoechstens .xlsm statt .xlsx, nie Daten. Vor dem Namen
+# darf kein Buchstabe, keine Ziffer, kein "_" und kein "." stehen.
+_XLM_IN_NAMEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_.À-ſ])"
+    r"(?:GET\.[A-Za-z0-9_.]+"
+    r"|[A-Za-zÀ-ſ][A-Za-z0-9_.À-ſ]*\.ZUORDNEN"
+    r"|EVALUATE|AUSWERTEN|FILES|DATEIEN|DOCUMENTS|DOKUMENTE"
+    r"|DIRECTORY|VERZEICHNIS|ACTIVE\.CELL|AKTIVE\.ZELLE|CALLER|AUFRUFER"
+    r"|SELECTION|NAMES|NAMEN|LINKS|WINDOWS|REFTEXT|TEXTREF|ABSREF|RELREF"
+    r"|DEREF|CALL|REGISTER\.ID)\(",
+    re.IGNORECASE,
+)
+
+# Name.MacroType: xlFunction = 1, xlCommand = 2 (xlNotXLM = 3). Ein Name
+# mit Typ 1/2 IST ein XLM-Makro (Makroblatt-Funktion bzw. -Befehl).
+_XL_NAME_MACRO_TYPES = (1, 2)
+
+
+def _name_text(nm, ersatz) -> str:
+    # getattr(..., Vorgabe) faengt nur AttributeError, ein COM-Fehler
+    # beim Lesen kaeme durch - daher eigenes try.
+    try:
+        return str(nm.Name)
+    except Exception:
+        return f"Nr. {ersatz}"
+
+
+def _hat_xlm_namen(workbook) -> tuple:
+    """(True, Grund), wenn ein definierter Name XLM-Funktionen nutzt oder
+    selbst ein XLM-Makro ist. Nicht lesbare Namen/Bezuege zaehlen
+    KONSERVATIV als Makro: ein unnoetiges .xlsm kostet nichts, ein
+    faelschliches .xlsx kostet die Formeln."""
+    try:
+        names  = workbook.Names
+        anzahl = int(names.Count)
+    except Exception as e:
+        return True, f"Namensliste nicht lesbar ({e!r})"
+    for i in range(1, anzahl + 1):
+        try:
+            nm = names.Item(i)
+        except Exception as e:
+            return True, f"Name Nr. {i} nicht lesbar ({e!r})"
+        try:
+            bezug = str(nm.RefersTo)
+        except Exception as e:
+            return True, f"Bezug von Name Nr. {i} nicht lesbar ({e!r})"
+        if _XLM_IN_NAMEN_RE.search(bezug):
+            return True, f"XLM-Funktion in Name '{_name_text(nm, i)}'"
+        try:
+            if int(nm.MacroType) in _XL_NAME_MACRO_TYPES:
+                return True, f"Name '{_name_text(nm, i)}' ist ein XLM-Makro"
+        except Exception as _e:
+            detail_logger.debug(f"_hat_xlm_namen: MacroType nicht lesbar: {_e!r}")
+    return False, ""
+
 # ==================================================================
 # Schriftart-Ersetzung + Metadaten  (Kern-Routine)
 # ==================================================================
@@ -2406,6 +2532,14 @@ def replace_fonts_in_workbook(
     # Original ueberschrieben. Schuetzt vor Datenverlust bei Crash
     # (Watchdog-Kill, Netzwerk-Drop, COM-Fehler) waehrend Save.
     temp_stage2_path    = None
+    # True, sobald Stage 1 per SaveAs DIREKT auf new_path (Freigabe)
+    # schreibt - auch wenn dieser SaveAs selbst abbricht, kann dort schon
+    # eine (halbe) Datei liegen. Siehe Aufraeumen im except.
+    stage1_gestartet    = False
+    # True, wenn die Mappe schreibend direkt von der Ablage geoeffnet wurde
+    # (keine Temp-Kopie): dann legt Excel dort die Besitzerdatei '~$<name>'
+    # an, die nach einem Watchdog-Kill liegen bleibt.
+    direkt_geoeffnet    = False
     _lp_cleanup_handled = False
     _orig_calc          = XL_CALC_AUTO
     had_protected_sheet = False
@@ -2489,6 +2623,7 @@ def replace_fonts_in_workbook(
             detail_logger.debug(f"Schreibschutz nicht änderbar: {e_chmod}")
 
     try:
+        direkt_geoeffnet = not is_temp_copy
         workbook = safe_excel_open(
             excel_app,
             file_path,
@@ -2537,6 +2672,18 @@ def replace_fonts_in_workbook(
                             detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
                 except Exception as _e:
                     detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
+
+            # XLM in definierten Namen (GET.CELL, EVALUATE ...) - siehe
+            # _hat_xlm_namen. Frueher nur VBA und Makroblaetter geprueft:
+            # solche .xls wurden .xlsx, die Namen fielen weg (#NAME?).
+            if not has_macros:
+                _xlm_namen, _xlm_grund = _hat_xlm_namen(workbook)
+                if _xlm_namen:
+                    has_macros = True
+                    detail_logger.info(
+                        f"XLM in definierten Namen ({_xlm_grund}) → "
+                        f"Speichere als Makro-Format: {original_path}")
+                    pbar.write(f"  ⚠  {_xlm_grund} → Makroformat")
 
             if ext == ".xlt":
                 new_format = XL_FORMAT_XLTM if has_macros else XL_FORMAT_XLTX
@@ -2589,6 +2736,7 @@ def replace_fonts_in_workbook(
                 file_path    = temp_stage1_path
                 is_temp_copy = False
             else:
+                stage1_gestartet = True
                 safe_excel_save(
                     excel_app,
                     lambda: workbook.SaveAs(
@@ -2977,6 +3125,10 @@ def replace_fonts_in_workbook(
             bak_path  = prepare_long_path(
                 original_path + f"_{uuid.uuid4().hex[:6]}.bak")
             bak_created = False
+            # Erst nach bestandener Pruefung gilt die zurueckgeschobene Datei
+            # als fertig; ein Abbruch danach (etwa Strg+C beim Loeschen des
+            # .bak) darf sie nicht mehr durch das alte Original ersetzen.
+            rueck_bestaetigt = False
             try:
                 if os.path.exists(safe_orig):
                     os.chmod(safe_orig, stat.S_IWRITE)
@@ -2988,6 +3140,7 @@ def replace_fonts_in_workbook(
                 if not verify_saved_file(safe_orig):
                     raise RuntimeError(
                         f"Zurückverschobene Datei nicht valide: {original_path}")
+                rueck_bestaetigt = True
 
                 detail_logger.debug("Temp-Datei zurückverschoben")
                 is_temp_copy = False
@@ -3000,16 +3153,32 @@ def replace_fonts_in_workbook(
             # BaseException wie in Block 5.5: sonst ueberspringt ein Strg+C
             # mitten im Move die Wiederherstellung aus dem .bak.
             except BaseException as e_move:
-                if bak_created and not os.path.exists(safe_orig):
+                # Frueher: "and not os.path.exists(safe_orig)". Genau im
+                # gefaehrlichen Fall existiert safe_orig aber: shutil.move
+                # (_av_safe_move) faellt ueber Laufwerksgrenzen (Temp lokal,
+                # Ziel auf der Freigabe) auf copy2 zurueck und legt das Ziel
+                # sofort an - ein Abbruch mittendrin oder eine ungueltige
+                # Kopie (verify_saved_file) hinterliess eine halbe Datei am
+                # Originalpfad, das intakte Original blieb als '<name>_xxxxxx.bak'
+                # liegen und fiel unter SKIP_FILE_SUFFIXES aus jedem Folgelauf.
+                # Jetzt wie Block 5.5: halbe Datei entfernen, .bak zurueck.
+                if bak_created and not rueck_bestaetigt and os.path.exists(bak_path):
                     try:
+                        if os.path.exists(safe_orig):
+                            _av_safe_remove(safe_orig)
                         _av_safe_replace(bak_path, safe_orig)
                         bak_created = False
                         detail_logger.warning(
-                            "Zurückschieben fehlgeschlagen – Original aus Backup wiederhergestellt")
+                            f"Zurückschieben fehlgeschlagen – Original aus Backup "
+                            f"wiederhergestellt: {original_path} (Backup war: {bak_path})")
                     except Exception as e_restore:
                         detail_logger.error(
                             f"Original konnte NICHT aus Backup wiederhergestellt werden: {e_restore}\n"
                             f"  Backup liegt unter: {bak_path}")
+                        pbar.write(f"  ⚠  Original liegt als Backup: {bak_path}")
+                elif bak_created and os.path.exists(bak_path):
+                    detail_logger.warning(
+                        f"Backup-Datei bleibt liegen (Rueckschieben war bestaetigt): {bak_path}")
                 rescue_ext  = os.path.splitext(os.path.basename(original_path))[1]
                 rescue_name = f"RESCUE_{uuid.uuid4().hex}{rescue_ext}"
                 rescue_path = os.path.join(TEMP_PROCESS_PATH, rescue_name)
@@ -3091,24 +3260,33 @@ def replace_fonts_in_workbook(
         detail_logger.info(f"Erfolgreich: {original_path}")
         return "PARTIAL" if had_protected_sheet else "SUCCESS"
 
-    except TimeoutError as e_timeout:
-        pbar.write(f"  ✗  TIMEOUT: {os.path.basename(original_path)}")
-        detail_logger.error(f"Timeout: {original_path} → {e_timeout}")
-        log_error(original_path, e_timeout)
-        return "ERROR"
-
+    # Frueher stand hier ein eigenes "except TimeoutError: return 'ERROR'"
+    # VOR diesem Zweig. Damit lief ausgerechnet beim Watchdog-Kill das
+    # Aufraeumen unten nie: bei .xls blieb die unfertige Stage-1-Datei
+    # '<name>.xlsx' liegen (Folgelauf wich auf '<name>_1.xlsx' aus), und
+    # bei direkt geoeffneten Mappen blieb Excels Besitzerdatei '~$<name>'
+    # liegen - Versuch 2 und JEDER Folgelauf meldeten die Mappe dann als
+    # "in Excel geöffnet" (is_locked_by_other). TimeoutError ist eine
+    # Exception und landet jetzt hier.
     except Exception as e:
         err_msg = str(e).lower()
+        ist_timeout = isinstance(e, TimeoutError)
 
-        is_password_error = any(kw in err_msg for kw in (
-            "password", "passwort", "kennwort",
-            "protected", "geschützt",
-        ))
-
-        if is_password_error:
-            pbar.write(f"  →  ÜBERSPRUNGEN (Passwort): {os.path.basename(original_path)}")
-            detail_logger.info(f"Übersprungen (Passwort): {original_path}")
-            return "SKIPPED"
+        # Mappe VOR dem Aufraeumen schliessen: nach Stage 1 ist new_path die
+        # in Excel offene Datei, Excel haelt sie ohne Loeschfreigabe - das
+        # Entfernen unten scheiterte bei jedem Nicht-Timeout-Fehler an der
+        # eigenen Sperre (das finally schloss erst danach). Nach einem Kill
+        # schlaegt Close still fehl; das ist gleichgueltig.
+        if workbook is not None:
+            try:
+                excel_app.Calculation = _orig_calc
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
+            try:
+                workbook.Close(SaveChanges=COM_FALSE)
+            except Exception as _e:
+                detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
+            workbook = None
 
         # Bereits geschriebene, aber nie gepruefte Zieldatei entfernen.
         # Bei .xls/.xlt schreibt Stage 1 new_path auf die Freigabe, BEVOR
@@ -3119,7 +3297,13 @@ def replace_fonts_in_workbook(
         # aus und loeschte am Ende das Original: der Anwender hatte zwei
         # Zieldateien, von denen nur eine brauchbar war, und die verwaiste
         # stand in keinem Protokoll. Das Original wird hier NICHT angetastet.
-        if (was_converted and new_path and not is_temp_copy
+        # stage1_gestartet: auch ein im SaveAs selbst abgebrochener Stage-1-
+        # Schritt kann dort schon eine halbe Datei hinterlassen haben; der
+        # Name war vorher frei (Kollisionspruefung), sie ist also unsere.
+        # Dieses Aufraeumen steht jetzt VOR der Kennwort-Erkennung: eine
+        # Meldung mit "geschützt"/"protected" (z. B. geschuetztes Blatt)
+        # nach Stage 1 fuehrte frueher zu SKIPPED ohne Aufraeumen.
+        if ((was_converted or stage1_gestartet) and new_path and not is_temp_copy
                 and new_path.lower() != original_path.lower()
                 and os.path.exists(prepare_long_path(new_path))):
             try:
@@ -3134,6 +3318,34 @@ def replace_fonts_in_workbook(
                 detail_logger.warning(
                     f"Unfertige Zieldatei nach Abbruch entfernt: {new_path}")
                 pbar.write(f"  ↺  Unfertige Zieldatei entfernt: {os.path.basename(new_path)}")
+
+        # Besitzerdatei '~$<name>' der getoeteten Instanz entfernen. Nur
+        # wenn Excel nicht mehr antwortet (Kill/Absturz) und die Mappe
+        # direkt von der Ablage geoeffnet war. Beim Start dieser Funktion
+        # gab es fuer original_path keine (is_locked_by_other oben), sie
+        # stammt also von uns; eine von einer LEBENDEN Excel-Sitzung
+        # offengehaltene Besitzerdatei laesst sich nicht loeschen und
+        # bleibt dann unangetastet.
+        if direkt_geoeffnet and (ist_timeout or not _excel_antwortet(excel_app)):
+            _verwaiste_besitzerdatei_entfernen(original_path)
+            if (was_converted or stage1_gestartet) and new_path:
+                _verwaiste_besitzerdatei_entfernen(new_path)
+
+        if ist_timeout:
+            pbar.write(f"  ✗  TIMEOUT: {os.path.basename(original_path)}")
+            detail_logger.error(f"Timeout: {original_path} → {e}")
+            log_error(original_path, e)
+            return "ERROR"
+
+        is_password_error = any(kw in err_msg for kw in (
+            "password", "passwort", "kennwort",
+            "protected", "geschützt",
+        ))
+
+        if is_password_error:
+            pbar.write(f"  →  ÜBERSPRUNGEN (Passwort): {os.path.basename(original_path)}")
+            detail_logger.info(f"Übersprungen (Passwort): {original_path}")
+            return "SKIPPED"
 
         log_error(original_path, e)
         pbar.write(f"  ✗  FEHLER: {os.path.basename(original_path)}")
@@ -3382,6 +3594,21 @@ def process_directory(
                 # Datei-Verarbeitung mit Retry
                 result = "ERROR"
                 for attempt in range(FILE_PROCESSING_ATTEMPTS):
+                    # Vor der Wiederholung lebt Excel nach einem Timeout
+                    # nicht mehr (Watchdog-Kill). Frueher lief Versuch 2
+                    # gegen die tote Instanz und scheiterte sicher; der
+                    # Lebendtest oben greift erst bei der NAECHSTEN Datei.
+                    if attempt > 0 and not _excel_antwortet(excel):
+                        pbar.write("  ↻  Excel antwortet nicht – starte neu vor Wiederholung ...")
+                        detail_logger.warning(
+                            "Excel vor Wiederholung tot (Timeout/Absturz) – Neustart")
+                        try:
+                            _kill_specific_excel()
+                            _start_excel()
+                        except Exception as e_retry_start:
+                            log_error(file_path, e_retry_start)
+                            result = "ERROR"
+                            break
                     try:
                         result = replace_fonts_in_workbook(
                             file_path, excel, pbar, font_name,
@@ -3740,6 +3967,20 @@ if __name__ == "__main__":
         signal.signal(signal.SIGTERM, _signal_handler)
     except Exception:
         pass
+    # SIGBREAK wie in 3b: Strg+Pause kommt unter Windows als SIGBREAK, nicht
+    # als SIGINT - ohne Handler endete der Prozess sofort, _restore_com_addins
+    # lief nie und die per Connect=False dauerhaft (LoadBehavior in HKCU)
+    # abgeschalteten COM-Add-Ins blieben aus. Die Laufzeitbibliothek meldet
+    # auch das Schliessen des Konsolenfensters als SIGBREAK; dort gibt
+    # Windows dem Prozess aber nur wenige Sekunden und beendet ihn, sobald
+    # der Konsolen-Handler zurueckkehrt - der Python-Handler kommt dann
+    # meist nicht mehr zum Zug. Fuer das Fensterschliessen ist das also nur
+    # ein Versuch, kein Schutz.
+    if hasattr(signal, "SIGBREAK"):
+        try:
+            signal.signal(signal.SIGBREAK, _signal_handler)
+        except Exception as _e:
+            detail_logger.debug(f"SIGBREAK-Handler nicht setzbar: {_e!r}")
 
     # --- Einzelinstanz-Schutz ---
     # Diese Sperre gab es bisher nur in 3a-3c. Ohne sie konnten zwei

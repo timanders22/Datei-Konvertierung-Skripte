@@ -24,6 +24,14 @@
       und bricht bei Fehlschlag ab (bzw. fragt interaktiv nach), um stunden-
       lange Timeouts pro Datei zu vermeiden.
 
+    PowerPoint muss geschlossen sein:
+      PowerPoint ist ein Einzelinstanz-COM-Server. Laeuft beim Start bereits
+      ein POWERPNT-Prozess (auch ohne Fenster), arbeitet das Skript nicht per
+      COM: interaktiv wird nach dem Schliessen erneut geprueft, mit
+      -NoInteractive endet der Lauf mit Exitcode 3. Waehrend des Laufs
+      PowerPoint nicht starten - erkennt ein Job eine fremde Instanz, bricht
+      der Lauf ebenfalls mit Exitcode 3 ab.
+
     Hinweis zu Passwoertern in PowerPoint:
       Anders als Word.Documents.Open und Excel.Workbooks.Open akzeptiert
       PowerPoint.Presentations.Open KEINEN Password-Parameter. Verschluesselte
@@ -217,6 +225,8 @@ $script:AvStableDelayMs        = 350
 $script:Utf8Bom = New-Object System.Text.UTF8Encoding($true)
 
 $script:ShouldStop      = $false
+# Gesetzt, sobald ein COM-Job eine PowerPoint-Sitzung des Anwenders erkennt.
+$script:FremdePptAbbruch = $false
 $script:UseProgress     = $false
 $script:SkipPreScan     = $false
 $script:TotalFiles      = 0
@@ -243,7 +253,10 @@ $script:PptConstants = @{
     ppSaveAsOpenXMLShowMacroEnabled         = 29
     msoTrue                                 = -1
     ppWindowMinimized                       =  2
-    ppAlertsNone                            =  2
+    # 1, nicht 2: laut Typbibliothek (MSPPT.OLB, PpAlertLevel) ist
+    # ppAlertsNone = 1 und ppAlertsAll = 2. Mit 2 wurden Warnungen also
+    # gerade NICHT unterdrueckt (3c, 4c, 7 und 9 setzen 1).
+    ppAlertsNone                            =  1
     msoFeatureInstallNone                   =  0
     msoAutomationSecurityForceDisable       =  3
 }
@@ -395,86 +408,78 @@ function Write-CsvLog {
     } catch {}
 }
 
-function Get-RunningOfficeSessions {
+function Get-PowerPointProzesseSitzung {
     <#
-        Liefert Office-Prozesse mit sichtbarem Hauptfenster, also echte
-        Sitzungen des Anwenders - im Unterschied zu unsichtbaren
-        Automatisierungs-Instanzen.
+        Alle POWERPNT-Prozesse der eigenen Windows-Sitzung - MIT und OHNE
+        sichtbares Fenster.
+
+        Frueher zaehlten nur Prozesse mit Hauptfenster. Eine Instanz ohne
+        Fenster (Rest eines abgebrochenen Laufs, Vorschau, Add-in-Host)
+        uebernimmt 'New-Object -ComObject PowerPoint.Application' aber genauso.
+        Prozesse anderer Sitzungen (Terminalserver) bleiben aussen vor: COM
+        verbindet nur mit Klassenobjekten der eigenen Anmeldesitzung (nicht
+        gemessen, hier nur Schutz vor einem Dauer-Abbruch auf Mehrbenutzer-
+        Rechnern).
     #>
-    param([string[]]$ProcessNames = @('POWERPNT'))
-    $found = @()
-    foreach ($n in $ProcessNames) {
-        try {
-            $found += @(Get-Process -Name $n -ErrorAction SilentlyContinue |
-                        Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero })
-        } catch { }
-    }
-    return ,@($found)
+    $sid = -1
+    try { $sid = (Get-Process -Id $PID -ErrorAction Stop).SessionId } catch {}
+    return ,@(Get-Process -Name 'POWERPNT' -ErrorAction SilentlyContinue |
+              Where-Object { $sid -lt 0 -or $_.SessionId -eq $sid })
 }
 
-function Show-OfficeRunningWarning {
+function Confirm-PowerPointGeschlossen {
     <#
-        Weist vor dem ersten COM-Zugriff auf bereits laufende Sitzungen hin.
+        Vor dem ersten COM-Zugriff: laeuft PowerPoint, arbeitet das Skript
+        NICHT per COM.
 
-        PowerPoint wird per COM automatisiert. Laeuft bereits eine Sitzung des
-        Anwenders, hat das zwei Auswirkungen:
-          1. Die Automatisierung kann sich an die vorhandene Sitzung haengen.
-             Warnhinweise werden dann abgeschaltet und das Fenster
-             ausgeblendet - fuer den Anwender sieht das aus wie ein Absturz.
-          2. Die eigene Instanz laesst sich beim Aufraeumen nicht mehr
-             zuverlaessig von der fremden unterscheiden.
+        PowerPoint ist ein Einzelinstanz-COM-Server. Vom Auftraggeber
+        gemessen (29.09.2026): laeuft eine Sitzung des Anwenders, liefert
+        'New-Object -ComObject PowerPoint.Application' genau diese Sitzung,
+        und ihr HWND fuehrt auf ihre PID. Die fruehere Fassung dieser Funktion
+        (Show-OfficeRunningWarning) versprach "Ihre Sitzung wird NICHT
+        beendet" und liess mit -NoInteractive einfach weiterlaufen ("sie
+        werden geschuetzt") - tatsaechlich hielt das Skript die fremde PID fuer
+        die eigene, schloss die Sitzung per Quit() bzw. per Stop-Process
+        -Force im Timeout-Zweig und verstellte DisplayAlerts und WindowState.
 
-        Die Sitzung wird NICHT beendet - dafuer sorgt die PID-Bindung an
-        den Quit-Stellen. Ein sauberer Lauf setzt aber ein geschlossenes
-        Office voraus.
-
-        Rueckgabe: $true = fortfahren, $false = Anwender bricht ab.
+        Interaktiv: Hinweis, nach Enter erneut pruefen, 'A' bricht ab.
+        -NoInteractive oder umgeleitete Eingabe: sofort $false (Abbruch).
+        Rueckgabe: $true = kein PowerPoint aktiv, $false = abbrechen.
     #>
-    param([switch]$Silent)
+    param([switch]$NoInteractive)
 
-    $sessions = Get-RunningOfficeSessions
-    if ($sessions.Count -eq 0) { return $true }
+    while ($true) {
+        $procs = Get-PowerPointProzesseSitzung
+        if ($procs.Count -eq 0) { return $true }
+        $pids = ($procs | ForEach-Object { $_.Id }) -join ', '
 
-    $namen = ($sessions | ForEach-Object { $_.ProcessName } | Select-Object -Unique) -join ', '
-    $pids  = ($sessions | ForEach-Object { $_.Id }) -join ', '
+        Write-Host ""
+        Write-Host ("=" * 66) -ForegroundColor Yellow
+        Write-Host "  POWERPOINT LAEUFT (PID: $pids)" -ForegroundColor Yellow
+        Write-Host ("=" * 66) -ForegroundColor Yellow
+        Write-Host "  PowerPoint laesst sich nur einmal starten. Das Skript wuerde"
+        Write-Host "  sich an diese Sitzung haengen und sie beim Aufraeumen"
+        Write-Host "  schliessen - ungespeicherte Praesentationen gingen verloren."
+        Write-Host "  Deshalb arbeitet es nicht, solange PowerPoint laeuft."
+        Write-Host ""
+        Write-Host "  Bitte PowerPoint vollstaendig beenden. Eine Instanz ohne Fenster"
+        Write-Host "  (POWERPNT.EXE) im Task-Manager beenden."
+        Write-Host "  Waehrend des Laufs PowerPoint NICHT starten."
+        Write-Host ("=" * 66) -ForegroundColor Yellow
+        Write-Host ""
 
-    if ($Silent) {
-        Write-Warning "Laufende Office-Sitzungen erkannt ($namen, PID: $pids) - sie werden geschuetzt, aber nicht geschlossen."
-        return $true
+        # Ohne echte Konsole NICHT fragen. Read-Host blockiert dort unbegrenzt
+        # (Aufgabenplanung mit angehaengter Konsole) oder liefert sofort leer.
+        # Massgeblich ist die tatsaechliche Eingabefaehigkeit, nicht der
+        # Hostname (ps2exe meldet 'PSRunspace-Host').
+        $kannFragen = $false
+        try { $kannFragen = -not [Console]::IsInputRedirected } catch { $kannFragen = $false }
+        if ($NoInteractive -or -not $kannFragen) {
+            return $false
+        }
+        $antwort = Read-Host "PowerPoint schliessen, dann Enter = erneut pruefen, A = Abbruch"
+        if ($antwort -match '^\s*[AaNn]') { return $false }
     }
-
-    Write-Host ""
-    Write-Host ("=" * 66) -ForegroundColor Yellow
-    Write-Host "  WARNUNG: Office laeuft bereits" -ForegroundColor Yellow
-    Write-Host ("=" * 66) -ForegroundColor Yellow
-    Write-Host "  Gefundene Sitzungen: $namen (PID: $pids)"
-    Write-Host ""
-    Write-Host "  Ihre Sitzung wird vom Skript NICHT beendet. Waehrend des Laufs"
-    Write-Host "  kann sie aber ausgeblendet werden und Warnhinweise sind"
-    Write-Host "  abgeschaltet - das wirkt wie ein Absturz."
-    Write-Host "  Ausserdem laesst sich die eigene Automatisierungs-Instanz dann"
-    Write-Host "  nicht mehr zuverlaessig von Ihrer Sitzung unterscheiden."
-    Write-Host ""
-    Write-Host "  EMPFEHLUNG: Office jetzt schliessen und das Skript neu starten." -ForegroundColor Yellow
-    Write-Host ("=" * 66) -ForegroundColor Yellow
-    Write-Host ""
-    # Ohne echte Konsole NICHT fragen. Read-Host blockiert dort unbegrenzt
-    # (Aufgabenplanung mit angehaengter Konsole) oder liefert sofort leer -
-    # beides taugt nicht als Freigabe. Massgeblich ist die tatsaechliche
-    # Eingabefaehigkeit, nicht der Hostname (ps2exe meldet 'PSRunspace-Host').
-    $kannFragen = $false
-    try { $kannFragen = -not [Console]::IsInputRedirected } catch { $kannFragen = $false }
-    if (-not $kannFragen) {
-        Write-Warning "Keine interaktive Konsole - Abbruch zum Schutz laufender Office-Sitzungen. Fuer den unbeaufsichtigten Betrieb -NoInteractive bzw. -Automated verwenden."
-        return $false
-    }
-
-    $answer = Read-Host "Trotzdem fortfahren? [j/N]"
-    if ($answer -notmatch '^[JjYy]') {
-        Write-Host "Abgebrochen. Bitte Office schliessen und neu starten." -ForegroundColor Cyan
-        return $false
-    }
-    return $true
 }
 
 function Confirm-Write {
@@ -482,6 +487,12 @@ function Confirm-Write {
         Zentrale Freigabe fuer jede schreibende Operation am Original.
         Das Skript kannte bisher gar kein -WhatIf; ein Probelauf auf einer
         fremden Ablage war damit nicht moeglich.
+
+        Wirft ShouldProcess, wird NICHT geschrieben. Vorher lieferte der
+        catch-Zweig $true - gemessen unter 5.1: mit -Confirm im
+        NonInteractive-Modus wirft ShouldProcess ("Lese- und
+        Eingabeaufforderungsfunktionen sind nicht verfuegbar"), und das
+        Skript schrieb dann jede Datei OHNE die verlangte Bestaetigung.
     #>
     param(
         [string]$Target,
@@ -491,27 +502,49 @@ function Confirm-Write {
     try {
         return $script:ScriptCmdlet.ShouldProcess($Target, $Action)
     } catch {
-        return $true
+        if (-not $script:ConfirmFehlerGemeldet) {
+            $script:ConfirmFehlerGemeldet = $true
+            Write-Warning "Bestaetigung nicht moeglich ($($_.Exception.Message)) - es wird NICHTS geschrieben."
+        }
+        Write-Log "Bestaetigung nicht moeglich, nicht geschrieben: $Target [$Action] - $($_.Exception.Message)" "WARN"
+        return $false
     }
 }
 
 # ==================================================================
-# ABBRUCH-HANDLER
+# ABBRUCH PER TASTE (Strg+C / ESC)
 # ==================================================================
-try {
-    if ($Host.Name -eq 'ConsoleHost') {
-        [Console]::TreatControlCAsInput = $false
-        [Console]::add_CancelKeyPress([System.ConsoleCancelEventHandler]{
-            param($sender, $e)
-            $e.Cancel = $true
-            Write-Host "`n!!  ABBRUCH angefordert - laufende Datei wird noch fertiggestellt..." -ForegroundColor Yellow
-            $script:ShouldStop = $true
-        })
-    }
-} catch {}
+# Kein [Console]::add_CancelKeyPress mehr: der dort registrierte Skriptblock
+# laeuft auf einem Threadpool-Thread ohne PowerShell-Runspace. Gemessen unter
+# 5.1 (Kindprozess, GenerateConsoleCtrlEvent, wortgleicher Handler, 4 von 4
+# Laeufen): ShouldStop wurde nie gesetzt, powershell.exe endete hart mit
+# Exitcode 2, und weder finally noch trap liefen - mitten im Rueckschreiben
+# haette das ein halbes Original hinterlassen. Stattdessen wie in 6 und 7:
+# Strg+C wird vor der Hauptschleife zur Eingabe (TreatControlCAsInput) und
+# dort zusammen mit ESC abgefragt (Test-AbortRequested).
+$script:CtrlCAsInput = $false
+$script:ConfirmFehlerGemeldet = $false
+
+function Test-AbortRequested {
+    if (-not $script:CtrlCAsInput) { return }
+    try {
+        while ([Console]::KeyAvailable) {
+            $key = [Console]::ReadKey($true)
+            $istStrgC = ($key.Key -eq [ConsoleKey]::C -and
+                         (($key.Modifiers -band [ConsoleModifiers]::Control) -ne 0))
+            if ($istStrgC -or $key.Key -eq [ConsoleKey]::Escape) {
+                if (-not $script:ShouldStop) {
+                    Write-Host "`n!!  ABBRUCH angefordert - laufende Datei wird noch fertiggestellt..." -ForegroundColor Yellow
+                }
+                $script:ShouldStop = $true
+            }
+        }
+    } catch {}
+}
 
 trap {
     Write-Warning "Unerwarteter Fehler: $_"
+    try { if ($script:CtrlCAsInput) { [Console]::TreatControlCAsInput = $false } } catch {}
     Start-Sleep -Milliseconds 200
     # Die Liste gehoert NICHT in die Bedingung: Sinn dieses Blocks ist es
     # gerade, die PIDs aus den .pid-Dateien nachzutragen, wenn die Liste noch
@@ -726,9 +759,21 @@ function Test-FileIsLocked {
     $stream = $null
     try {
         if (-not [System.IO.File]::Exists($lp)) { return $false }
+        # Schreibgeschuetzte Dateien nur lesend oeffnen. ReadWrite wirft bei
+        # gesetztem ReadOnly-Attribut UnauthorizedAccessException (gemessen
+        # unter 5.1) - der Probelauf meldete jede solche Datei als "Zugriff
+        # verweigert", weil das Attribut dort nicht entfernt wird. Fuer die
+        # Sperrpruefung genuegt FileShare.None: jeder fremde Handle laesst
+        # auch den lesenden Open scheitern.
+        $zugriff = [System.IO.FileAccess]::ReadWrite
+        try {
+            if ([System.IO.File]::GetAttributes($lp) -band [System.IO.FileAttributes]::ReadOnly) {
+                $zugriff = [System.IO.FileAccess]::Read
+            }
+        } catch {}
         $stream = [System.IO.File]::Open($lp,
                        [System.IO.FileMode]::Open,
-                       [System.IO.FileAccess]::ReadWrite,
+                       $zugriff,
                        [System.IO.FileShare]::None)
         return $false
     } catch [System.UnauthorizedAccessException] {
@@ -737,6 +782,28 @@ function Test-FileIsLocked {
         return $true
     } finally {
         if ($stream) { try { $stream.Close() } catch {} }
+    }
+}
+
+function Clear-ReadOnlyAttribut {
+    # Entfernt nur das ReadOnly-Bit. $true = war gesetzt und ist entfernt.
+    param([string]$LongPath)
+    try {
+        $a = [System.IO.File]::GetAttributes($LongPath)
+        if (-not ($a -band [System.IO.FileAttributes]::ReadOnly)) { return $false }
+        [System.IO.File]::SetAttributes($LongPath, $a -band (-bnot [System.IO.FileAttributes]::ReadOnly))
+        return $true
+    } catch { return $false }
+}
+
+function Set-ReadOnlyAttribut {
+    # Setzt das ReadOnly-Bit wieder (Rollback: Original unveraendert zurueck).
+    param([string]$LongPath)
+    try {
+        $a = [System.IO.File]::GetAttributes($LongPath)
+        [System.IO.File]::SetAttributes($LongPath, $a -bor [System.IO.FileAttributes]::ReadOnly)
+    } catch {
+        Write-DetailedLog "ReadOnly-Attribut nicht wiederherstellbar: $LongPath - $_" "WARN"
     }
 }
 
@@ -922,6 +989,91 @@ function Clear-TrackedPowerPointInstances {
     $script:TrackedPptPids.Clear()
 }
 
+function Wait-TrackedPowerPointExit {
+    <#
+        Vor jedem COM-Job: eigene, bereits per Quit() beendete Instanzen
+        laufen oft noch einen Moment weiter. Der naechste Job erfasst vor
+        New-Object alle vorhandenen POWERPNT-Prozesse als fremd - ein noch
+        auslaufender eigener Prozess wuerde dort als Sitzung des Anwenders
+        gelten und den Lauf grundlos abbrechen. Daher bis zu $TimeoutSec
+        warten und Reste danach beenden - nur eigene (Name + Startzeit).
+    #>
+    param([int]$TimeoutSec = 10)
+    if ($script:TrackedPptPids.Count -eq 0) { return }
+    $bis = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $bis) {
+        $lebend = @($script:TrackedPptPids | Select-Object -Unique |
+                    Where-Object { Test-IsOwnPptProcess -ProcessId $_ })
+        if ($lebend.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    Clear-TrackedPowerPointInstances
+}
+
+# ==================================================================
+# EIGENE POWERPOINT-INSTANZ ERKENNEN (Code fuer die COM-Jobs)
+# ==================================================================
+# PowerPoint ist ein Einzelinstanz-COM-Server: laeuft bereits eine Sitzung,
+# liefert 'New-Object -ComObject PowerPoint.Application' GENAU DIESE, und ihr
+# HWND fuehrt auf ihre PID (vom Auftraggeber gemessen, 29.09.2026). Die
+# frueheren Kommentare nahmen an, die PID bleibe dann leer - tatsaechlich
+# galt die Sitzung des Anwenders als eigene Instanz.
+# Deshalb erfasst jeder Job VOR New-Object die POWERPNT-Prozesse der eigenen
+# Sitzung. Gehoert das gelieferte Objekt zu einem davon (oder laesst es sich
+# nicht zuordnen), ist es NICHT die eigene Instanz: keine Eigenschaft wird
+# verstellt, kein Quit, keine PID-Datei, kein Kill - der Job meldet 'FREMD',
+# das Hauptskript bricht den Lauf ab.
+# Die Jobs laufen in eigenen Prozessen und sehen die Skriptfunktionen nicht;
+# der Code geht deshalb als Text an beide Jobs (Konvertierung, Smoke-Test) -
+# eine Quelle statt zwei Kopien.
+$script:PptInstanzCode = @'
+function Get-PptSitzungsPids {
+    $sid = -1
+    try { $sid = (Get-Process -Id $PID -ErrorAction Stop).SessionId } catch {}
+    return ,@(Get-Process -Name 'POWERPNT' -ErrorAction SilentlyContinue |
+              Where-Object { $sid -lt 0 -or $_.SessionId -eq $sid } |
+              ForEach-Object { [int]$_.Id })
+}
+
+function Get-PptInstanz {
+    # Eigen = $true nur, wenn die Instanz nachweislich NEU gestartet wurde.
+    param($App, [int[]]$VorherPids = @())
+    $hwndPid = 0
+    try {
+        if (-not ('Win32.User32PptInst' -as [type])) {
+            Add-Type -Name 'User32PptInst' -Namespace 'Win32' -ErrorAction Stop -MemberDefinition '[DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);'
+        }
+        $procId = 0
+        [void][Win32.User32PptInst]::GetWindowThreadProcessId([IntPtr]$App.HWND, [ref]$procId)
+        if ($procId -gt 0) { $hwndPid = $procId }
+    } catch {}
+    if ($hwndPid -gt 0) {
+        return @{ Eigen = ($VorherPids -notcontains $hwndPid); Pid = $hwndPid }
+    }
+    # HWND nicht lesbar: nur eindeutig, wenn genau EIN Prozess neu hinzukam.
+    $nachher = Get-PptSitzungsPids
+    $neu = @($nachher | Where-Object { $VorherPids -notcontains $_ })
+    if ($neu.Count -eq 1) { return @{ Eigen = $true; Pid = [int]$neu[0] } }
+    return @{ Eigen = $false; Pid = $null }
+}
+
+function Get-PptFremdePraesentationen {
+    # Offene Praesentationen AUSSERHALB des eigenen Arbeitsordners; -1 = nicht lesbar.
+    param($App, [string]$EigenerOrdner)
+    try {
+        $n = 0
+        $liste = $App.Presentations
+        if ($null -eq $liste) { return -1 }
+        foreach ($p in $liste) {
+            $fn = ''
+            try { $fn = [string]$p.FullName } catch {}
+            if (-not $fn.StartsWith($EigenerOrdner, [System.StringComparison]::OrdinalIgnoreCase)) { $n++ }
+        }
+        return $n
+    } catch { return -1 }
+}
+'@
+
 # ==================================================================
 # HELPER: DATEISYSTEM-TRAVERSIERUNG
 # ==================================================================
@@ -969,10 +1121,35 @@ function Get-PptFilesRobust {
     }
 }
 
+# Eigene Sicherungen heissen '<Original>.bak_<8 Hex, klein, mindestens ein
+# Buchstabe>' (New-BackupPfad). Nur GENAU dieses Muster raeumt das Skript
+# auf. Vorher hiess die Sicherung schlicht '<Original>.bak', und das
+# Aufraeummuster '^(.+?)\.bak(_[0-9a-fA-F]+)?$' traf damit auch eine vom
+# Anwender selbst angelegte 'Vortrag.pptx.bak' (oder 'Vortrag.pptx.bak_2024')
+# - geloescht, sobald das Original gleich gross oder groesser war. Eine
+# vorhandene 'Vortrag.pptx.bak' wurde zudem vor dem Schreiben nach
+# '.bak_<6 Hex>' umbenannt und fiel damit im naechsten Lauf ebenfalls unter
+# das Muster. Der Buchstabe ist Pflicht, damit eine Datumsendung wie
+# '.bak_20240101' (acht Ziffern) nie als eigene Sicherung gilt.
+# Alte '.bak'- und '.bak_<6 Hex>'-Reste frueherer Fassungen werden nicht mehr
+# angefasst - lieber ein liegengebliebener Rest als eine fremde Sicherung weg.
+$script:EigenesBackupMuster = '^(?<orig>.+)\.bak_(?=[0-9a-f]*[a-f])[0-9a-f]{8}$'
+
+function New-BackupPfad {
+    param([string]$Original)
+    for ($i = 0; $i -lt 100; $i++) {
+        $kennung = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+        if ($kennung -notmatch '[a-f]') { continue }
+        $kandidat = "$Original.bak_$kennung"
+        if (-not [System.IO.File]::Exists($kandidat)) { return $kandidat }
+    }
+    throw "Kein freier Backup-Name fuer $Original"
+}
+
 function Get-OriginalFromBackupPath {
-    # Vortrag.pptx.bak / Vortrag.pptx.bak_a1b2c3  ->  Vortrag.pptx
+    # Vortrag.pptx.bak_1a2b3c4d  ->  Vortrag.pptx ; alles andere -> $null
     param([string]$BackupPath)
-    if ($BackupPath -match '^(?<orig>.+?)\.bak(?:_[0-9a-fA-F]+)?$') {
+    if ($BackupPath -cmatch $script:EigenesBackupMuster) {
         return $Matches['orig']
     }
     return $null
@@ -980,12 +1157,13 @@ function Get-OriginalFromBackupPath {
 
 function Remove-OrphanedBackups {
     <#
-        Raeumt '.bak'/'.bak_xxxxxx'-Reste frueherer Laeufe auf.
+        Raeumt '.bak_xxxxxxxx'-Reste frueherer Laeufe auf (nur das eigene
+        Muster, siehe $script:EigenesBackupMuster).
 
         Geloescht wird nur, wenn ALLE Bedingungen zutreffen:
           1. Der abgeleitete Originalname endet auf eine PowerPoint-Endung
              (fremde .bak-Dateien bleiben unangetastet),
-          2. das Original existiert und ist groesser als 0 Byte,
+          2. das Original existiert und ist mindestens so gross wie das Backup,
           3. das Backup ist aelter als $script:BackupCleanupMinAgeHours.
 
         Fehlt das Original oder ist es leer, kann das Backup die einzige
@@ -999,7 +1177,7 @@ function Remove-OrphanedBackups {
     }
     $cutoff = (Get-Date).AddHours(-$script:BackupCleanupMinAgeHours)
 
-    foreach ($bak in (Get-PptFilesRobust $RootPath '^\.bak(_[0-9a-fA-F]+)?$')) {
+    foreach ($bak in (Get-PptFilesRobust $RootPath '^\.bak_[0-9a-f]{8}$')) {
         try {
             $orig = Get-OriginalFromBackupPath -BackupPath $bak
             if ([string]::IsNullOrWhiteSpace($orig)) { continue }
@@ -1109,11 +1287,31 @@ function Update-Progress {
 function Convert-PptToPptx {
     param([string]$SourcePath, [string]$DestPathBase, [string]$OriginalExt)
 
+    # Auslaufende eigene Instanzen des vorigen Jobs abwarten, sonst gelten
+    # sie im naechsten Job als fremd (siehe Wait-TrackedPowerPointExit).
+    Wait-TrackedPowerPointExit
+
     $pidFile = Join-Path $script:TempPath "PptDeepClean_$([Guid]::NewGuid().ToString()).pid"
     $job = Start-Job -ScriptBlock {
-        param($src, $destBase, $origExt, $consts, $pidFile)
+        param($src, $destBase, $origExt, $consts, $pidFile, $instanzCode, $eigenerOrdner)
 
-        $ppt = New-Object -ComObject PowerPoint.Application
+        . ([scriptblock]::Create($instanzCode))
+
+        # Vor New-Object erfassen, welche PowerPoint-Prozesse schon laufen
+        # (Begruendung bei $script:PptInstanzCode).
+        $vorher = Get-PptSitzungsPids
+        $ppt    = New-Object -ComObject PowerPoint.Application
+        $inst   = Get-PptInstanz -App $ppt -VorherPids $vorher
+        if (-not $inst.Eigen) {
+            # Fremde oder nicht zuordenbare Instanz: NICHTS daran verstellen,
+            # kein Quit, keine PID-Datei - nur die eigene Referenz freigeben.
+            try { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ppt) | Out-Null } catch {}
+            $wer = if ($inst.Pid) { "PID $($inst.Pid)" } else { "PID nicht zuzuordnen" }
+            return @{ Status = "FREMD"; PptPid = $null
+                      Msg = "PowerPoint des Anwenders laeuft ($wer) - Lauf abgebrochen" }
+        }
+        $myPptPid = $inst.Pid
+        try { [System.IO.File]::WriteAllText($pidFile, "$myPptPid") } catch {}
 
         $ppt.Visible            = $consts.msoTrue
         $ppt.DisplayAlerts      = $consts.ppAlertsNone
@@ -1121,41 +1319,16 @@ function Convert-PptToPptx {
         try { $ppt.AutomationSecurity = $consts.msoAutomationSecurityForceDisable } catch {}
         try { $ppt.WindowState = $consts.ppWindowMinimized } catch {}
 
-        $myPptPid = $null
+        $pres = $null
+        $res  = @{ Status = "ERROR"; Msg = "Oeffnen fehlgeschlagen" }
         try {
-            Add-Type -Name "User32Ppt" -Namespace "Win32" -MemberDefinition @'
-[DllImport("user32.dll")]
-public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
-'@ -ErrorAction SilentlyContinue
-            $procId = 0
-            [Win32.User32Ppt]::GetWindowThreadProcessId([IntPtr]$ppt.Hwnd, [ref]$procId) | Out-Null
-            if ($procId -gt 0) { $myPptPid = $procId }
-        } catch {}
-        if ($myPptPid) { try { [System.IO.File]::WriteAllText($pidFile, "$myPptPid") } catch {} }
+            try {
+                $pres = $ppt.Presentations.Open($src, -1, -1, 0)
+            } catch {
+                $res.Msg = $_.Exception.Message
+            }
+            if (-not $pres) { throw [System.InvalidOperationException]::new($res.Msg) }
 
-        $pres    = $null
-        $lastErr = "Oeffnen fehlgeschlagen"
-        try {
-            $pres = $ppt.Presentations.Open($src, -1, -1, 0)
-        } catch {
-            $lastErr = $_.Exception.Message
-        }
-
-        if (-not $pres) {
-            # Quit() nur fuer die selbst gestartete Instanz.
-            # PowerPoint ist wie Word ein Einzelinstanz-COM-Server: laeuft
-            # bereits eine Sitzung des Anwenders, liefert New-Object
-            # -ComObject GENAU DIESE Instanz. $myPptPid bleibt dann leer -
-            # und ein Quit() darauf schliesst die Sitzung des Anwenders
-            # samt ungespeicherter Praesentationen. Dann nur die Referenz
-            # freigeben; eine evtl. doch eigene Instanz raeumt die
-            # Zombie-Erkennung des Aufrufers spaeter ab.
-            if ($myPptPid) { try { $ppt.Quit() } catch {} }
-            [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ppt) | Out-Null
-            return @{ Status = "ERROR"; Msg = $lastErr; PptPid = $myPptPid }
-        }
-
-        try {
             $hasMacros = $false
             try { $hasMacros = [bool]$pres.HasVBProject } catch { $hasMacros = $true }
             $origExt = $origExt.ToLower()
@@ -1185,7 +1358,7 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
             try { $pres.Saved = $consts.msoTrue } catch {}
             $pres.Close()
 
-            return @{ Status = "OK"; Path = $final; PptPid = $myPptPid }
+            $res = @{ Status = "OK"; Path = $final }
         } catch {
             try {
                 if ($pres) {
@@ -1193,17 +1366,38 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
                     $pres.Close()
                 }
             } catch {}
-            return @{ Status = "ERROR"; Msg = $_.Exception.Message; PptPid = $myPptPid }
+            $res = @{ Status = "ERROR"; Msg = $_.Exception.Message }
         } finally {
             if ($pres) {
                 try { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($pres) | Out-Null } catch {}
                 $pres = $null
             }
-            # Quit nur fuer die eigene Instanz (siehe Hinweis oben).
-            if ($myPptPid) { try { $ppt.Quit() } catch {} }
-            [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ppt) | Out-Null
         }
-    } -ArgumentList $SourcePath, $DestPathBase, $OriginalExt, $script:PptConstants, $pidFile
+
+        # Quit nur, wenn ausser den eigenen Arbeitsdateien NICHTS offen ist.
+        # PowerPoint startet nur einmal: oeffnet der Anwender waehrend des
+        # Laufs eine Praesentation, landet sie in DIESER Instanz - ein Quit()
+        # schloesse sie. Dann Instanz stehen lassen, Fenster wiederherstellen
+        # (ppWindowNormal=1, ppAlertsAll=2, Werte aus der Interop-Assembly
+        # gelesen), PID NICHT zur Nachverfolgung melden (sonst beendet sie
+        # Clear-TrackedPowerPointInstances) und warnen.
+        $fremdOffen = Get-PptFremdePraesentationen -App $ppt -EigenerOrdner $eigenerOrdner
+        if ($fremdOffen -eq 0) {
+            try { $ppt.Quit() } catch {}
+            $res.PptPid = $myPptPid
+        } else {
+            try { $ppt.WindowState   = 1 } catch {}
+            try { $ppt.DisplayAlerts = 2 } catch {}
+            $res.PptPid  = $null
+            $res.Warnung = if ($fremdOffen -lt 0) {
+                "Offene Praesentationen der PowerPoint-Instanz (PID $myPptPid) nicht lesbar - PowerPoint NICHT beendet"
+            } else {
+                "In der PowerPoint-Instanz (PID $myPptPid) hat der Anwender $fremdOffen Praesentation(en) geoeffnet - PowerPoint NICHT beendet"
+            }
+        }
+        try { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ppt) | Out-Null } catch {}
+        return $res
+    } -ArgumentList $SourcePath, $DestPathBase, $OriginalExt, $script:PptConstants, $pidFile, $script:PptInstanzCode, ($script:TempPath.TrimEnd('\') + '\')
 
     if (-not (Wait-Job $job -Timeout $script:FileOpenTimeoutSeconds)) {
         Stop-Job  $job -WhatIf:$false
@@ -1213,12 +1407,13 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
                 $pidContent = [System.IO.File]::ReadAllText($pidFile).Trim()
                 if ($pidContent -match '^\d+$') {
                     $savedPid = [int]$pidContent
-                    if ($savedPid -gt 0) {
-                        $p = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
-                        if ($p -and $p.ProcessName -eq 'POWERPNT') {
-                            try { Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
-                            Write-DetailedLog "Timeout: POWERPNT.EXE PID $savedPid sofort beendet" "WARN"
-                        }
+                    # Nur beenden, was nachweislich die eigene Instanz ist
+                    # (Name + Startzeit nach Skriptbeginn). Vorher genuegte der
+                    # Name - bei einer Sitzung des Anwenders, deren PID in der
+                    # Datei stand, beendete dieser Zweig sie per -Force.
+                    if ($savedPid -gt 0 -and (Test-IsOwnPptProcess -ProcessId $savedPid)) {
+                        try { Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
+                        Write-DetailedLog "Timeout: POWERPNT.EXE PID $savedPid sofort beendet" "WARN"
                     }
                 }
             } catch {}
@@ -1231,9 +1426,22 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
     Remove-Job $job -WhatIf:$false
     if ([System.IO.File]::Exists($pidFile)) { try { [System.IO.File]::Delete($pidFile) } catch {} }
     if ($result.PptPid) { $script:TrackedPptPids.Add([int]$result.PptPid) }
+    if ($result.Warnung) {
+        # Der Anwender arbeitet in PowerPoint - weiter per COM zu arbeiten,
+        # hiesse, seine Sitzung zu uebernehmen. Die laufende Datei wird noch
+        # fertiggestellt, dann bricht die Hauptschleife ab.
+        $script:FremdePptAbbruch = $true
+        Write-Host ""
+        Write-Host "WARNUNG: $($result.Warnung). Lauf wird nach dieser Datei beendet." -ForegroundColor Yellow
+        Write-Log "$($result.Warnung) - Lauf wird nach dieser Datei beendet." "WARN"
+    }
 
     if ($result.Status -eq "OK") { return $result.Path }
-    else                         { throw $result.Msg }
+    if ($result.Status -eq "FREMD") {
+        $script:FremdePptAbbruch = $true
+        Write-Log "$($result.Msg)" "ERROR"
+    }
+    throw $result.Msg
 }
 
 # ==================================================================
@@ -1262,9 +1470,32 @@ function Remove-PptxProtection {
     # bei einer einzigen wirklich geschuetzten Datei) - mit neuem Zeitstempel
     # und vollstaendigem Neu-Upload auf Google Drive. Sie verhindern zudem
     # nur Gruppieren bzw. freies Verzerren und sind kein Bearbeitungsschutz.
+    #
+    # Nachgezaehlt am 29.09.2026 in den Office-2024-Vorlagen dieses Rechners
+    # (root\Templates: 6 .potx, root\Document Themes 16: 11 .thmx):
+    #  - 'noChangeArrowheads' steht in 3 der 6 .potx (Pitchbook, Training,
+    #    WidescreenPresentation) - 25x in Notizseiten, 22x auf Folien (auch
+    #    picLocks an Bildern). Wie noChangeAspect nur eine Formatsperre
+    #    (Pfeilspitzen), kein Bearbeitungsschutz -> ganz aus der Liste.
+    #  - 'noRot' steht in ALLEN 6 .potx, 60x - ausnahmslos am Folienbild-
+    #    Platzhalter (ph type="sldImg") in notesMaster/notesSlide:
+    #    <a:spLocks noGrp="1" noRot="1" noChangeAspect="1"/>. Jede .pptx mit
+    #    Notizen haette damit als geschuetzt gegolten und waere neu
+    #    geschrieben worden. Auf Folien, Layouts und Mastern kam noRot kein
+    #    einziges Mal vor - dort bleibt es eine Anwendersperre.
+    #  - 'noTextEdit' steht 5x am selben sldImg-Platzhalter (Training.potx);
+    #    der Platzhalter traegt keinen Text.
+    #    -> noRot und noTextEdit werden nur am sldImg-Platzhalter der
+    #       Notizteile uebergangen ($sldImgIgnorieren).
+    #  - 'noEditPoints' steht 10x im Design "Ion Boardroom" (.thmx) an
+    #    Schmuckformen in Layouts und Master, nie auf Folien.
+    #    -> in slideLayout/slideMaster uebergangen, auf Folien entfernt.
+    # Probe: die 6 .potx als .pptx durch Remove-PptxProtection - vorher bei
+    # allen 6 "Shape-Lock" (7 bis 25 Teile je Datei), nachher bei keiner.
     $lockAttrs = @("noSelect","noMove","noResize","noRot",
-                   "noChangeArrowheads","noTextEdit",
+                   "noTextEdit",
                    "noAdjustHandles","noEditPoints","noUngrp")
+    $sldImgIgnorieren = @("noRot","noTextEdit")
 
     try {
         $zip = Invoke-WithRetry -Context "ZipFile.Open Update" -Action {
@@ -1387,9 +1618,24 @@ function Remove-PptxProtection {
                          local-name()='cxnSpLocks'       or local-name()='graphicFrameLocks' or
                          local-name()='grpSpLocks']"))
                 $lockTypeCounts = @{}
+                $istNotizTeil  = $targetName -match '^ppt/(notesSlides/notesSlide|notesMasters/notesMaster)\d+\.xml$'
+                $istLayoutTeil = $targetName -match '^ppt/(slideLayouts/slideLayout|slideMasters/slideMaster)\d+\.xml$'
                 foreach ($node in $lockNodes) {
                     $hadLock = $false
+                    # Von Office selbst gesetzte Attribute je Fundort uebergehen
+                    # (Messung siehe $lockAttrs).
+                    $uebergehen = @()
+                    if ($istLayoutTeil) { $uebergehen += 'noEditPoints' }
+                    if ($istNotizTeil -and $node.LocalName -eq 'spLocks') {
+                        # spLocks -> cNvSpPr -> nvSpPr; dort nvPr/ph
+                        $ph = $null
+                        try {
+                            $ph = $node.ParentNode.ParentNode.SelectSingleNode("*[local-name()='nvPr']/*[local-name()='ph']")
+                        } catch {}
+                        if ($ph -and $ph.GetAttribute('type') -eq 'sldImg') { $uebergehen += $sldImgIgnorieren }
+                    }
                     foreach ($attr in $lockAttrs) {
+                        if ($uebergehen -contains $attr) { continue }
                         $a = $node.Attributes[$attr]
                         if ($a -and $a.Value -eq "1") {
                             $a.Value  = "0"
@@ -1474,34 +1720,38 @@ function Test-PowerPointTrustCenter {
     $pidFile  = Join-Path $TempDir ("trustcheck_{0}.pid"  -f ([Guid]::NewGuid().ToString("N")))
 
     $job = Start-Job -ScriptBlock {
-        param($fp, $pidFile, $consts)
+        param($fp, $pidFile, $consts, $instanzCode, $eigenerOrdner)
 
-        $ppt = New-Object -ComObject PowerPoint.Application
+        . ([scriptblock]::Create($instanzCode))
+
+        # Vor New-Object erfassen, welche PowerPoint-Prozesse schon laufen
+        # (Begruendung bei $script:PptInstanzCode).
+        $vorher = Get-PptSitzungsPids
+        $ppt    = New-Object -ComObject PowerPoint.Application
+        $inst   = Get-PptInstanz -App $ppt -VorherPids $vorher
+        if (-not $inst.Eigen) {
+            try { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ppt) | Out-Null } catch {}
+            $wer = if ($inst.Pid) { "PID $($inst.Pid)" } else { "PID nicht zuzuordnen" }
+            return @{ Ok = $false; Fremd = $true; PptPid = $null
+                      Msg = "PowerPoint des Anwenders laeuft ($wer)" }
+        }
+        $myPptPid = $inst.Pid
+        try { [System.IO.File]::WriteAllText($pidFile, "$myPptPid") } catch {}
+
         $ppt.Visible       = $consts.msoTrue
         $ppt.DisplayAlerts = $consts.ppAlertsNone
         $ppt.FeatureInstall = $consts.msoFeatureInstallNone
         try { $ppt.AutomationSecurity = $consts.msoAutomationSecurityForceDisable } catch {}
         try { $ppt.WindowState = $consts.ppWindowMinimized } catch {}
 
-        $myPptPid = $null
-        try {
-            Add-Type -Name "User32PptTc" -Namespace "Win32" -MemberDefinition @'
-[DllImport("user32.dll")]
-public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
-'@ -ErrorAction SilentlyContinue
-            $procId = 0
-            [Win32.User32PptTc]::GetWindowThreadProcessId([IntPtr]$ppt.Hwnd, [ref]$procId) | Out-Null
-            if ($procId -gt 0) { $myPptPid = $procId }
-        } catch {}
-        if ($myPptPid) { try { [System.IO.File]::WriteAllText($pidFile, "$myPptPid") } catch {} }
-
         $pres1 = $null
         $pres2 = $null
+        $res   = $null
         try {
             # 1) Leere Praesentation erzeugen und in den Temp-Ordner speichern
             $pres1 = $ppt.Presentations.Add($consts.msoTrue)
             if (-not $pres1) {
-                return @{ Ok = $false; Msg = "Presentations.Add lieferte keine Praesentation"; PptPid = $myPptPid }
+                throw [System.InvalidOperationException]::new("Presentations.Add lieferte keine Praesentation")
             }
             $pres1.SaveAs($fp, $consts.ppSaveAsOpenXMLPresentation)
             $pres1.Close()
@@ -1510,24 +1760,38 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
             # 2) Re-Open aus dem Temp-Ordner -> eigentlicher Trust-Center-Test
             $pres2 = $ppt.Presentations.Open($fp, -1, -1, 0)
             if (-not $pres2) {
-                return @{ Ok = $false; Msg = "Presentations.Open lieferte keine Praesentation"; PptPid = $myPptPid }
+                throw [System.InvalidOperationException]::new("Presentations.Open lieferte keine Praesentation")
             }
             $pres2.Close()
             $pres2 = $null
 
-            return @{ Ok = $true; PptPid = $myPptPid }
+            $res = @{ Ok = $true }
         } catch {
-            return @{ Ok = $false; Msg = $_.Exception.Message; PptPid = $myPptPid }
+            $res = @{ Ok = $false; Msg = $_.Exception.Message }
         } finally {
             if ($pres1) { try { $pres1.Close() } catch {} }
             if ($pres2) { try { $pres2.Close() } catch {} }
-            # Quit nur fuer die eigene Instanz (siehe Hinweis oben).
-            if ($myPptPid) { try { $ppt.Quit() } catch {} }
-            try { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ppt) | Out-Null } catch {}
-            [System.GC]::Collect()
-            [System.GC]::WaitForPendingFinalizers()
         }
-    } -ArgumentList $testPath, $pidFile, $script:PptConstants
+
+        # Quit nur, wenn ausser den eigenen Arbeitsdateien nichts offen ist
+        # (Begruendung in Convert-PptToPptx).
+        $fremdOffen = Get-PptFremdePraesentationen -App $ppt -EigenerOrdner $eigenerOrdner
+        if ($fremdOffen -eq 0) {
+            try { $ppt.Quit() } catch {}
+            $res.PptPid = $myPptPid
+        } else {
+            try { $ppt.WindowState   = 1 } catch {}
+            try { $ppt.DisplayAlerts = 2 } catch {}
+            $res.PptPid = $null
+            $res.Ok     = $false
+            $res.Fremd  = $true
+            $res.Msg    = "In der PowerPoint-Instanz (PID $myPptPid) ist eine fremde Praesentation geoeffnet - PowerPoint NICHT beendet"
+        }
+        try { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ppt) | Out-Null } catch {}
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+        return $res
+    } -ArgumentList $testPath, $pidFile, $script:PptConstants, $script:PptInstanzCode, ($TempDir.TrimEnd('\') + '\')
 
     $completed = Wait-Job $job -Timeout $TimeoutSec
 
@@ -1541,18 +1805,15 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
                     $savedPid = [int]$pidContent
                     if ($savedPid -gt 0) {
                         $script:TrackedPptPids.Add($savedPid)
-                        # Process-Name-Check vor Stop-Process schuetzt vor
-                        # PID-Recycling: Wenn PowerPoint waehrend des Smoke-
-                        # Tests abstuerzt (AV-Kill, Office-Profilschaden),
-                        # gibt Windows die PID sofort frei und kann sie an
-                        # einen unbeteiligten Systemprozess (svchost, Update,
-                        # Virenscanner) vergeben. Ein blindes Stop-Process
-                        # wuerde diesen Fremdprozess abschiessen.
-                        # Konsistent mit der Implementierung in
-                        # Convert-PptToPptx (Z. 633-637) und mit
-                        # Clear-TrackedPowerPointInstances (Z. 442-449).
-                        $p = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
-                        if ($p -and $p.ProcessName -eq 'POWERPNT') {
+                        # Nur die nachweislich eigene Instanz beenden: Name UND
+                        # Startzeit nach Skriptbeginn (Test-IsOwnPptProcess).
+                        # Die reine Namenspruefung schuetzte zwar vor PID-
+                        # Recycling an Systemprozesse, nicht aber vor einer
+                        # PowerPoint-Sitzung des Anwenders - deren PID stand
+                        # bei uebernommener Sitzung selbst in der PID-Datei.
+                        # Gleich wie Convert-PptToPptx und
+                        # Clear-TrackedPowerPointInstances.
+                        if (Test-IsOwnPptProcess -ProcessId $savedPid) {
                             try { Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
                             Write-DetailedLog "Trust-Center-Timeout: POWERPNT.EXE PID $savedPid sofort beendet" "WARN"
                         }
@@ -1575,7 +1836,7 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
         return @{ Ok = $true }
     } else {
         $m = if ($result) { $result.Msg } else { "Kein Ergebnis vom COM-Job" }
-        return @{ Ok = $false; Msg = $m }
+        return @{ Ok = $false; Msg = $m; Fremd = [bool]($result -and $result.Fremd) }
     }
 }
 
@@ -1589,8 +1850,8 @@ if (-not $NoInteractive.IsPresent) {
     Write-Host "║             POWERPOINT DEEP UNPROTECT              ║" -ForegroundColor Cyan
     Write-Host "╚════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 
-    # Vor dem ersten COM-Zugriff auf laufende Office-Sitzungen hinweisen.
-    if (-not (Show-OfficeRunningWarning -Silent:$NoInteractive)) { exit 0 }
+    # Laufendes PowerPoint wird unmittelbar vor dem ersten COM-Zugriff
+    # geprueft (Confirm-PowerPointGeschlossen, vor dem Smoke-Test).
     Write-Host ""
     Write-Host "HINWEIS: Das Skript verwendet den Ordner 'Dokumente' als temporären" -ForegroundColor DarkYellow
     Write-Host "Arbeitsordner für die COM-Verarbeitung (PowerPoint öffnet Dateien daraus)." -ForegroundColor DarkYellow
@@ -1668,10 +1929,9 @@ if (-not $NoInteractive.IsPresent) {
     }
     $script:UseProgress = $ShowProgress.IsPresent
     $script:SkipPreScan = $true
-
-    # Auch ohne Dialog protokollieren, dass fremde Office-Sitzungen
-    # laufen - im Fehlerfall ist das die haeufigste Ursache.
-    [void](Show-OfficeRunningWarning -Silent)
+    # Laufendes PowerPoint: siehe Confirm-PowerPointGeschlossen vor dem
+    # Smoke-Test. Die fruehere stille Warnung ("sie werden geschuetzt")
+    # liess den Lauf trotzdem an der Sitzung des Anwenders arbeiten.
 }
 
 # ==================================================================
@@ -1689,6 +1949,20 @@ if (-not (Test-Path -LiteralPath $TargetPath)) {
 $tgtItem = Get-Item -LiteralPath $TargetPath -ErrorAction SilentlyContinue
 if ($tgtItem -and -not $tgtItem.PSIsContainer) {
     Write-Error "Zielpfad ist eine Datei, kein Verzeichnis: $TargetPath"
+    exit 1
+}
+
+# Absoluten Pfad festschreiben. Test-Path loest einen relativen Pfad gegen
+# den PowerShell-Ort ($PWD) auf, [System.IO] dagegen gegen das Arbeits-
+# verzeichnis des Prozesses - die beiden laufen nach einem Set-Location
+# auseinander. Gemessen unter 5.1 (PWD = ...\A, Prozess-CWD = ...\B):
+# Test-Path 'ziel' pruefte A\ziel, EnumerateFiles('ziel') lieferte B\ziel -
+# das Skript haette einen fremden Baum bearbeitet. Gilt auch fuer die
+# manuelle Pfadeingabe im Menue.
+try {
+    $TargetPath = (Resolve-Path -LiteralPath $TargetPath -ErrorAction Stop).ProviderPath
+} catch {
+    Write-Error "Pfad nicht aufloesbar: $TargetPath - $_"
     exit 1
 }
 
@@ -1716,10 +1990,35 @@ Write-Host " Ziel: $TargetPath"
 Write-Host "=====================================================" -ForegroundColor Cyan
 
 # ------------------------------------------------------------------
+# Laufendes PowerPoint? Dann KEIN COM (Begruendung bei
+# Confirm-PowerPointGeschlossen). Exitcode 3 = PowerPoint laeuft.
+# ------------------------------------------------------------------
+if (-not (Confirm-PowerPointGeschlossen -NoInteractive:$NoInteractive)) {
+    Write-Host "Abbruch: PowerPoint laeuft. Bitte PowerPoint beenden und das Skript neu starten." -ForegroundColor Red
+    Write-Log "Abbruch: PowerPoint laeuft bereits - COM-Automatisierung wuerde die Sitzung des Anwenders uebernehmen." "ERROR"
+    Close-Loggers
+    if (Test-Path -LiteralPath $script:TempPath) { Remove-Item -LiteralPath $script:TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
+    exit 3
+}
+
+# ------------------------------------------------------------------
 # PowerPoint Smoke-Test
 # ------------------------------------------------------------------
 Write-Host "Prüfe COM-Subsystem und Trust-Center..." -ForegroundColor DarkGray
 $smokeTest = Test-PowerPointTrustCenter -TempDir $script:TempPath -TimeoutSec $script:TrustCenterTimeoutSec
+
+if ($smokeTest.Fremd) {
+    # Zwischen Pruefung und Smoke-Test wurde PowerPoint gestartet: kein
+    # "Trotzdem fortfahren" - jeder weitere Job haette dieselbe Sitzung.
+    Write-Host ""
+    Write-Host "ABBRUCH: $($smokeTest.Msg)" -ForegroundColor Red
+    Write-Host "Bitte PowerPoint beenden und das Skript neu starten." -ForegroundColor Red
+    Write-Log "Abbruch im Smoke-Test: $($smokeTest.Msg)" "ERROR"
+    Clear-TrackedPowerPointInstances
+    Close-Loggers
+    if (Test-Path -LiteralPath $script:TempPath) { Remove-Item -LiteralPath $script:TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
+    exit 3
+}
 
 if (-not $smokeTest.Ok) {
     Write-Host ""
@@ -1786,7 +2085,7 @@ if (-not $SkipBackupCleanup) {
                 break
             }
         }
-        Write-Host "Zum Wiederherstellen die Endung '.bak' bzw. '.bak_xxxxxx' entfernen." -ForegroundColor Gray
+        Write-Host "Zum Wiederherstellen die Endung '.bak_xxxxxxxx' entfernen." -ForegroundColor Gray
         Write-Host ""
     }
     Write-Log ("Backup-Aufraeumen: {0} entfernt, {1} behalten, {2} ohne Original, {3} Fehler" -f `
@@ -1827,11 +2126,30 @@ $stats = @{
 # ==================================================================
 Write-Host "Starte Verarbeitung..." -ForegroundColor Cyan
 
+# Strg+C ab hier als Eingabe behandeln und in der Schleife abfragen (siehe
+# "ABBRUCH PER TASTE"). Erst jetzt, damit die Read-Host-Abfragen davor sich
+# normal abbrechen lassen. Nur mit echter, nicht umgeleiteter Konsole; mit
+# -NoInteractive fragt niemand Tasten ab.
+if (-not $NoInteractive.IsPresent) {
+    try {
+        if (-not [Console]::IsInputRedirected) {
+            [Console]::TreatControlCAsInput = $true
+            $script:CtrlCAsInput = $true
+            Write-Host "Abbruch mit Strg+C oder ESC (die laufende Datei wird fertiggestellt)." -ForegroundColor DarkGray
+        }
+    } catch {}
+}
+
 try {
 Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
     ForEach-Object {
 
+    Test-AbortRequested
     if ($script:ShouldStop) { throw [System.OperationCanceledException]::new() }
+    # Fremde PowerPoint-Sitzung erkannt (Job meldete FREMD oder der Anwender
+    # hat in der Automatisierungs-Instanz etwas geoeffnet): nicht weiter per
+    # COM arbeiten.
+    if ($script:FremdePptAbbruch) { throw [System.OperationCanceledException]::new() }
 
     $filePath = $_
     $fileName = [System.IO.Path]::GetFileName($filePath)
@@ -1884,7 +2202,23 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
             Write-CsvLog -Status "WHATIF" -Actions "Wuerde Sperrdatei loeschen" -Path $filePath
             return
         }
-        try { [System.IO.File]::Delete((Add-LongPathPrefix $filePath)) } catch {}
+        # Nur zaehlen, was wirklich geloescht ist. Vorher lief $stats.Junk++
+        # auch nach einem gescheiterten Delete (leerer catch). Scheitert das
+        # Loeschen, ist die Sperrdatei meist doch in Benutzung - dann schonen.
+        $junkWeg = $false
+        try {
+            [System.IO.File]::Delete((Add-LongPathPrefix $filePath))
+            $junkWeg = -not [System.IO.File]::Exists((Add-LongPathPrefix $filePath))
+        } catch {
+            Write-DetailedLog "Sperrdatei nicht loeschbar: $filePath - $_" "WARN"
+        }
+        if (-not $junkWeg) {
+            $stats.Skipped++
+            if (-not $script:UseProgress) { Write-Host "-> SKIP (Sperrdatei nicht loeschbar)" -ForegroundColor Yellow }
+            Write-Log "Sperrdatei nicht loeschbar (in Benutzung?): $filePath" "WARN"
+            Write-CsvLog -Status "SKIP" -Actions "Sperrdatei nicht loeschbar" -Path $filePath
+            return
+        }
         $stats.Junk++
         if (-not $script:UseProgress) { Write-Host "-> JUNK" -ForegroundColor DarkGray }
         Write-DetailedLog "Junk entfernt: $filePath" "DEBUG"
@@ -1894,17 +2228,20 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
 
     $srcLong = Add-LongPathPrefix $filePath
 
-    # 2. Schreibschutz-Attribut entfernen
-    $fileAttrs = $null
-    try { $fileAttrs = [System.IO.File]::GetAttributes($srcLong) } catch {}
-    if ($fileAttrs -and ($fileAttrs -band [System.IO.FileAttributes]::ReadOnly)) {
-        try {
-            if (Confirm-Write $filePath 'Schreibschutz-Attribut entfernen') {
-                [System.IO.File]::SetAttributes($srcLong, $fileAttrs -band (-bnot [System.IO.FileAttributes]::ReadOnly))
-                Write-DetailedLog "Datei-Schreibschutz (Attribut) entfernt: $filePath" "DEBUG"
-            }
-        } catch {}
-    }
+    # 2. Schreibschutz-Attribut: hier nur FESTSTELLEN. Entfernt wird es erst,
+    #    wenn das Ergebnis feststeht - beim Rueckschreiben bzw. im Zweig
+    #    "Kein Schutz" - und jeweils nach Confirm-Write, mit Ausweis im
+    #    Protokoll. Vorher wurde es hier fuer JEDE Datei entfernt, auch fuer
+    #    danach gesperrte, verschluesselte oder defekte, ohne Eintrag in der
+    #    CSV (dort stand "Kein Schutz gefunden"). Im Probelauf blieb es
+    #    stehen, und die Sperrpruefung meldete die Datei als "Zugriff
+    #    verweigert" (siehe Test-FileIsLocked). Das Entfernen selbst bleibt
+    #    gewollt: es ist Teil von "Schutz entfernen", wie in 2a und 2b.
+    $istReadOnly = $false
+    try {
+        $istReadOnly = [bool]([System.IO.File]::GetAttributes($srcLong) -band [System.IO.FileAttributes]::ReadOnly)
+    } catch {}
+    $roEntfernt = $false
 
     # 3. Sperr-Check
     $lockResult = Test-FileIsLocked -FilePath $filePath
@@ -1954,6 +2291,12 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
     try {
         # 4. In Temp kopieren (mit Retry gegen AV-Locks)
         Invoke-WithRetry -Context "Copy src->temp" -Action { [System.IO.File]::Copy($srcLong, $tempFile, $true) }
+        # File.Copy uebernimmt das ReadOnly-Attribut auf die Temp-Kopie
+        # (gemessen unter 5.1), und ZipFile.Open(Update) scheitert daran mit
+        # UnauthorizedAccessException - nach ~36 s Retry. Seit das Attribut am
+        # Original erst beim Rueckschreiben entfernt wird, traefe das jede
+        # schreibgeschuetzte Datei; die Temp-Kopie gehoert dem Skript.
+        [void](Clear-ReadOnlyAttribut $tempFile)
 
         # Priming-Read: AV synchron abschliessen lassen
         Invoke-FilePrimingRead -Path $tempFile
@@ -2011,7 +2354,9 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
                 if (-not $script:UseProgress) { Write-Host -NoNewline "[Conv] " -ForegroundColor Cyan }
                 $workFile     = Convert-PptToPptx -SourcePath $tempFile -DestPathBase $tempBase -OriginalExt $ext
                 $wasConverted = $true
-                $stats.Converted++
+                # $stats.Converted wird erst nach erfolgreichem Rueckschreiben
+                # gezaehlt (siehe dort) - vorher hier, und ein gescheitertes
+                # Rueckschreiben liess den Zaehler zu hoch stehen.
                 Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
                 Write-DetailedLog "Konvertiert: $filePath -> $workFile" "DEBUG"
             } catch [System.TimeoutException] {
@@ -2024,6 +2369,13 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
                 return
             } catch {
                 $stats.Errors++
+                if ($script:FremdePptAbbruch) {
+                    # Job hat eine fremde PowerPoint-Sitzung erkannt; die
+                    # Hauptschleife bricht vor der naechsten Datei ab.
+                    if (-not $script:UseProgress) { Write-Host "-> ABBRUCH (PowerPoint des Anwenders laeuft)" -ForegroundColor Red }
+                    Write-CsvLog -Status "ERR" -Actions "PowerPoint des Anwenders laeuft - Lauf abgebrochen" -Path $filePath -Details $_.Exception.Message
+                    return
+                }
                 if (-not $script:UseProgress) { Write-Host "-> ERR (Konvert)" -ForegroundColor Red }
                 Write-Log "Konvert-Fehler: $filePath - $_" "ERROR"
                 Write-DetailedLog "Konvert-Fehler Detail: $_" "ERROR"
@@ -2081,10 +2433,10 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
             if ($wasConverted) {
                 $actionStrPre = (@('Konvertierung') + @($actions)) -join ', '
             }
+            if ($istReadOnly) { $actionStrPre = (@($actionStrPre, 'Schreibschutz-Attribut') | Where-Object { $_ }) -join ', ' }
 
             # Zentrale Freigabe: ab hier wird das Original angefasst.
             if (-not (Confirm-Write $filePath "Schutz entfernen ($actionStrPre)")) {
-                if ($wasConverted) { $stats.Converted-- }
                 $stats.WouldChange++
                 if (-not $script:UseProgress) {
                     Write-Host "-> WHATIF ($actionStrPre)" -ForegroundColor DarkCyan
@@ -2108,6 +2460,8 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
                     if (-not $script:UseProgress) { Write-Host "-> ERR (>$($script:MaxNameClashRetries) Namenskonflikte)" -ForegroundColor Red }
                     Write-Log "Namenskonflikt-Limit ($($script:MaxNameClashRetries)) erreicht: $filePath" "ERROR"
                     Write-DetailedLog "Alle Umbenennungen _2 bis _$($script:MaxNameClashRetries) existieren: $filePath" "ERROR"
+                    # Vorher ohne CSV-Zeile: die Datei fehlte im Ergebnisprotokoll.
+                    Write-CsvLog -Status "ERR" -Actions "Namenskonflikt-Limit erreicht" -Path $filePath -Details "_2 bis _$($script:MaxNameClashRetries) belegt"
                     return
                 }
 
@@ -2117,25 +2471,22 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
                 if (-not $script:UseProgress) { Write-Host -NoNewline "[Umben.] " -ForegroundColor Yellow }
             }
 
-            $backupPath = "$srcLong.bak"
+            # Eigener, eindeutiger Backup-Name (siehe $script:EigenesBackupMuster).
+            # Ein vorhandenes '.bak' des Anwenders wird nicht mehr umbenannt
+            # oder ueberschrieben.
+            $backupPath = New-BackupPfad -Original $srcLong
 
-            if ([System.IO.File]::Exists($backupPath)) {
-                # Ein zurueckgebliebenes .bak stammt aus einem harten Abbruch
-                # eines frueheren Laufs und kann die einzige intakte Kopie des
-                # Originals sein. Daher beiseite legen statt ueberschreiben.
-                $staleBak = "$srcLong.bak_$([Guid]::NewGuid().ToString('N').Substring(0,6))"
-                try {
-                    [System.IO.File]::Move($backupPath, $staleBak)
-                    Write-Log "Veraltetes Backup beiseite gelegt (nicht geloescht): $staleBak" "WARN"
-                } catch {
-                    Write-DetailedLog "Veraltetes Backup nicht verschiebbar (wird ueberschrieben): $_" "WARN"
-                }
+            # Schreibschutz erst jetzt entfernen (nach der Freigabe) - noetig
+            # fuer Delete/Copy am Original und damit das Backup ihn nicht erbt.
+            if ($istReadOnly) {
+                $roEntfernt = Clear-ReadOnlyAttribut $srcLong
+                if ($roEntfernt) { Write-DetailedLog "Datei-Schreibschutz (Attribut) entfernt: $filePath" "DEBUG" }
             }
 
             Invoke-WithRetry -Action { [System.IO.File]::Copy($srcLong, $backupPath, $true) }
             # Erzeugungszeit ausdruecklich stempeln: Remove-OrphanedBackups
-            # misst das Alter daran. Musste ein vorhandenes .bak ueberschrieben
-            # werden, behielte die Datei sonst die ALTE CreationTime.
+            # misst das Alter daran (File.Copy uebernimmt die LastWriteTime der
+            # Quelle; die CreationTime koennte per NTFS-Tunneling alt sein).
             try { [System.IO.File]::SetCreationTime($backupPath, (Get-Date)) } catch {}
 
             try {
@@ -2170,8 +2521,10 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
                 Set-FileSecuritySnapshot -Path $finalDest -Snapshot $origSecurity
 
                 $stats.Unlocked++
+                if ($wasConverted) { $stats.Converted++ }
                 $actionStr = $actions -join ', '
                 if ([string]::IsNullOrWhiteSpace($actionStr)) { $actionStr = "Nur Format konvertiert" }
+                if ($roEntfernt) { $actionStr += ", Schreibschutz-Attribut" }
                 if (-not $script:UseProgress) {
                     Write-Host "-> OK ($actionStr)" -ForegroundColor Green
                 }
@@ -2184,6 +2537,9 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
                     try { [System.IO.File]::Delete($finalDest) } catch {}
                     Write-DetailedLog "Unvollstaendige Zieldatei entfernt: $finalDest" "WARN"
                 }
+                # Original unveraendert? (Konvertierung: .ppt nie angefasst;
+                # In-Place: nur nach erfolgreichem Rollback.)
+                $originalIntakt = ($finalDest -ne $srcLong)
                 if ([System.IO.File]::Exists($backupPath)) {
                     $backupSafeToDelete = $true
                     if ($finalDest -eq $srcLong) {
@@ -2192,6 +2548,7 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
                             [System.IO.File]::Copy($backupPath, $srcLong, $true)
                             if ([System.IO.File]::Exists($srcLong)) {
                                 $backupSafeToDelete = $true
+                                $originalIntakt     = $true
                                 Set-FileSecuritySnapshot -Path $srcLong -Snapshot $origSecurity
                                 Write-DetailedLog "Rollback erfolgreich: Original aus Backup wiederhergestellt: $srcLong" "WARN"
                             }
@@ -2203,6 +2560,10 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
                     if ($backupSafeToDelete) {
                         try { [System.IO.File]::Delete($backupPath) } catch {}
                     }
+                }
+                # Nichts geschrieben -> auch das Schreibschutz-Attribut zurueck.
+                if ($roEntfernt -and $originalIntakt -and [System.IO.File]::Exists($srcLong)) {
+                    Set-ReadOnlyAttribut $srcLong
                 }
                 if (-not $script:UseProgress) { Write-Host "-> ERR (Schreiben)" -ForegroundColor Red }
                 Write-Log "Schreib-Fehler: $filePath - $_" "ERROR"
@@ -2224,32 +2585,30 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
                 # durch die Temp-Kopie ersetzt. Auch das Beiseitelegen eines
                 # vorhandenen .bak gehoert hinter die Freigabe, sonst benennt
                 # schon die Simulation Dateien um.
-                if (-not (Confirm-Write $filePath 'Zone.Identifier entfernen')) {
+                $zoneAktion = if ($istReadOnly) { 'Zone.Identifier, Schreibschutz-Attribut' } else { 'Zone.Identifier' }
+                if (-not (Confirm-Write $filePath "$zoneAktion entfernen")) {
                     $stats.WouldChange++
                     if (-not $script:UseProgress) {
-                        Write-Host "-> WHATIF (Zone.Identifier)" -ForegroundColor DarkCyan
+                        Write-Host "-> WHATIF ($zoneAktion)" -ForegroundColor DarkCyan
                     }
-                    Write-Log    "Simulation: wuerde Zone.Identifier entfernen: $filePath" "INFO"
-                    Write-CsvLog -Status "WHATIF" -Actions "Wuerde Zone.Identifier entfernen" -Path $filePath
+                    Write-Log    "Simulation: wuerde $zoneAktion entfernen: $filePath" "INFO"
+                    Write-CsvLog -Status "WHATIF" -Actions "Wuerde $zoneAktion entfernen" -Path $filePath
                     return
                 }
 
-                $zoneBak = "$srcLong.bak"
+                # Eigener, eindeutiger Backup-Name (siehe Rueckschreib-Pfad).
+                $zoneBak = New-BackupPfad -Original $srcLong
 
-                if ([System.IO.File]::Exists($zoneBak)) {
-                    # Stale-Backup beiseite legen statt ueberschreiben
-                    # (siehe Begruendung im Rueckschreib-Pfad).
-                    $staleBak = "$srcLong.bak_$([Guid]::NewGuid().ToString('N').Substring(0,6))"
-                    try {
-                        [System.IO.File]::Move($zoneBak, $staleBak)
-                        Write-Log "Veraltetes Backup beiseite gelegt (nicht geloescht): $staleBak" "WARN"
-                    } catch {
-                        Write-DetailedLog "Veraltetes Backup nicht verschiebbar (wird ueberschrieben): $_" "WARN"
-                    }
+                # Schreibschutz erst nach der Freigabe entfernen - Delete am
+                # Original scheitert sonst, und das Backup erbte ihn.
+                if ($istReadOnly) {
+                    $roEntfernt = Clear-ReadOnlyAttribut $srcLong
+                    if ($roEntfernt) { Write-DetailedLog "Datei-Schreibschutz (Attribut) entfernt: $filePath" "DEBUG" }
                 }
 
                 try {
                     Invoke-WithRetry -Action { [System.IO.File]::Copy($srcLong, $zoneBak, $true) }
+                    try { [System.IO.File]::SetCreationTime($zoneBak, (Get-Date)) } catch {}
                     [System.IO.File]::Delete($srcLong)
                     Invoke-WithRetry -Action { [System.IO.File]::Copy($workFile, $srcLong, $true) }
                     if (-not [System.IO.File]::Exists($srcLong)) { throw "Verifizierung fehlgeschlagen" }
@@ -2265,9 +2624,10 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
                     Set-FileSecuritySnapshot -Path $srcLong -Snapshot $origSecurity
                     try { [System.IO.File]::Delete($zoneBak) } catch {}
                     $stats.Unlocked++
-                    if (-not $script:UseProgress) { Write-Host "-> OK (Zone.Identifier)" -ForegroundColor Green }
-                    Write-Log "Erledigt: $filePath  [Zone.Identifier]" "INFO"
-                    Write-CsvLog -Status "OK" -Actions "Zone.Identifier entfernt" -Path $filePath
+                    $zoneErg = if ($roEntfernt) { 'Zone.Identifier, Schreibschutz-Attribut' } else { 'Zone.Identifier' }
+                    if (-not $script:UseProgress) { Write-Host "-> OK ($zoneErg)" -ForegroundColor Green }
+                    Write-Log "Erledigt: $filePath  [$zoneErg]" "INFO"
+                    Write-CsvLog -Status "OK" -Actions "$zoneErg entfernt" -Path $filePath
                 } catch {
                     $stats.Errors++
                     # Potenziell korrupte Zieldatei zuerst bedingungslos
@@ -2288,6 +2648,8 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
                             if ([System.IO.File]::Exists($srcLong)) {
                                 $backupSafeToDelete = $true
                                 Set-FileSecuritySnapshot -Path $srcLong -Snapshot $origSecurity
+                                # Original unveraendert zurueck -> Attribut auch.
+                                if ($roEntfernt) { Set-ReadOnlyAttribut $srcLong }
                                 Write-DetailedLog "Rollback erfolgreich (Zone.Identifier-Pfad): $srcLong" "WARN"
                             }
                         } catch {
@@ -2303,6 +2665,26 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
                     Write-CsvLog -Status "ERR" -Actions "Schreib-Fehler (Zone.Identifier)" -Path $filePath -Details $_.Exception.Message
                     if (-not $script:UseProgress) { Write-Host "-> WARN (ADS)" -ForegroundColor Yellow }
                 }
+            } elseif ($istReadOnly) {
+                # Kein Schutz im Inhalt, aber Schreibschutz-Attribut: das ist
+                # die einzige Aenderung - mit Freigabe und Ausweis.
+                if (-not (Confirm-Write $filePath 'Schreibschutz-Attribut entfernen')) {
+                    $stats.WouldChange++
+                    if (-not $script:UseProgress) { Write-Host "-> WHATIF (Schreibschutz-Attribut)" -ForegroundColor DarkCyan }
+                    Write-Log    "Simulation: wuerde Schreibschutz-Attribut entfernen: $filePath" "INFO"
+                    Write-CsvLog -Status "WHATIF" -Actions "Wuerde Schreibschutz-Attribut entfernen" -Path $filePath
+                } elseif (Clear-ReadOnlyAttribut $srcLong) {
+                    $roEntfernt = $true
+                    $stats.Unlocked++
+                    if (-not $script:UseProgress) { Write-Host "-> OK (Schreibschutz-Attribut)" -ForegroundColor Green }
+                    Write-Log    "Erledigt: $filePath  [Schreibschutz-Attribut]" "INFO"
+                    Write-CsvLog -Status "OK" -Actions "Schreibschutz-Attribut entfernt" -Path $filePath
+                } else {
+                    $stats.Errors++
+                    if (-not $script:UseProgress) { Write-Host "-> ERR (Schreibschutz-Attribut)" -ForegroundColor Red }
+                    Write-Log    "Schreibschutz-Attribut nicht entfernbar: $filePath" "ERROR"
+                    Write-CsvLog -Status "ERR" -Actions "Schreibschutz-Attribut nicht entfernbar" -Path $filePath
+                }
             } else {
                 if (-not $script:UseProgress) { Write-Host "-> Kein Schutz" -ForegroundColor Gray }
                 Write-CsvLog -Status "NO_CHANGE" -Actions "Kein Schutz gefunden" -Path $filePath
@@ -2311,10 +2693,12 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
 
     } catch {
         $stats.Errors++
-        if ($wasConverted) { $stats.Converted-- }
         if ($backupPath -and [System.IO.File]::Exists($backupPath)) {
             try { [System.IO.File]::Delete($backupPath) } catch {}
         }
+        # Hier landet nur, was VOR dem inneren Schreib-try scheitert (z. B.
+        # die Backup-Kopie) - das Original ist dann unveraendert.
+        if ($roEntfernt -and [System.IO.File]::Exists($srcLong)) { Set-ReadOnlyAttribut $srcLong }
         if (-not $script:UseProgress) { Write-Host "-> ERROR: $($_.Exception.Message)" -ForegroundColor Red }
         Write-Log "Allg. Fehler: $filePath - $_" "ERROR"
         Write-DetailedLog "Allg. Fehler Detail: $_" "ERROR"
@@ -2342,9 +2726,15 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
     }
 }
 } catch [System.OperationCanceledException] {
-    Write-Host "`nVerarbeitung durch Nutzer abgebrochen." -ForegroundColor Yellow
-    Write-Log "Verarbeitung durch Nutzer abgebrochen." "WARN"
+    if ($script:FremdePptAbbruch -and -not $script:ShouldStop) {
+        Write-Host "`nVerarbeitung abgebrochen: PowerPoint des Anwenders laeuft." -ForegroundColor Red
+        Write-Log "Verarbeitung abgebrochen: PowerPoint des Anwenders laeuft - COM-Arbeit eingestellt." "ERROR"
+    } else {
+        Write-Host "`nVerarbeitung durch Nutzer abgebrochen." -ForegroundColor Yellow
+        Write-Log "Verarbeitung durch Nutzer abgebrochen." "WARN"
+    }
 }
+try { if ($script:CtrlCAsInput) { [Console]::TreatControlCAsInput = $false; $script:CtrlCAsInput = $false } } catch {}
 
 # ==================================================================
 # AUFRAEUMEN & STATISTIK
@@ -2405,8 +2795,17 @@ if ($script:LogWriter) {
 Invoke-WindowsTempCleanup
 Close-Loggers
 
+if ($script:FremdePptAbbruch) {
+    Write-Host ""
+    Write-Host "ACHTUNG: Lauf wegen laufender PowerPoint-Sitzung abgebrochen (Exitcode 3)." -ForegroundColor Red
+    Write-Host "PowerPoint beenden und das Skript erneut starten." -ForegroundColor Red
+}
+
 if (-not $NoInteractive.IsPresent) {
     Write-Host ""
     Write-Host "Beliebige Taste druecken zum Beenden..." -ForegroundColor DarkGray
     try { $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") } catch {}
 }
+
+# Exitcode 3 = PowerPoint des Anwenders lief (Abbruch zu seinem Schutz).
+if ($script:FremdePptAbbruch) { exit 3 }

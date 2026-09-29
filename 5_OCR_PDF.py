@@ -21,8 +21,14 @@
 # --watch / --daemon:  Hotfolder-Modus
 # --verify-markers:    Vorhandene PDF/A-Marker gegen veraPDF prüfen
 #                      und bei Abweichung korrigieren/neu verarbeiten
-# --cleanup-backups:   Zu Beginn Backup-Leichen rekursiv löschen
+# --cleanup-backups:   Zu Beginn Reste abgebrochener Läufe rekursiv löschen
 #                      (Default: Nein – spart Zeit auf großen Ablagen)
+# --pdfa-upgrade:      PDF/A-2b-markierte Dateien bei Ziel pdfa-2u erneut
+#                      verarbeiten (nur mit veraPDF; sonst nie erneut)
+#
+# ANHÄNGE: Dateien mit eingebetteten Dateien (ZUGFeRD/XRechnung, Akten-
+# anhänge) werden bei PDF/A-Ausgabe übersprungen. Jede Ausgabe wird vor dem
+# Ersetzen gegen das Original geprüft (Seiten, Anhänge, Formularfelder).
 # --clear-mru:         Recent-Documents-Liste leeren (Default: Aus)
 # --no-initial-scan:   Watch-Modus: vorhandene PDFs beim Start NICHT
 #                      einreihen (Default: Initial-Scan aktiv)
@@ -46,6 +52,7 @@ import shutil
 import io
 import re
 import csv
+import math
 import uuid
 import hashlib
 import tempfile
@@ -116,7 +123,7 @@ os.environ["OMP_THREAD_LIMIT"] = "1"
 # ==================================================================
 try:
     import ocrmypdf
-    from ocrmypdf.exceptions import PriorOcrFoundError
+    from ocrmypdf.exceptions import PriorOcrFoundError, ExitCode
     import fitz
     try:
         fitz.TOOLS.mupdf_display_errors(False)
@@ -1655,6 +1662,23 @@ def _same_volume(a: str, b: str) -> bool:
         return False
 
 
+# Dateiattribute, die safe_replace_with_retry vom Original auf die neue
+# Fassung uebertraegt. ARCHIVE bewusst nicht: die neue Fassung IST geaendert,
+# und ein uebernommenes geloeschtes Archivbit wuerde sie vor einer
+# archivbitgesteuerten Sicherung verstecken.
+_ATTR_UEBERTRAGEN = 0x1 | 0x2 | 0x4 | 0x2000   # READONLY, HIDDEN, SYSTEM, NOT_CONTENT_INDEXED
+_ATTR_ARCHIVE     = 0x20
+_ATTR_NORMAL      = 0x80
+
+
+def _setze_dateiattribute(path: str, attrs: int) -> None:
+    try:
+        import win32api
+        win32api.SetFileAttributes(path, attrs if attrs else _ATTR_NORMAL)
+    except Exception as _e:
+        detail_logger.debug(f"_setze_dateiattribute: Exception verworfen: {_e!r}")
+
+
 def safe_replace_with_retry(src: str, dst: str, retries: int = 5, delay: float = 1.0) -> bool:
     # Ersetzt dst durch src OHNE Truncate-Fenster: shutil.move() faellt
     # cross-volume auf copy2 zurueck und schreibt das Ziel direkt neu --
@@ -1664,16 +1688,39 @@ def safe_replace_with_retry(src: str, dst: str, retries: int = 5, delay: float =
     # os.replace() atomar uebergeschoben; auf demselben Volume genuegt
     # os.replace() direkt. Das Ziel ist zu jedem Zeitpunkt entweder die
     # alte oder die neue Datei, nie ein Zwischenzustand.
+    #
+    # Dateiattribute: os.replace scheitert an schreibgeschuetzten Zielen,
+    # deshalb wird das Ziel vorher auf NORMAL gesetzt. Frueher blieb es
+    # dabei - die ersetzte Datei hatte ReadOnly/Hidden/System verloren, und
+    # bei GESCHEITERTEM Ersetzen auch das unveraenderte Original (gemessen:
+    # ReadOnly+Hidden vorher, danach beides weg, in beiden Faellen). Jetzt
+    # werden die Attribute gemerkt und zurueckgeschrieben: nach Erfolg auf
+    # die neue Fassung (ohne ARCHIVE, siehe _ATTR_UEBERTRAGEN), nach einem
+    # Fehlschlag unveraendert auf das Original.
     dst_lp = _lp(dst)
+    alte_attribute: Optional[int] = None
     try:
         if os.path.exists(dst_lp):
             import win32api, win32con
             try:
+                a = win32api.GetFileAttributes(dst_lp)
+                if a != -1:
+                    alte_attribute = a
                 win32api.SetFileAttributes(dst_lp, win32con.FILE_ATTRIBUTE_NORMAL)
             except Exception as _e:
                 detail_logger.debug(f"safe_replace_with_retry: Exception verworfen: {_e!r}")
     except Exception as _e:
         detail_logger.debug(f"safe_replace_with_retry: Exception verworfen: {_e!r}")
+
+    def _attribute_zurueck(ersetzt: bool) -> None:
+        if alte_attribute is None:
+            return
+        if ersetzt:
+            _setze_dateiattribute(
+                dst_lp, (alte_attribute & _ATTR_UEBERTRAGEN) | _ATTR_ARCHIVE)
+        else:
+            _setze_dateiattribute(
+                dst_lp, alte_attribute & (_ATTR_UEBERTRAGEN | _ATTR_ARCHIVE))
 
     if _same_volume(src, dst):
         stage = src
@@ -1694,6 +1741,7 @@ def safe_replace_with_retry(src: str, dst: str, retries: int = 5, delay: float =
             print(f"  ⚠️  Ersetzen fehlgeschlagen (Staging-Kopie): {src} → {dst}: "
                   f"{_fmt_exc(last_err) if last_err else '?'}")
             safe_remove(stage)
+            _attribute_zurueck(False)
             return False
 
     for attempt in range(retries):
@@ -1701,6 +1749,7 @@ def safe_replace_with_retry(src: str, dst: str, retries: int = 5, delay: float =
             os.replace(_lp(stage), dst_lp)
             if stage != src:
                 safe_remove(src)
+            _attribute_zurueck(True)
             return True
         except PermissionError as e:
             if attempt < retries - 1:
@@ -1712,6 +1761,7 @@ def safe_replace_with_retry(src: str, dst: str, retries: int = 5, delay: float =
             break
     if stage != src:
         safe_remove(stage)
+    _attribute_zurueck(False)
     return False
 
 
@@ -1926,22 +1976,34 @@ def cleanup_orphaned_backups(
                         detail_logger.debug(f"cleanup_orphaned_backups: Exception verworfen: {_e!r}")
                     continue
 
-                # NUR eigene Artefakte (<name>.pdf.backup): ein generischer
-                # *.backup-Filter wuerde fremde Sicherungsdateien loeschen.
+                # <name>.pdf.backup: legte process_pdf_file bis 09/2026 vor
+                # jedem OCR-Versuch an. Das Skript erzeugt keine mehr (siehe
+                # dort), hier geht es nur noch um Reste aelterer Laeufe.
+                # Der Name allein beweist aber nicht, dass die Datei vom
+                # Skript stammt - eine von Hand angelegte 'Vertrag.pdf.backup'
+                # sieht genauso aus und wurde frueher geloescht, sobald die
+                # PDF daneben lesbar war. Geloescht wird deshalb nur noch,
+                # was BYTEGLEICH mit der PDF daneben ist: dann geht nichts
+                # verloren, egal wer die Kopie angelegt hat. Das ist genau der
+                # haeufige Rest (Abbruch/Timeout waehrend der OCR, Original
+                # unveraendert). Alles andere bleibt liegen und wird gemeldet.
                 if low.endswith(".pdf.backup"):
                     full = os.path.join(root, f)
                     try:
                         if os.path.getmtime(_lp(full)) < cutoff:
-                            # Schutz vor Datenverlust: Stammt das Backup aus
-                            # einem hart abgebrochenen Lauf, kann es die
-                            # einzige intakte Kopie sein. Nur loeschen, wenn
-                            # die zugehoerige PDF existiert und lesbar ist.
                             sibling = _strip_long_path(full)[: -len(".backup")]
-                            if not (safe_exists(sibling) and _pdf_opens_ok(sibling)):
+                            gleich = False
+                            if safe_exists(sibling) and _pdf_opens_ok(sibling):
+                                try:
+                                    import filecmp
+                                    gleich = filecmp.cmp(_lp(full), _lp(sibling), shallow=False)
+                                except Exception as _e:
+                                    detail_logger.debug(f"cleanup_orphaned_backups: Vergleich: {_e!r}")
+                            if not gleich:
                                 kept += 1
-                                msg = (f"Backup NICHT geloescht – Original fehlt oder ist "
-                                       f"defekt (Backup ist evtl. die einzige intakte Kopie): "
-                                       f"{_strip_long_path(full)}")
+                                msg = (f"Backup NICHT geloescht – nicht inhaltsgleich mit der PDF "
+                                       f"daneben (oder diese fehlt/ist defekt); Herkunft nicht "
+                                       f"nachweisbar: {_strip_long_path(full)}")
                                 print(f"  ⚠️  {msg}")
                                 log_warning("cleanup_backups", msg)
                                 continue
@@ -1952,7 +2014,7 @@ def cleanup_orphaned_backups(
     except Exception as _e:
         detail_logger.debug(f"cleanup_orphaned_backups: Exception verworfen: {_e!r}")
     if kept:
-        print(f"  ⚠️  {kept} Backup(s) wegen fehlendem/defektem Original behalten – bitte manuell pruefen.")
+        print(f"  ⚠️  {kept} Backup(s) behalten (nicht inhaltsgleich mit der PDF daneben) – bitte manuell pruefen.")
     return count
 
 
@@ -2105,15 +2167,26 @@ def _analyze_image_for_print(doc, page, img_tuple, w: int, h: int, px: int,
     if image_color_components(doc, xref) >= 4:
         info["has_cmyk_images"] = True
 
-    # Platzierung auf der Seite suchen; ohne Treffer keine DPI-Aussage
+    # Platzierung auf der Seite suchen; ohne Treffer keine DPI-Aussage.
+    #
+    # Die Bildkanten werden ueber die Platzierungsmatrix vermessen, nicht
+    # ueber das umschliessende Rechteck. Bei einem um 90 Grad gedrehten Bild
+    # liegt die Pixelbreite entlang der RECHTECKHOEHE; max(w/Breite,
+    # h/Hoehe) teilte dann die falschen Kanten durcheinander. Gemessen: ein
+    # 1000x500-px-Bild, gedreht in 3x6 Zoll platziert, hat 166,7 dpi -
+    # gemeldet wurden 333 dpi und damit faelschlich das Druckprofil.
+    # Die Matrix bildet das Einheitsquadrat des Bildes auf die Seite ab;
+    # ihre Zeilen (a, b) und (c, d) sind die platzierten Bildkanten in pt,
+    # die Laengen gelten fuer jede Drehung und Scherung.
     try:
-        rects = page.get_image_rects(xref)
+        platzierungen = page.get_image_rects(xref, transform=True)
     except Exception:
-        rects = []
-    for r in rects or []:
+        platzierungen = []
+    for eintrag in platzierungen or []:
         try:
-            width_in  = float(r.width) / 72.0
-            height_in = float(r.height) / 72.0
+            r, mat = eintrag
+            width_in  = math.hypot(mat.a, mat.b) / 72.0
+            height_in = math.hypot(mat.c, mat.d) / 72.0
         except Exception:
             continue
         if width_in <= 0 or height_in <= 0:
@@ -2148,6 +2221,8 @@ def get_pdf_info(file_path: str) -> Dict[str, Any]:
         "is_encrypted":   False,
         "needs_repair":   False,
         "has_forms":      False,
+        "has_attachments": False,
+        "anhaenge_text":  "",
         "is_oversized":   False,
         "max_image_pixels": 0,
         "max_image_dpi":  0.0,
@@ -2203,6 +2278,16 @@ def get_pdf_info(file_path: str) -> Dict[str, Any]:
             elif LEGACY_MARKER in subject:
                 info["existing_marker"] = "LEGACY"
 
+            # Anhaenge zaehlen: eingebettete Dateien auf Dokumentebene
+            # (ZUGFeRD-/XRechnung-XML, Aktenanhaenge) und Datei-Anmerkungen
+            # auf den Seiten. Grundlage fuer den Anhangschutz in
+            # process_pdf_file (Befund E1).
+            try:
+                n_eingebettet = int(doc.embfile_count())
+            except Exception:
+                n_eingebettet = 0
+            n_seitenanhang = 0
+
             for page_num in range(len(doc)):
                 page = doc.load_page(page_num)
                 # get_text ist der teuerste Teil dieser Schleife und liefe bei
@@ -2216,6 +2301,11 @@ def get_pdf_info(file_path: str) -> Dict[str, Any]:
                     info["has_text"] = True
                 if not info["has_forms"] and list(page.widgets()):
                     info["has_forms"] = True
+                try:
+                    n_seitenanhang += sum(
+                        1 for _ in page.annots(types=[fitz.PDF_ANNOT_FILE_ATTACHMENT]))
+                except Exception as _e:
+                    detail_logger.debug(f"get_pdf_info: Exception verworfen: {_e!r}")
                 if not info["is_oversized"]:
                     rect = page.rect
                     if rect.width > MAX_PAGE_DIMENSION or rect.height > MAX_PAGE_DIMENSION:
@@ -2238,18 +2328,52 @@ def get_pdf_info(file_path: str) -> Dict[str, Any]:
                 except Exception as _e:
                     detail_logger.debug(f"get_pdf_info: Exception verworfen: {_e!r}")
 
-        # XMP-Rueckfall NUR bei tatsaechlich vorhandener Textebene.
-        # Die Marker aus dem Subject setzt ausschliesslich dieses Skript, sie
-        # belegen also wirklich eine OCR-Verarbeitung. Die XMP-Kennung sagt
-        # dagegen nur, dass die Datei als PDF/A vorliegt - das kann jeder
-        # Scanner oder jedes Archivwerkzeug erzeugt haben, ganz ohne OCR.
-        # Ein reiner Bild-Scan im Format PDF/A-2u galt damit als 'bereits
-        # verarbeitet' und wurde uebersprungen, obwohl er keine Textebene hat:
-        # genau die Dateien, deretwegen das Skript laeuft.
-        if info["existing_marker"] is None and info["has_text"]:
-            xmp_code = _read_xmp_pdfa_code(file_path)
-            if xmp_code in ("PDFA_2U", "PDFA_2B"):
-                info["existing_marker"] = xmp_code
+            if n_eingebettet or n_seitenanhang:
+                info["has_attachments"] = True
+                teile = []
+                if n_eingebettet:
+                    teile.append(f"{n_eingebettet} eingebettete Datei(en)")
+                if n_seitenanhang:
+                    teile.append(f"{n_seitenanhang} Datei-Anmerkung(en) auf Seiten")
+                info["anhaenge_text"] = ", ".join(teile)
+
+            # XMP-Rueckfall NUR bei tatsaechlich vorhandener Textebene.
+            # Die Marker aus dem Subject setzt ausschliesslich dieses Skript, sie
+            # belegen also wirklich eine OCR-Verarbeitung. Die XMP-Kennung sagt
+            # dagegen nur, dass die Datei als PDF/A vorliegt - das kann jeder
+            # Scanner oder jedes Archivwerkzeug erzeugt haben, ganz ohne OCR.
+            # Ein reiner Bild-Scan im Format PDF/A-2u galt damit als 'bereits
+            # verarbeitet' und wurde uebersprungen, obwohl er keine Textebene hat:
+            # genau die Dateien, deretwegen das Skript laeuft.
+            #
+            # 'Textebene vorhanden' hiess dabei: IRGENDEINE Seite hat Text.
+            # Ein Mischdokument - Textdeckblatt plus Scanseiten, von einem
+            # fremden Werkzeug als PDF/A-2u gekennzeichnet - galt damit als
+            # verarbeitet, die Scanseiten bekamen nie Text (gemessen:
+            # SKIP_MARKER_PDFA_2U, Seite 2 ohne Text, in jedem Lauf).
+            # Fremdes PDF/A-XMP zaehlt deshalb nur noch, wenn JEDE Seite Text
+            # hat - dann gaebe es fuer die OCR (skip_text) ohnehin nichts zu
+            # tun. Der Volldurchlauf ueber alle Seiten faellt nur fuer
+            # Dateien mit fremdem PDF/A-XMP und ohne eigenen Marker an.
+            if info["existing_marker"] is None and info["has_text"]:
+                xmp_code = _read_xmp_pdfa_code(file_path)
+                if xmp_code in ("PDFA_2U", "PDFA_2B"):
+                    seite_ohne_text = None
+                    for page_num in range(len(doc)):
+                        try:
+                            if not doc.load_page(page_num).get_text("text").strip():
+                                seite_ohne_text = page_num + 1
+                                break
+                        except Exception:
+                            seite_ohne_text = page_num + 1
+                            break
+                    if seite_ohne_text is None:
+                        info["existing_marker"] = xmp_code
+                    else:
+                        detail_logger.debug(
+                            f"get_pdf_info: fremdes PDF/A-XMP ({xmp_code}), aber Seite "
+                            f"{seite_ohne_text} ohne Text – nicht als verarbeitet gewertet: "
+                            f"{file_path}")
 
         info["has_ocr_marker"] = info["existing_marker"] is not None
 
@@ -2387,33 +2511,117 @@ def set_ocr_marker(file_path: str, marker_value: str) -> bool:
     return _add_ocr_marker_legacy(file_path, marker_value)
 
 
-def repair_pdf(file_path: str, temp_dir: str) -> bool:
+def repair_pdf_arbeitskopie(file_path: str, temp_dir: str) -> Optional[str]:
+    """Repariert eine PDF in eine ARBEITSKOPIE im Temp-Verzeichnis.
+
+    Liefert den Pfad der reparierten Kopie oder None. Das Original wird
+    NICHT angefasst; ersetzt wird es erst mit dem fertigen, geprueften
+    OCR-Ergebnis.
+
+    Die fruehere repair_pdf kopierte die Seiten per insert_pdf in ein
+    leeres Dokument und schob das Ergebnis SOFORT ueber das Original.
+    Gemessen an einer Testdatei mit zerstoerter xref: eingebettete Datei,
+    Lesezeichen, Titel/Autor/Subject, Seitenbeschriftungen und XMP waren
+    danach weg - endgueltig, auch wenn die Datei anschliessend wegen eines
+    Markers uebersprungen wurde oder die OCR scheiterte.
+
+    Reparatur jetzt ueber das ganze Dokument statt ueber seine Seiten:
+    zuerst qpdf (pikepdf oeffnen/speichern - dieselbe Bibliothek, mit der
+    ocrmypdf die Datei spaeter liest), sonst MuPDF (oeffnen repariert,
+    speichern schreibt die reparierte Struktur). Beide erhielten an der
+    Testdatei alles oben Genannte.
+    """
     tmp_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}_repaired.pdf")
-    # Zeitstempel und Sicherheitsinfo VOR dem Ersetzen festhalten. Die
-    # reparierte Datei wird per safe_replace_with_retry ueber das Original
-    # geschoben und ist danach eine neue Datei. Die Sicherung im Aufrufer
-    # greift zu spaet: sie liest erst nach dem Reparaturblock und wuerde
-    # damit den Reparaturzeitpunkt und die bereits verlorenen Rechte
-    # wiederherstellen. Gleiche Ursache und gleiche Loesung wie bei
-    # set_ocr_marker.
-    gesichert = _sichere_datei_metadaten(file_path)
+    p = _lp(file_path)
+    fehler = []
     try:
-        p = _lp(file_path)
-        with fitz.open(p) as src, fitz.open() as dst:
-            dst.insert_pdf(src)
-            dst.save(tmp_path, garbage=4, deflate=True)
-        if safe_replace_with_retry(tmp_path, file_path):
-            _stelle_datei_metadaten_her(file_path, gesichert)
-            return True
-        return False
+        import pikepdf
+        with pikepdf.Pdf.open(p) as pdf:
+            pdf.save(tmp_path)
+        return tmp_path
     except Exception as e:
-        log_warning("repair_pdf", f"Reparatur fehlgeschlagen ({file_path}): {_fmt_exc(e)}")
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception as _e:
-            detail_logger.debug(f"repair_pdf: Exception verworfen: {_e!r}")
-        return False
+        fehler.append(f"pikepdf: {_fmt_exc(e)}")
+        safe_remove(tmp_path)
+    try:
+        with fitz.open(p) as src:
+            src.save(tmp_path, garbage=1, deflate=True)
+        return tmp_path
+    except Exception as e:
+        fehler.append(f"MuPDF: {_fmt_exc(e)}")
+        safe_remove(tmp_path)
+    log_warning("repair_pdf", f"Reparatur fehlgeschlagen ({file_path}): {'; '.join(fehler)}")
+    return None
+
+
+def _pdf_inventar(pdf_path: str) -> Optional[Dict[str, Any]]:
+    """Was beim Ersetzen nicht verloren gehen darf: Seiten, eingebettete
+    Dateien (Name -> SHA-256 des Inhalts), Datei-Anmerkungen, Formularfelder.
+    None, wenn die Datei nicht lesbar ist."""
+    try:
+        import pikepdf
+        with pikepdf.Pdf.open(_lp(pdf_path)) as pdf:
+            anhaenge: Dict[str, Optional[str]] = {}
+            for name, spec in pdf.attachments.items():
+                try:
+                    anhaenge[str(name)] = hashlib.sha256(
+                        spec.get_file().read_bytes()).hexdigest()
+                except Exception:
+                    anhaenge[str(name)] = None
+            datei_anm = 0
+            for page in pdf.pages:
+                for annot in page.obj.get("/Annots", None) or []:
+                    try:
+                        if annot.get("/Subtype") == pikepdf.Name.FileAttachment:
+                            datei_anm += 1
+                    except Exception:
+                        continue
+            felder = 0
+            try:
+                acro = pdf.Root.get("/AcroForm")
+                if acro is not None and acro.get("/Fields") is not None:
+                    felder = len(acro.Fields)
+            except Exception:
+                felder = 0
+            return {"seiten": len(pdf.pages), "anhaenge": anhaenge,
+                    "datei_anm": datei_anm, "felder": felder}
+    except Exception as e:
+        detail_logger.debug(f"_pdf_inventar: nicht lesbar ({pdf_path}): {e!r}")
+        return None
+
+
+def pruefe_ausgabe_vollstaendig(original: str, ocr_eingabe: str,
+                                ausgabe: str) -> Optional[str]:
+    """Vergleicht die OCR-Ausgabe VOR dem Ersetzen mit dem Original.
+
+    Liefert None, wenn nichts verloren ging, sonst den Grund. Befund E1:
+    ocrmypdf meldete Erfolg (Rueckgabe 0), obwohl in der Ausgabe Anhaenge
+    fehlten - gemessen: Datei-Anmerkung auf einer Scanseite weg (deskew
+    rastert die Seite neu, auch bei output_type 'pdf'), ZUGFeRD-XML im
+    zweiten PDF/A-Durchlauf weg - und das Original wurde trotzdem ersetzt.
+    Verglichen wird mit dem ORIGINAL; nur wenn es nicht lesbar ist (defekt,
+    Reparaturfall), mit der Datei, die ocrmypdf tatsaechlich bekam.
+    """
+    ref = _pdf_inventar(original) or _pdf_inventar(ocr_eingabe)
+    if ref is None:
+        return "Eingabe nicht lesbar – Vollständigkeit nicht prüfbar"
+    neu = _pdf_inventar(ausgabe)
+    if neu is None:
+        return "Ausgabe nicht lesbar"
+    gruende = []
+    if neu["seiten"] != ref["seiten"]:
+        gruende.append(f"Seitenzahl {ref['seiten']} → {neu['seiten']}")
+    fehlend = [n for n in ref["anhaenge"] if n not in neu["anhaenge"]]
+    veraendert = [n for n, h in ref["anhaenge"].items()
+                  if n in neu["anhaenge"] and h is not None and neu["anhaenge"][n] != h]
+    if fehlend:
+        gruende.append(f"eingebettete Datei(en) fehlen: {', '.join(fehlend)}")
+    if veraendert:
+        gruende.append(f"eingebettete Datei(en) verändert: {', '.join(veraendert)}")
+    if neu["datei_anm"] < ref["datei_anm"]:
+        gruende.append(f"Datei-Anmerkungen {ref['datei_anm']} → {neu['datei_anm']}")
+    if neu["felder"] < ref["felder"]:
+        gruende.append(f"Formularfelder {ref['felder']} → {neu['felder']}")
+    return "; ".join(gruende) if gruende else None
 
 
 def try_remove_empty_password(file_path: str, temp_dir: str) -> bool:
@@ -3369,6 +3577,24 @@ def marker_code_for_output_type(output_type: str) -> str:
     return "PDF"
 
 
+def pdfa_upgrade_moeglich(config: Dict) -> bool:
+    """Darf eine als PDF/A-2b markierte Datei bei Ziel pdfa-2u erneut laufen?
+
+    Befund E4: Ohne veraPDF markiert resolve_pdfa_marker jedes Ergebnis
+    konservativ als PDF/A-2b. Bei Ziel pdfa-2u galt genau dieser Marker im
+    naechsten Lauf als 'Upgrade 2b -> 2u' - jeder Lauf verarbeitete damit
+    ALLE eigenen Dateien erneut, und das Ergebnis war wieder 2b. Gemessen
+    an einem JPEG-Scan: neuer Bildstrom in jeder Runde (Neukodierung,
+    Generationsverlust). Mit veraPDF laeuft es genauso im Kreis, wenn die
+    Datei 2u nicht erreicht (unvollstaendige ToUnicode-Tabellen).
+
+    Ein Upgrade ist deshalb nur noch moeglich, wenn veraPDF es ueberhaupt
+    bestaetigen kann UND der Anwender es mit --pdfa-upgrade ausdruecklich
+    anfordert (typisch: einmalig, nachdem veraPDF eingerichtet wurde).
+    """
+    return bool(config.get("pdfa_upgrade")) and bool(config.get("has_verapdf"))
+
+
 def _compose_subject(marker_value: str, old_subject: str) -> str:
     # Vorhandene INHALTLICHE Subject-Metadaten nicht zerstoeren: alte
     # Marker-Varianten werden entfernt, der verbleibende Beschreibungstext
@@ -3475,10 +3701,19 @@ def process_pdf_file(
             msg += "\n" + traceback.format_exc()
         log_entries.append(_LogEntry("ERROR", ctx, msg, False))
 
+    # Temp-Dateien, die bei JEDEM Ende der Verarbeitung weg muessen (die
+    # reparierte Arbeitskopie). Zwischen Reparatur und OCR liegen viele
+    # fruehe Ruecksprunge (Marker, Schutzpruefungen) - aufgeraeumt wird
+    # deshalb zentral in build_result.
+    arbeitsreste: List[str] = []
+
     def build_result(status: str, detail: str,
                      size_mb: float = 0.0, pages: int = 0,
                      error_msg: Optional[str] = None,
                      size_after_mb: float = 0.0) -> _ProcessResult:
+        for rest in arbeitsreste:
+            if safe_exists(rest):
+                safe_remove(rest)
         log_entries.extend(_worker_buffer_drain())
         return _ProcessResult(
             status=status, detail=detail,
@@ -3569,6 +3804,28 @@ def process_pdf_file(
             return build_result("SKIPPED", "SKIP_HAS_FORMS",
                                 size_mb=info["size_mb"], pages=info["pages"])
 
+        # Anhangschutz (Befund E1). PDF/A-2 erlaubt nur eingebettete Dateien,
+        # die selbst PDF/A sind; Ghostscript schreibt fremde Anhaenge zwar
+        # mit, warnt aber ('output may not conform to PDF/A-2'), und das
+        # Ergebnis traegt trotzdem die PDF/A-2b-Kennung. ZUGFeRD/XRechnung
+        # verlangen PDF/A-3 - die Umkennzeichnung auf 2b zerstoert die
+        # Konformitaet, und gemessen fehlte die Rechnungs-XML nach dem
+        # zweiten Durchlauf ganz. Solche Dateien werden bei PDF/A-Ziel
+        # uebersprungen statt still als Standard-PDF ausgegeben: ein
+        # stiller Formatwechsel ergaebe einen gemischten Bestand und liefe
+        # beim naechsten PDF/A-Lauf erneut in die 'Rekonvertierung'.
+        # Wer OCR fuer solche Dateien will, nimmt --output-type pdf (dann
+        # schuetzt die Vollstaendigkeitspruefung vor dem Ersetzen).
+        if (info.get("has_attachments")
+                and str(config.get("output_type", DEFAULT_OUTPUT_TYPE)).startswith("pdfa")):
+            pwrite(f"  ⚠️  Enthält Anhänge ({info.get('anhaenge_text')}) – PDF/A-2 würde sie "
+                   f"verändern oder verlieren; zum Schutz übersprungen "
+                   f"(OCR ohne PDF/A: --output-type pdf)")
+            lwarn(log_context, f"Anhänge erkannt ({info.get('anhaenge_text')}) – "
+                               f"bei PDF/A-Ziel uebersprungen: {file_path}")
+            return build_result("SKIPPED", "SKIP_HAS_ATTACHMENTS",
+                                size_mb=info["size_mb"], pages=info["pages"])
+
         if info["is_oversized"]:
             pwrite(f"  ⚠️  Physische Dimensionen zu groß (>{MAX_PAGE_DIMENSION} pt ≈ "
                    f"{MAX_PAGE_DIMENSION / 72:.0f} Zoll) – überspringe")
@@ -3601,14 +3858,24 @@ def process_pdf_file(
         return _abbruch
 
     # --- Beschädigte Struktur reparieren ---
+    # Nur als ARBEITSKOPIE (Befund E2): die reparierte Datei dient als
+    # OCR-Eingabe, das Original wird erst mit dem geprueften OCR-Ergebnis
+    # ersetzt. Endet die Verarbeitung vorher (Marker, Schutzpruefung,
+    # OCR-Fehler), bleibt das Original byte-gleich.
+    repariert: Optional[str] = None
     if pdf_info["needs_repair"]:
-        pwrite("  🔧 Beschädigte PDF-Struktur – versuche Reparatur ...")
-        if repair_pdf(file_path, temp_dir):
-            pwrite("  ✓ Reparatur erfolgreich")
-            linfo(log_context, f"Repariert: {file_path}")
+        pwrite("  🔧 Beschädigte PDF-Struktur – repariere Arbeitskopie ...")
+        repariert = repair_pdf_arbeitskopie(file_path, temp_dir)
+        if repariert:
+            arbeitsreste.append(repariert)
+            pwrite("  ✓ Reparatur erfolgreich (Arbeitskopie; Original unverändert)")
+            linfo(log_context, f"Repariert (Arbeitskopie {repariert}): {file_path}")
             # Erst jetzt sind Seitenzahl, Formularfelder, Bildgroessen und
             # Marker ueberhaupt lesbar - Schutzpruefungen deshalb wiederholen.
-            pdf_info = get_pdf_info(file_path)
+            # Die Groesse bleibt die des Originals (Statistik vorher/nachher).
+            pdf_info = get_pdf_info(repariert)
+            pdf_info["path"]    = file_path
+            pdf_info["size_mb"] = file_size_mb
             if not pdf_info["is_valid"]:
                 pwrite("  ✗ Nach Reparatur nicht lesbar – überspringe")
                 lwarn(log_context, f"Nach Reparatur nicht lesbar: {file_path}")
@@ -3656,10 +3923,14 @@ def process_pdf_file(
                             pages=pdf_info["pages"])
 
     if found_marker == "PDFA_2B":
-        if output_type == "pdfa-2u":
+        if output_type == "pdfa-2u" and pdfa_upgrade_moeglich(config):
             pass
         else:
-            pwrite("  ✓ Bereits im Format PDF/A-2b (Metadaten-Marker)")
+            if output_type == "pdfa-2u":
+                pwrite("  ✓ Bereits als PDF/A-2b verarbeitet – kein erneuter Lauf "
+                       "(Upgrade auf 2u nur mit veraPDF und --pdfa-upgrade)")
+            else:
+                pwrite("  ✓ Bereits im Format PDF/A-2b (Metadaten-Marker)")
             linfo(log_context, "Übersprungen – PDF/A-2b-Marker vorhanden")
             return build_result("SKIPPED", "SKIP_MARKER_PDFA_2B",
                                 size_mb=pdf_info["size_mb"],
@@ -3687,7 +3958,11 @@ def process_pdf_file(
         pwrite("  ℹ️  Enthält bereits Text (ocrmypdf entscheidet mit skip_text=True)")
 
     # --- Temporäre Kopie als Input (mit AV-Scanner-Toleranz) ---
-    temp_input = create_temp_copy(file_path, temp_dir)
+    # Nach einer Reparatur ist die reparierte Arbeitskopie die Eingabe.
+    if repariert and safe_exists(repariert):
+        temp_input = repariert
+    else:
+        temp_input = create_temp_copy(file_path, temp_dir)
     if not temp_input:
         pwrite("  ✗ Temp-Kopie nicht erstellbar")
         lerr(log_context, "Temp-Kopie fehlgeschlagen")
@@ -3755,7 +4030,15 @@ def process_pdf_file(
     ocr_successful   = False
     ocr_error_msg    = None
     last_error_kind  = None
-    backup_file      = file_path + ".backup"
+    # Keine '<name>.pdf.backup' mehr (Befund E5). Sie wurde vor jedem
+    # Versuch neben dem Original angelegt und nie zurueckgespielt - das
+    # Original bleibt bis zum atomaren os.replace ohnehin unberuehrt (siehe
+    # safe_replace_with_retry). Nutzen hatte sie keinen, Schaden zweifach:
+    # eine vorhandene fremde 'Vertrag.pdf.backup' wurde ueberschrieben und
+    # danach geloescht (gemessen), und bei Worker-Timeout, zweitem Strg+C
+    # oder KeyboardInterrupt blieb sie neben dem Original liegen (gemessen)
+    # und wanderte mit in die Cloud. Dazu kam je Versuch eine volle Kopie
+    # ueber das Netz.
 
     # Harte Abbrüche (Signatur, korrupter Stream): Status, Detail, Fehlermeldung
     hard_status: Optional[Tuple[str, str, Optional[str]]] = None
@@ -3823,19 +4106,13 @@ def process_pdf_file(
                 current_options["color_conversion_strategy"] = "RGB"
                 color_fallback_applied = True
 
-        backup_success = False
+        # Fehlerart gilt je Versuch - sonst trug ein spaeterer, anders
+        # gearteter Fehlschlag noch die Art des vorigen Versuchs.
+        last_error_kind = None
         try:
-            if not safe_copy(file_path, backup_file):
-                if safe_exists(backup_file):
-                    safe_remove(backup_file)
-                last_error_kind = "BACKUP"
-                raise Exception("Backup-Erstellung fehlgeschlagen")
-
-            backup_success = True
-
             with _OcrMypdfLogCapture() as ocr_cap:
                 with io.StringIO() as err_buf, contextlib.redirect_stderr(err_buf):
-                    ocrmypdf.ocr(
+                    ocr_rc = ocrmypdf.ocr(
                         temp_input,
                         temp_output,
                         language=ocr_language,
@@ -3853,6 +4130,42 @@ def process_pdf_file(
                     if kw in combined_warnings.lower():
                         lwarn(log_context, f"OCR-Warnung: {combined_warnings[:300]}")
                         break
+
+            # --- Rueckgabewert von ocrmypdf auswerten (Befund E3) ---
+            # Im API-Modus meldet ocrmypdf zwei Fehlschlaege NICHT als
+            # Ausnahme, sondern als Rueckgabewert - und die Ausgabedatei
+            # liegt trotzdem da (ocrmypdf 17.4.1, _pipelines/_common.py,
+            # report_output_pdf):
+            #   ExitCode.pdfa_conversion_failed (10): die Ausgabe traegt keine
+            #     PDF/A-Kennung; check_pdf() laeuft in diesem Fall gar nicht
+            #     mehr, die Gueltigkeit ist also ungeprueft.
+            #   ExitCode.invalid_output_pdf (4): check_pdf() hat die Ausgabe
+            #     als ungueltige PDF erkannt.
+            # Frueher wurde der Wert verworfen: gemessen (Attrappe mit genau
+            # diesen Rueckgaben) ersetzte die Ausgabe in BEIDEN Faellen das
+            # Original, mit Marker 'PDF/A-2b' auf einer Datei ohne PDF/A-XMP.
+            # Jetzt: 4 -> nie ersetzen. 10 -> ebenfalls nicht ersetzen, weil
+            # (a) die Ausgabe ungeprueft ist, (b) der Anwender PDF/A verlangt
+            # hat und (c) eine als Standard-PDF markierte Datei beim naechsten
+            # PDF/A-Lauf wieder in die 'Rekonvertierung' liefe. Beides gilt
+            # als Fehlschlag des Versuchs; die naechsten Versuche laufen ohne
+            # deskew/clean und zuletzt mit RGB-Farbraum - genau die Mittel,
+            # an denen eine PDF/A-Konvertierung sonst scheitert.
+            try:
+                rc_wert = int(ocr_rc) if ocr_rc is not None else 0
+            except (TypeError, ValueError):
+                rc_wert = -1
+            if rc_wert == int(ExitCode.invalid_output_pdf):
+                last_error_kind = "OUTPUT_INVALID"
+                raise Exception("ocrmypdf-Rückgabe 4 (invalid_output_pdf): Ausgabe ist keine "
+                                "gültige PDF – Original NICHT ersetzt")
+            if rc_wert == int(ExitCode.pdfa_conversion_failed):
+                last_error_kind = "PDFA"
+                raise Exception("ocrmypdf-Rückgabe 10 (pdfa_conversion_failed): PDF/A-"
+                                "Konvertierung gescheitert – Original NICHT ersetzt")
+            if rc_wert != int(ExitCode.ok):
+                last_error_kind = "OCR"
+                raise Exception(f"ocrmypdf-Rückgabe {ocr_rc!r} – Original NICHT ersetzt")
 
             if os.path.exists(temp_output):
                 # --- veraPDF-Validierung VOR dem Verschieben ---
@@ -3888,14 +4201,24 @@ def process_pdf_file(
                         if not set_ocr_marker(temp_output, final_subject):
                             lwarn(log_context, "OCR-Marker konnte nicht gesetzt werden")
 
+                # --- Vollstaendigkeit pruefen, BEVOR das Original faellt ---
+                # (Befund E1) Seiten, eingebettete Dateien, Datei-Anmerkungen
+                # und Formularfelder der Ausgabe gegen das Original. Bei
+                # Verlust wird NICHT ersetzt; der Versuch gilt als gescheitert.
+                # Der naechste laeuft ohne deskew/clean - gemessen erhaelt
+                # ocrmypdf die Datei-Anmerkungen dann, weil die Seite nicht
+                # mehr neu gerastert wird.
+                verlust = pruefe_ausgabe_vollstaendig(file_path, temp_input, temp_output)
+                if verlust:
+                    last_error_kind = "VERLUST"
+                    raise Exception(f"Ausgabe unvollständig – Original NICHT ersetzt: {verlust}")
+
                 # --- Atomare Ersetzung temp_output → file_path ---
-                # os.replace laesst das Original bei JEDEM Fehlschlag intakt;
-                # ein Backup-Rueckspielen ist deshalb nicht mehr noetig.
+                # os.replace laesst das Original bei JEDEM Fehlschlag intakt.
                 if not safe_replace_with_retry(temp_output, file_path):
                     last_error_kind = "MOVE"
                     raise Exception(f"Ersetzen von {file_path} fehlgeschlagen (SMB-Lock?)")
 
-                safe_remove(backup_file)
                 ocr_successful = True
                 pwrite(f"  ✅ OCR erfolgreich (Marker: {final_marker_code or 'PDF'})")
                 linfo(log_context, f"OCR erfolgreich – Marker: {final_marker_code}")
@@ -3903,22 +4226,13 @@ def process_pdf_file(
             else:
                 # OCR hat keine Ausgabedatei produziert. file_path wurde NIE
                 # angetastet (ocrmypdf liest aus temp_input, schreibt nach
-                # temp_output - beide sind temporaere Pfade). Backup deshalb
-                # nur loeschen, NICHT zurueckspielen: Wuerden wir das Backup
-                # ueber file_path schreiben, koennte das im Hotfolder-Modus
-                # zwischenzeitlich vom Nutzer ersetzte Originale ueberschreiben
-                # (z.B. User legt neue Version waehrend OCR laeuft).
-                if backup_success and safe_exists(backup_file):
-                    safe_remove(backup_file)
+                # temp_output - beide sind temporaere Pfade).
                 last_error_kind = "NO_OUTPUT"
                 raise Exception("Ausgabedatei wurde nicht erstellt")
 
         except PriorOcrFoundError:
             pwrite("  ✓ Bereits OCR-verarbeitet (ocrmypdf-Erkennung)")
             linfo(log_context, "PriorOcrFoundError – Datei bereits verarbeitet")
-            # file_path wurde nicht modifiziert - Backup einfach loeschen.
-            if backup_success and safe_exists(backup_file):
-                safe_remove(backup_file)
 
             # --- Auch hier zentrale Marker-Strategie auf bestehender Datei ---
             verified_code = None
@@ -3952,9 +4266,6 @@ def process_pdf_file(
         except DigitalSignatureError:
             pwrite("  ⚠️  Digital signiertes PDF – OCR würde Signatur ungültig machen")
             lwarn(log_context, f"Digital signiert – übersprungen: {file_path}")
-            # file_path wurde nicht modifiziert - Backup einfach loeschen.
-            if backup_success and safe_exists(backup_file):
-                safe_remove(backup_file)
             hard_status = ("SKIPPED", "SKIP_SIGNED", None)
             break
 
@@ -3962,9 +4273,6 @@ def process_pdf_file(
             ocr_error_msg = _fmt_exc(e)
             pwrite(f"  ✗ PDF-Inhaltsstrom defekt – Retry chancenlos: {ocr_error_msg}")
             lerr(log_context, f"Korrupter PDF-Inhaltsstrom: {ocr_error_msg}")
-            # file_path wurde nicht modifiziert - Backup einfach loeschen.
-            if backup_success and safe_exists(backup_file):
-                safe_remove(backup_file)
             hard_status = ("ERROR", "ERROR_INVALID_STREAM", ocr_error_msg)
             break
 
@@ -3977,12 +4285,7 @@ def process_pdf_file(
             # ocrmypdf hat file_path nicht angefasst (liest aus temp_input,
             # schreibt nach temp_output), und die finale Ersetzung laeuft
             # atomar ueber os.replace - auch im MOVE-Fehlerfall bleibt das
-            # Original intakt. Backup daher in ALLEN Fehlerfaellen nur
-            # loeschen, nie zurueckspielen: Rueckspielen koennte im
-            # Hotfolder-Modus eine zwischenzeitlich vom Nutzer ersetzte
-            # Datei ueberschreiben.
-            if backup_success and safe_exists(backup_file):
-                safe_remove(backup_file)
+            # Original intakt.
 
             # String-Match-Fallback (Klassen-Match versagt sporadisch in spawn-Workern)
             if (
@@ -4099,10 +4402,14 @@ def process_pdf_file(
                             pages=pdf_info["pages"],
                             size_after_mb=get_file_size_mb(file_path))
     else:
-        if last_error_kind == "BACKUP":
-            detail = "ERROR_BACKUP"
-        elif last_error_kind == "MOVE":
+        if last_error_kind == "MOVE":
             detail = "ERROR_MOVE"
+        elif last_error_kind == "VERLUST":
+            detail = "ERROR_OUTPUT_LOSS"
+        elif last_error_kind == "PDFA":
+            detail = "ERROR_PDFA"
+        elif last_error_kind == "OUTPUT_INVALID":
+            detail = "ERROR_OUTPUT_INVALID"
         else:
             detail = "ERROR_OCR"
         return build_result("ERROR", detail,
@@ -4151,6 +4458,7 @@ def _new_stats() -> Dict[str, int]:
         "SKIP_OVERSIZED":      0,
         "SKIP_OVERSIZED_IMAGE": 0,
         "SKIP_HAS_FORMS":      0,
+        "SKIP_HAS_ATTACHMENTS": 0,
         "SKIP_LOCKED":         0,
         "SKIP_MEMORY":         0,
         "SKIP_SIGNED":         0,
@@ -4166,6 +4474,10 @@ def _new_stats() -> Dict[str, int]:
         "ERROR_BACKUP":         0,
         "ERROR_MOVE":           0,
         "ERROR_TIMEOUT":        0,
+        "ERROR_OUTPUT_LOSS":    0,
+        "ERROR_OUTPUT_INVALID": 0,
+        "ERROR_PDFA":           0,
+        "ERROR_ABORTED":        0,
     }
 
 
@@ -4368,9 +4680,13 @@ def dry_run_directory(
         marker         = info.get("existing_marker")
 
         skip_grund = None
-        if marker == "PDFA_2U":
+        if info.get("has_attachments") and target_is_pdfa:
+            skip_grund = (f"Anhänge ({info.get('anhaenge_text')}) – bei PDF/A-Ziel "
+                          f"übersprungen, OCR nur mit --output-type pdf")
+        elif marker == "PDFA_2U":
             skip_grund = "bereits PDF/A-2u"
-        elif marker == "PDFA_2B" and output_type != "pdfa-2u":
+        elif marker == "PDFA_2B" and not (output_type == "pdfa-2u"
+                                          and pdfa_upgrade_moeglich(config)):
             skip_grund = "bereits PDF/A-2b"
         elif marker in ("PDF", "LEGACY") and not target_is_pdfa:
             skip_grund = "bereits als Standard-PDF verarbeitet"
@@ -4397,7 +4713,8 @@ def dry_run_directory(
         except Exception as _e:
             detail_logger.debug(f"dry_run_directory: Exception verworfen: {_e!r}")
         if info.get("needs_repair"):
-            hinweise.append("Reparatur nötig")
+            hinweise.append("Reparatur nötig – nur als Arbeitskopie, Original wird "
+                            "erst mit dem geprüften OCR-Ergebnis ersetzt")
         if info.get("has_forms"):
             hinweise.append("Formularfelder")
 
@@ -4489,26 +4806,104 @@ def process_directory(
             append_resume(resume_path, result.file_path)
         _flush_log_handlers()
 
+    def _worker_abgebrochen(fp: str, pbar) -> None:
+        # Befund E6: Strg+C erreicht in der Konsole auch die Worker-Prozesse.
+        # Dort gibt es keinen eigenen Signal-Handler; der KeyboardInterrupt
+        # beendet process_pdf_file, der Pool reicht ihn als Ergebnis weiter,
+        # und future.result() wirft ihn im Hauptprozess erneut. Als
+        # BaseException ging er an 'except Exception' vorbei und riss
+        # process_directory mitten in der Auswertung ab - gemessen: fertige
+        # Dateien ohne CSV-Zeile und ohne Resume-Eintrag, keine Statistik.
+        # Jetzt: geordneter Abschluss wie beim ersten Strg+C (shutdown_event),
+        # die betroffene Datei bekommt eine CSV-Zeile, aber KEINEN Resume-
+        # Eintrag - sie ist nicht fertig und wird im naechsten Lauf erneut
+        # angefasst (das Original ist unversehrt; ein bereits ersetztes
+        # Ergebnis traegt den Marker und wird dann uebersprungen).
+        shutdown_event.set()
+        stats["ERROR"] += 1
+        stats["ERROR_ABORTED"] = stats.get("ERROR_ABORTED", 0) + 1
+        log_warning("process_directory",
+                    f"Abbruch (Strg+C) im Worker – nicht fertig verarbeitet: {fp}")
+        _write_error_csv(fp, "ERROR_ABORTED",
+                         "Strg+C im Worker – Datei nicht fertig verarbeitet")
+        pbar.write(f"  ⚠️  ABGEBROCHEN (Strg+C): {os.path.basename(fp)}")
+        _flush_log_handlers()
+
     with tqdm(total=total, desc="OCR", unit="PDF",
               bar_format=bar_fmt, disable=disable_tqdm) as pbar:
 
         if workers <= 1:
-            # Sequenzieller Modus
-            for file_path in iterable:
-                if shutdown_event.is_set():
-                    pbar.write("  ⚠️  Graceful Shutdown – Abbruch")
-                    break
-                try:
-                    result = process_pdf_file(file_path, config, temp_dir)
-                    _handle_result(result, pbar)
-                except Exception as e:
-                    log_error("process_directory", f"Kritisch: {file_path}: {_fmt_exc(e)}",
-                              exc_info=True)
-                    stats["ERROR"] += 1
-                    stats["ERROR_OCR"] = stats.get("ERROR_OCR", 0) + 1
-                    pbar.write(f"  ✗ KRITISCH: {os.path.basename(file_path)}")
-                finally:
-                    pbar.update(1)
+            # Sequenzieller Modus - jede Datei in einem Einzelprozess-Pool.
+            #
+            # Befund E8: Frueher lief process_pdf_file hier direkt im
+            # Hauptprozess, und WORKER_TIMEOUT galt nur im Pool. Eine
+            # haengende Datei (Ghostscript/Tesseract in der Endlosschleife)
+            # hielt den Lauf unbegrenzt an - gemessen mit Attrappe und
+            # WORKER_TIMEOUT=5 s: eine 40-s-Datei lief ungestoert durch.
+            # Jetzt dasselbe Muster wie im Hotfolder-Modus (_worker_loop):
+            # ein Pool mit einem Worker, Zeitlimit je Datei, bei
+            # Ueberschreitung Hard-Kill, frischer Pool und Aufraeumen der
+            # verwaisten Temp-Dateien. Gewartet wird in kurzen Schritten,
+            # damit der Signal-Handler (Strg+C) im Hauptprozess zum Zug kommt.
+            pool_kwargs_seq = {
+                "max_workers": 1,
+                "initializer": _worker_init_tempdir,
+                "initargs": (temp_dir,),
+            }
+            if sys.version_info >= (3, 11):
+                pool_kwargs_seq["max_tasks_per_child"] = 50
+            executor_seq = ProcessPoolExecutor(**pool_kwargs_seq)
+            try:
+                for file_path in iterable:
+                    if shutdown_event.is_set():
+                        pbar.write("  ⚠️  Graceful Shutdown – Abbruch")
+                        break
+                    try:
+                        future = executor_seq.submit(process_pdf_file, file_path, config, temp_dir)
+                        gestartet = time.time()
+                        while not future.done():
+                            concurrent.futures.wait([future], timeout=5)
+                            if not future.done() and time.time() - gestartet > WORKER_TIMEOUT:
+                                break
+                        if not future.done():
+                            log_error("process_directory",
+                                      f"Worker-Timeout ({WORKER_TIMEOUT//60} Min): {file_path}")
+                            stats["ERROR"] += 1
+                            stats["ERROR_TIMEOUT"] = stats.get("ERROR_TIMEOUT", 0) + 1
+                            _write_error_csv(file_path, "ERROR_TIMEOUT",
+                                             f"Worker-Timeout ({WORKER_TIMEOUT // 60} Min) – Hard-Kill")
+                            pbar.write(f"  ✗ TIMEOUT (Hard-Kill): {os.path.basename(file_path)}")
+                            _terminate_pool_workers(executor_seq)
+                            executor_seq.shutdown(wait=False)
+                            executor_seq = ProcessPoolExecutor(**pool_kwargs_seq)
+                            n_purged = _purge_orphan_temp_files(temp_dir)
+                            if n_purged:
+                                log_warning("process_directory",
+                                            f"Timeout: {n_purged} verwaiste Temp-Datei(en) entfernt")
+                            _flush_log_handlers()
+                            continue
+                        try:
+                            result = future.result()
+                        except BrokenProcessPool as e:
+                            _terminate_pool_workers(executor_seq)
+                            executor_seq.shutdown(wait=False)
+                            executor_seq = ProcessPoolExecutor(**pool_kwargs_seq)
+                            _purge_orphan_temp_files(temp_dir)
+                            raise Exception(f"Worker-Prozess gestorben – Pool neu gestartet: "
+                                            f"{_fmt_exc(e)}")
+                        _handle_result(result, pbar)
+                    except KeyboardInterrupt:
+                        _worker_abgebrochen(file_path, pbar)
+                    except Exception as e:
+                        log_error("process_directory", f"Kritisch: {file_path}: {_fmt_exc(e)}",
+                                  exc_info=True)
+                        stats["ERROR"] += 1
+                        stats["ERROR_OCR"] = stats.get("ERROR_OCR", 0) + 1
+                        pbar.write(f"  ✗ KRITISCH: {os.path.basename(file_path)}")
+                    finally:
+                        pbar.update(1)
+            finally:
+                executor_seq.shutdown(wait=True)
 
         else:
             # Paralleler Modus mit Hard-Kill, Pool-Reset und Heartbeat
@@ -4647,6 +5042,8 @@ def process_directory(
                                         active_workers.pop(fp_done, None)
                                     try:
                                         _handle_result(f_done.result(), pbar)
+                                    except KeyboardInterrupt:
+                                        _worker_abgebrochen(fp_done, pbar)
                                     except Exception as e_done:
                                         log_error(
                                             "process_directory",
@@ -4775,6 +5172,11 @@ def process_directory(
                                     pool_reset_needed = True
                                     _flush_log_handlers()
                                     break
+                                except KeyboardInterrupt:
+                                    # Siehe _worker_abgebrochen (Befund E6).
+                                    # Kein break: die uebrigen fertigen Futures
+                                    # dieser Runde werden weiter ausgewertet.
+                                    _worker_abgebrochen(fp, pbar)
                                 except Exception as e:
                                     log_error("process_directory",
                                               f"Worker-Fehler: {fp}: {_fmt_exc(e)}", exc_info=True)
@@ -4789,9 +5191,22 @@ def process_directory(
                                 break
 
                             if shutdown_event.is_set():
+                                # Noch nicht gestartete Auftraege zuruecknehmen,
+                                # LAUFENDE aber weiter einsammeln (Befund E6):
+                                # frueher folgte hier ein break, und die
+                                # Ergebnisse der Worker, die ihre Datei noch
+                                # fertig ersetzten, gingen ohne CSV-Zeile und
+                                # Resume-Eintrag verloren. Das Zeitlimit oben
+                                # gilt fuer sie weiter; _fill_queue reiht nach
+                                # dem Shutdown nichts mehr ein.
                                 for f in list(future_to_path.keys()):
-                                    f.cancel()
-                                break
+                                    if f.cancel():
+                                        fp_c, _st = future_to_path.pop(f)
+                                        with heartbeat_lock:
+                                            active_workers.pop(fp_c, None)
+                                if not future_to_path:
+                                    break
+                                continue
 
                             _fill_queue()
                     finally:
@@ -5088,6 +5503,21 @@ def run_watch_mode(
                     _write_csv_row(result)
                     _flush_log_handlers()
 
+                except KeyboardInterrupt:
+                    # Gleiche Ursache wie Befund E6 im Verzeichnismodus: der
+                    # KeyboardInterrupt des Workers kommt aus future.result()
+                    # und beendete bisher diesen Worker-Thread still, ohne
+                    # CSV-Zeile. Jetzt geordnet: Datei protokollieren, den
+                    # Hotfolder-Betrieb wie beim ersten Strg+C beenden.
+                    shutdown_event.set()
+                    with thread_lock:
+                        stats["ERROR"] += 1
+                        stats["ERROR_ABORTED"] = stats.get("ERROR_ABORTED", 0) + 1
+                        print(f"  [ABGEBROCHEN] {os.path.basename(file_path)}: Strg+C im Worker")
+                    log_warning("watch_mode", f"Abbruch (Strg+C) im Worker: {file_path}")
+                    _write_error_csv(file_path, "ERROR_ABORTED",
+                                     "Strg+C im Worker – Datei nicht fertig verarbeitet")
+
                 except Exception as e:
                     with thread_lock:
                         stats["ERROR"] += 1
@@ -5211,6 +5641,7 @@ def print_detailed_stats(stats: Dict[str, int]) -> None:
         ("Bereits als PDF/A-2b markiert", stats.get("SKIP_MARKER_PDFA_2B", 0)),
         ("Bereits als PDF markiert",      stats.get("SKIP_MARKER_PDF", 0)),
         ("Enthält Formularfelder",        stats.get("SKIP_HAS_FORMS", 0)),
+        ("Enthält Anhänge (PDF/A-Ziel)",  stats.get("SKIP_HAS_ATTACHMENTS", 0)),
         ("Verschlüsselt",                  stats.get("SKIP_ENCRYPTED", 0)),
         ("Digital signiert",               stats.get("SKIP_SIGNED", 0)),
         ("Physisch übergroß",              stats.get("SKIP_OVERSIZED", 0)),
@@ -5234,6 +5665,10 @@ def print_detailed_stats(stats: Dict[str, int]) -> None:
         ("Backup-Fehler",       stats.get("ERROR_BACKUP", 0)),
         ("Verschiebe-Fehler",   stats.get("ERROR_MOVE", 0)),
         ("Worker-Timeout",      stats.get("ERROR_TIMEOUT", 0)),
+        ("Ausgabe unvollständig (nicht ersetzt)", stats.get("ERROR_OUTPUT_LOSS", 0)),
+        ("Ausgabe ungültig (nicht ersetzt)",      stats.get("ERROR_OUTPUT_INVALID", 0)),
+        ("PDF/A gescheitert (nicht ersetzt)",     stats.get("ERROR_PDFA", 0)),
+        ("Abgebrochen (Strg+C im Worker)",        stats.get("ERROR_ABORTED", 0)),
         ("Requeue-Limit",       stats.get("ERROR_REQUEUE_LIMIT", 0)),
         ("Generation-Limit",    stats.get("ERROR_GENERATION_LIMIT", 0)),
     ]
@@ -5311,7 +5746,8 @@ def main() -> None:
     parser.add_argument("--verify-markers", action="store_true",
                         help="Vorhandene PDF/A-Marker gegen veraPDF prüfen und ggf. korrigieren")
     parser.add_argument("--cleanup-backups", action="store_true",
-                        help="Backup-Leichen (*.backup) beim Start rekursiv aufräumen")
+                        help="Reste abgebrochener Läufe (*.pdf.tmp_new, *.pdf.tmp_marker, "
+                             "inhaltsgleiche *.pdf.backup) beim Start rekursiv aufräumen")
     parser.add_argument("--clear-mru", action="store_true",
                         help="Recent-Documents-Liste leeren (Default: aus)")
     parser.add_argument("--no-initial-scan", action="store_true",
@@ -5325,6 +5761,9 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true",
                         help="Probelauf: zeigt je Datei die Entscheidung, "
                              "schreibt nichts")
+    parser.add_argument("--pdfa-upgrade", action="store_true",
+                        help="Bereits als PDF/A-2b markierte Dateien bei Ziel pdfa-2u "
+                             "erneut verarbeiten (nur mit veraPDF wirksam)")
     args = parser.parse_args()
 
     if args.clear_mru:
@@ -5391,12 +5830,14 @@ def main() -> None:
         print()
         print("—" * 70)
         print("  Backup-Leichen aufräumen?")
-        print("  Sucht rekursiv nach *.backup-Dateien aus abgebrochenen Läufen.")
+        print("  Sucht rekursiv nach Resten abgebrochener Läufe (*.pdf.tmp_new,")
+        print("  *.pdf.tmp_marker; *.pdf.backup älterer Skriptfassungen – diese nur,")
+        print("  wenn sie inhaltsgleich mit der PDF daneben sind).")
         print("  Vorteil: Saubere Ablage, keine Altlasten nach Abstürzen.")
         print("  Nachteil: Bei großen Netzlaufwerken mit tiefen Strukturen")
         print("            kann die Suche vor Beginn der Arbeit mehrere Minuten")
-        print("            bis Stunden dauern. Im Normalbetrieb werden Backups")
-        print("            ohnehin nach jeder erfolgreichen Datei einzeln gelöscht.")
+        print("            bis Stunden dauern. Neue *.backup-Dateien legt das")
+        print("            Skript nicht mehr an.")
         print("—" * 70)
         do_cleanup = ask_yes_no("  Jetzt nach Backup-Leichen suchen?", default_yes=False)
 
@@ -5435,8 +5876,9 @@ def main() -> None:
             temp_dir = _ORIG_WINDOWS_TEMP
         print(f"  → Fallback: {temp_dir}")
 
-    # Temp-Umlenkung auch fuer den MAIN-Prozess: im sequenziellen Modus
-    # (workers=1) laeuft ocrmypdf direkt im Hauptprozess - ohne Umlenkung
+    # Temp-Umlenkung auch fuer den MAIN-Prozess: bis 09/2026 lief ocrmypdf
+    # im sequenziellen Modus (workers=1) direkt im Hauptprozess (heute in
+    # einem Einzelprozess-Pool, siehe process_directory) - ohne Umlenkung
     # landeten dessen ocrmypdf.io.*-Zwischenordner im System-Temp und
     # blieben bei Abstuerzen als GB-grosser Muell liegen. Der echte
     # System-Temp-Pfad ist vorab in _ORIG_WINDOWS_TEMP gesichert; auch
@@ -5532,6 +5974,10 @@ def main() -> None:
                 config["verify_markers"] = True
 
     config["output_type"]      = output_type
+    config["pdfa_upgrade"]     = bool(args.pdfa_upgrade)
+    if args.pdfa_upgrade and not config.get("has_verapdf"):
+        print("  ⚠️  --pdfa-upgrade ohne veraPDF wirkungslos: ohne Validierung bliebe "
+              "jedes Ergebnis PDF/A-2b.")
     config["force_print_safe"] = bool(args.print_safe)
     config["no_print_safe"]    = bool(args.no_print_safe)
     if args.print_safe and args.no_print_safe:
@@ -5544,7 +5990,8 @@ def main() -> None:
         print()
         print("⚠️  HINWEIS: PDF/A-2u angefordert, aber veraPDF nicht verfügbar.")
         print("   Es wird konservativ höchstens PDF/A-2b markiert (kein 2u-Marker")
-        print("   ohne validierte Konformität).")
+        print("   ohne validierte Konformität). Bereits als 2b markierte Dateien")
+        print("   werden nicht erneut verarbeitet.")
 
     # --- Resume-Datei ---
     resume_path: Optional[str] = None
@@ -5587,7 +6034,10 @@ def main() -> None:
     print("    • skip_text=True   → Seiten mit Text werden übersprungen")
     print("    • OCR-Marker       → Info-Dict /Subject + XMP dc:description")
     print("    • XMP-Fallback     → pdfaid:part/conformance wird mitgelesen")
-    print("    • Backup           → Original gesichert, erst nach Erfolg gelöscht")
+    print("    • Ersetzen         → erst nach Vollständigkeitsprüfung (Seiten, Anhänge),")
+    print("                         atomar; Original bis dahin unberührt (keine .backup)")
+    if is_pdfa:
+        print("    • Anhänge          → Dateien mit Anhängen werden bei PDF/A übersprungen")
     print("    • Retry × 3        → ab Versuch 2 ohne clean/deskew/unpaper")
     print("    • Farbraum-Fix     → RGB-Konvertierung (proaktiv bei PDF/A)")
     print("    • Pillow-Toleranz  → LOAD_TRUNCATED_IMAGES = True, MAX_IMAGE_PIXELS = None")
@@ -5595,7 +6045,7 @@ def main() -> None:
     print("    • Stream-Schutz    → korrupte Inhaltsströme ohne Retry abgebrochen")
     print("    • Bitmap-Fallback  → bei pypdfium2-Speicherlimit Wechsel auf Ghostscript")
     print("    • Temp-Kopie       → AV-Scanner-Toleranz (Retry + Stabilisierung)")
-    print(f"    • Worker-Timeout   → {WORKER_TIMEOUT // 60} Min pro Datei (parallel, Hard-Kill + Pool-Reset)")
+    print(f"    • Worker-Timeout   → {WORKER_TIMEOUT // 60} Min pro Datei (auch sequenziell, Hard-Kill + Pool-Reset)")
     print(f"    • Heartbeat        → alle {HEARTBEAT_INTERVAL // 60} Min Lebenszeichen mit aktiven Workern")
     print("    • Log-Flush        → nach jeder Datei explizit auf Platte geschrieben")
     print("    • Run-Summary      → letzter Lauf wird zusätzlich als Datei abgelegt")
@@ -5605,6 +6055,8 @@ def main() -> None:
             print("    • veraPDF-Check   → Marker spiegelt validierte Konformität")
         else:
             print("    • Ohne veraPDF    → maximal PDF/A-2b-Marker (konservativ)")
+        if pdfa_upgrade_moeglich(config):
+            print("    • PDF/A-Upgrade   → 2b-markierte Dateien werden erneut verarbeitet")
         if config.get("verify_markers"):
             print("    • Marker-Verify   → alte Marker werden geprüft und korrigiert")
     if resume_path:

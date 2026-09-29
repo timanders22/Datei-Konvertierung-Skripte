@@ -152,6 +152,9 @@ XL_XLSB  = 50
 XL_NO_RESTRICTIONS = 0
 
 XL_EXCEL4_MACRO_SHEET = 3
+# Internationales Makroblatt (xlExcel4IntlMacroSheet) - ebenfalls XLM-Code,
+# geht als .xlsx genauso verloren wie Typ 3.
+XL_EXCEL4_INTL_MACRO_SHEET = 4
 
 XL_LOCAL_SESSION_CHANGES = 2
 
@@ -1753,6 +1756,17 @@ def safe_excel_open(excel_app, file_path, pw, corrupt_load=XL_CORRUPT_NORMAL,
             CorruptLoad               = corrupt_load,
         )
         with state_lock:
+            # Wie in _excel_call_with_watchdog: hat der Waechter schon
+            # zugeschlagen (Timeout lief ab, waehrend Open gerade
+            # zurueckkehrte), ist die Instanz getoetet und wb ein toter
+            # COM-Verweis. Frueher kam er hier trotzdem als Erfolg zurueck;
+            # der naechste Zugriff scheiterte dann mit einem RPC-Fehler,
+            # der als "Zugriff verweigert" endete. Nachgestellt mit einer
+            # Attrappe, deren Open erst nach dem Timeout zurueckkehrt:
+            # vorher Rueckgabe der Mappe, jetzt TimeoutError. Der Wurf
+            # landet im except unten und wird dort als Timeout gemeldet.
+            if timeout_flag[0]:
+                raise TimeoutError("Excel Timeout (Waechter hat nach Open zugeschlagen)")
             completed[0] = True
     except Exception:
         with state_lock:
@@ -1981,6 +1995,15 @@ def needs_version_update(
 # OOXML-Pre-Clean: Namenskonflikte VOR COM-Open entfernen
 # ==================================================================
 
+# "criteria", "extract", "kriterien", "extrahieren", "filterdatenbank" und
+# "konsolidierungsbereich" standen hier frueher ebenfalls (29.09.2026
+# entfernt, gleiche Begruendung wie bei _SYSTEM_NAMES_EXACT). In OOXML
+# traegt JEDER eingebaute Name das Praefix "_xlnm." (ECMA-376 Teil 1,
+# definedName; Excel schreibt auch in der deutschen Fassung nur diese
+# Form). Ein nackter Name "Kriterien" oder "Criteria" in xl/workbook.xml
+# ist deshalb ein Benutzername - der Pre-Clean loeschte ihn samt aller
+# Formelbezuege darauf (-> #NAME?), und zwar schon vorbeugend, sobald die
+# Mappe irgendeinen _xlnm-Eintrag (Druckbereich, AutoFilter) hatte.
 _BUILTIN_CONFLICT_NAMES_OOXML = {
     "_xlnm.print_area",
     "_xlnm.print_titles",
@@ -1991,15 +2014,9 @@ _BUILTIN_CONFLICT_NAMES_OOXML = {
     "print_area",
     "print_titles",
     "_filterdatabase",
-    "criteria",
-    "extract",
     "consolidate_area",
     "druckbereich",
     "drucktitel",
-    "filterdatenbank",
-    "kriterien",
-    "extrahieren",
-    "konsolidierungsbereich",
 }
 
 
@@ -2026,7 +2043,16 @@ def scan_definedName_conflicts(file_path: str) -> int:
             # diese Alternative verschmolz das Muster einen solchen
             # Eintrag mit dem NAECHSTEN bis zu dessen </definedName> -
             # der Pre-Clean traf damit den falschen Bereich.
-            r"<definedName[^>]*/>|<definedName[^>]*?>.*?</definedName>",
+            # Hier (und im Muster von pre_clean_definedNames) stand bis
+            # 29.09.2026 statt des Wortgrenzen-Kuerzels ein ECHTES
+            # Rueckschritt-Zeichen (Byte 0x08) - beim Einfuegen ueber die
+            # Schale aufgeloest, in keinem Editor sichtbar. Das Muster
+            # passte damit auf keine Mappe: diese Funktion lieferte immer
+            # 0, der Pre-Clean immer (False, 0). Byteweise nachgemessen,
+            # Nachweis mit Probemappe: vorher 0 Treffer, jetzt die
+            # erwarteten. Der Quelltext enthaelt keine Steuerzeichen mehr
+            # ausser Tabulator/CR/LF - bei Aenderungen erneut pruefen.
+            r"<definedName\b[^>]*/>|<definedName\b[^>]*?>.*?</definedName>",
             inner, re.DOTALL)
     count = 0
     for entry in entries:
@@ -2067,7 +2093,7 @@ def pre_clean_definedNames(file_path: str) -> Tuple[bool, int]:
             # diese Alternative verschmolz das Muster einen solchen
             # Eintrag mit dem NAECHSTEN bis zu dessen </definedName> -
             # der Pre-Clean traf damit den falschen Bereich.
-            r"<definedName[^>]*/>|<definedName[^>]*?>.*?</definedName>",
+            r"<definedName\b[^>]*/>|<definedName\b[^>]*?>.*?</definedName>",
             inner, re.DOTALL)
         if not entries:
             return (False, 0)
@@ -2502,6 +2528,26 @@ def remove_protection(
 # ==================================================================
 # Namen-Konfliktbereinigung (DESTRUKTIV – siehe Header)
 # ==================================================================
+# Nur Namen, die ausschliesslich eingebaute Namen sein koennen. Frueher
+# standen hier auch "criteria", "extract", "kriterien", "extrahieren",
+# "filterdatenbank" und "konsolidierungsbereich": ein selbst angelegter
+# Bereichsname gleichen Namens (etwa "Kriterien" fuer eine Auswertung)
+# wurde per nm.Delete() geloescht, jede Formel darauf zeigte danach
+# #NAME?. COM kennt kein "ist eingebaut"-Merkmal (Visible/MacroType
+# unterscheiden das nicht). Erkennbar ist ein eingebauter Name an
+#   - "_xlnm." in Name/NameLocal (Excels Speicherform), oder
+#   - Name (Makrosprache, englisch) != NameLocal (Oberflaechensprache):
+#     nur eingebaute Namen werden uebersetzt ("Criteria" -> "Kriterien");
+#     ein Benutzername heisst in beiden Eigenschaften gleich.
+# "Criteria"/"Extract" werden deshalb NUR geloescht, wenn Excel sie
+# uebersetzt anzeigt (_SYSTEM_NAMES_NUR_UEBERSETZT). In einer englischen
+# Oberflaeche bleibt ein eingebautes Criteria dann stehen - im Zweifel
+# nicht loeschen. "_FilterDatenbank" (so heisst der AutoFilter-Name in
+# der deutschen Oberflaeche) faellt ueber das englische "_FilterDatabase"
+# in Name; "filterdatenbank" ohne Unterstrich traf nur Benutzernamen.
+# Die Uebersetzungsregel ist aus der COM-Dokumentation (Name = Makro-
+# sprache, NameLocal = Benutzersprache) abgeleitet, nicht an Excel
+# gemessen - Stichprobe am echten Excel steht aus.
 _SYSTEM_NAMES_EXACT = {
     "_xlnm.print_area",
     "_xlnm.print_titles",
@@ -2512,15 +2558,14 @@ _SYSTEM_NAMES_EXACT = {
     "print_area",
     "print_titles",
     "_filterdatabase",
-    "criteria",
-    "extract",
     "consolidate_area",
     "druckbereich",
     "drucktitel",
-    "filterdatenbank",
-    "kriterien",
-    "extrahieren",
-    "konsolidierungsbereich",
+}
+
+_SYSTEM_NAMES_NUR_UEBERSETZT = {
+    "criteria",
+    "extract",
 }
 
 def _extract_local_name(full_name: str) -> str:
@@ -2569,6 +2614,14 @@ def resolve_name_conflicts(
                 local_en in _SYSTEM_NAMES_EXACT
                 or local_de in _SYSTEM_NAMES_EXACT
             )
+
+            # Criteria/Extract nur als eingebauter Name (von Excel
+            # uebersetzt angezeigt) - siehe _SYSTEM_NAMES_NUR_UEBERSETZT.
+            if (not should_delete
+                    and local_en in _SYSTEM_NAMES_NUR_UEBERSETZT
+                    and local_de
+                    and local_de != local_en):
+                should_delete = True
 
             if not should_delete:
                 should_delete = "_xlnm." in local_en or "_xlnm." in local_de
@@ -2670,6 +2723,96 @@ def _is_macro_format_error(exc: Exception, target_ext: str) -> bool:
         return True
     e_text = str(exc).lower()
     return any(kw in e_text for kw in ("macro", "makro", "vba", "0x800a03ec"))
+
+# ==================================================================
+# XLM-Funktionen in definierten Namen (Makroerkennung ergaenzend zu VBA)
+# ==================================================================
+# Excel-4.0-Makrofunktionen (XLM) stehen nicht nur auf Makroblaettern,
+# sondern auch in definierten Namen - verbreitet fuer Blattlisten
+# (GET.WORKBOOK), Zellformat-Abfragen (GET.CELL) und Textformeln
+# (EVALUATE). Beim Speichern in ein makrofreies Format (.xlsx/.xltx)
+# nennt Excel sie als nicht speicherbar ("Excel 4.0-Funktionen, die in
+# definierten Namen gespeichert sind"); mit DisplayAlerts=False wird ohne
+# Rueckfrage makrofrei gespeichert, jede Zelle mit Bezug auf einen solchen
+# Namen zeigt danach #NAME?. HasVBProject sieht davon nichts - solche
+# Mappen muessen wie VBA-Mappen ins Makroformat (.xlsm/.xltm).
+#
+# Auswahl der Muster (Gross/Klein egal):
+#   - GET.<...>(       alle XLM-Abfragefunktionen heissen GET.* (GET.CELL,
+#                      GET.WORKBOOK, GET.DOCUMENT, GET.WORKSPACE,
+#                      GET.FORMULA, GET.NAME, GET.DEF, GET.OBJECT,
+#                      GET.WINDOW, GET.NOTE, GET.LINK.INFO ...). Keine
+#                      Tabellenfunktion beginnt mit "GET." (GETPIVOTDATA
+#                      hat keinen Punkt).
+#   - <...>.ZUORDNEN(  deutsche Form derselben Familie (ZELLE.ZUORDNEN,
+#                      ARBEITSMAPPE.ZUORDNEN, DOKUMENT.ZUORDNEN ...); keine
+#                      Tabellenfunktion endet so.
+#   - einzeln          XLM-Funktionen ohne GET, die in Namen vorkommen und
+#                      KEINE gleichnamige Tabellenfunktion haben:
+#                      EVALUATE/AUSWERTEN, FILES/DATEIEN, DOCUMENTS/
+#                      DOKUMENTE, DIRECTORY/VERZEICHNIS, ACTIVE.CELL/
+#                      AKTIVE.ZELLE, CALLER/AUFRUFER, SELECTION, NAMES/
+#                      NAMEN, LINKS, WINDOWS, REFTEXT, TEXTREF, ABSREF,
+#                      RELREF, DEREF, CALL, REGISTER.ID.
+#                      Bewusst NICHT: CELL/ZELLE, INFO (Tabellenfunktionen).
+# Name.RefersTo liefert die Formel laut Dokumentation in der Makrosprache
+# (englisch); die deutschen Formen sind Absicherung. Sie stammen aus
+# Literatur/Foren, nicht aus einer Messung an diesem Rechner - ein
+# Fehlgriff kostet hoechstens .xlsm statt .xlsx, nie Daten. Vor dem Namen
+# darf kein Buchstabe, keine Ziffer, kein "_" und kein "." stehen.
+_XLM_IN_NAMEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_.À-ſ])"
+    r"(?:GET\.[A-Za-z0-9_.]+"
+    r"|[A-Za-zÀ-ſ][A-Za-z0-9_.À-ſ]*\.ZUORDNEN"
+    r"|EVALUATE|AUSWERTEN|FILES|DATEIEN|DOCUMENTS|DOKUMENTE"
+    r"|DIRECTORY|VERZEICHNIS|ACTIVE\.CELL|AKTIVE\.ZELLE|CALLER|AUFRUFER"
+    r"|SELECTION|NAMES|NAMEN|LINKS|WINDOWS|REFTEXT|TEXTREF|ABSREF|RELREF"
+    r"|DEREF|CALL|REGISTER\.ID)\(",
+    re.IGNORECASE,
+)
+
+# Name.MacroType: xlFunction = 1, xlCommand = 2 (xlNotXLM = 3). Ein Name
+# mit Typ 1/2 IST ein XLM-Makro (Makroblatt-Funktion bzw. -Befehl).
+_XL_NAME_MACRO_TYPES = (1, 2)
+
+
+def _hat_xlm_namen(wb) -> Tuple[bool, str]:
+    """(True, Grund), wenn ein definierter Name XLM-Funktionen nutzt oder
+    selbst ein XLM-Makro ist. Nicht lesbare Namen/Bezuege zaehlen
+    KONSERVATIV als Makro: ein unnoetiges .xlsm kostet nichts, ein
+    faelschliches .xlsx kostet die Formeln."""
+    try:
+        names  = wb.Names
+        anzahl = int(names.Count)
+    except Exception as e:
+        return True, f"Namensliste nicht lesbar ({e!r})"
+    for i in range(1, anzahl + 1):
+        try:
+            nm = names.Item(i)
+        except Exception as e:
+            return True, f"Name Nr. {i} nicht lesbar ({e!r})"
+        try:
+            bezug = str(nm.RefersTo)
+        except Exception as e:
+            return True, f"Bezug von Name Nr. {i} nicht lesbar ({e!r})"
+        if _XLM_IN_NAMEN_RE.search(bezug):
+            return True, f"XLM-Funktion in Name '{_name_text(nm, i)}'"
+        try:
+            if int(nm.MacroType) in _XL_NAME_MACRO_TYPES:
+                return True, f"Name '{_name_text(nm, i)}' ist ein XLM-Makro"
+        except Exception as _e:
+            detail_logger.debug(f"_hat_xlm_namen: MacroType nicht lesbar: {_e!r}")
+    return False, ""
+
+
+def _name_text(nm, ersatz) -> str:
+    # getattr(..., Vorgabe) faengt nur AttributeError, ein COM-Fehler
+    # beim Lesen kaeme durch - daher eigenes try.
+    try:
+        return str(nm.Name)
+    except Exception:
+        return f"Nr. {ersatz}"
+
 
 def _save_as_workbook(
     wb: win32com.client.CDispatch,
@@ -2792,6 +2935,11 @@ def convert_excel_file(
     move_started        = False
     # Reservierter Zielname (0-Byte-Platzhalter) - siehe Freigabe im finally.
     target_was_reserved = False
+    # Dateiattribute des Originals (nur gesetzt, wenn sie unten wirklich
+    # auf NORMAL gesetzt wurden) und Pfad der fertigen Ergebnisdatei - beide
+    # fuer die Wiederherstellung im finally (siehe _dateiattribute_zurueck).
+    orig_attribute      = None
+    ergebnis_pfad       = None
     ext            = os.path.splitext(file_path)[1].lower()
     is_template    = ext in (".xlt", ".xltx", ".xltm")
     is_addin       = ext in (".xla", ".xlam")
@@ -2903,11 +3051,35 @@ def convert_excel_file(
         except Exception as _e:
             detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
 
-        try:
-            win32api.SetFileAttributes(prepare_long_path(file_path), win32con.FILE_ATTRIBUTE_NORMAL)
-            detail_logger.debug(f"FILE_ATTRIBUTE_READONLY entfernt: {file_path}")
-        except Exception as _e:
-            detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
+        # Attribute (Schreibschutz/Versteckt/System/Archiv) wurden hier
+        # frueher bedingungslos auf NORMAL gesetzt - auch im Probelauf, der
+        # zusichert, nichts zu aendern, und auch bei Mappen, die danach
+        # ALREADY_CURRENT/SKIPPED/ERROR blieben. Zurueckgesetzt wurden sie
+        # nie: nach dem Lauf war jede schreibgeschuetzte oder versteckte
+        # Mappe der Ablage beschreibbar/sichtbar. Jetzt: im Probelauf gar
+        # nicht anfassen; im Echtlauf merken und im finally auf das
+        # Original (unveraendert) bzw. die Ergebnisdatei (UPDATED)
+        # zurueckschreiben. Nachgestellt an einer Probedatei mit
+        # READONLY|HIDDEN|ARCHIVE.
+        # Eine Langpfad-Temp-Kopie (is_temp_copy) wird wie bisher auf NORMAL
+        # gesetzt, aber nicht gemerkt - sie ist ein eigenes Arbeitsstueck.
+        if dry_run:
+            detail_logger.debug(f"[DRY-RUN] Dateiattribute bleiben unangetastet: {file_path}")
+        else:
+            _attr_vorher = None
+            if not is_temp_copy:
+                try:
+                    _attr_vorher = win32api.GetFileAttributes(prepare_long_path(file_path))
+                except Exception as _e:
+                    detail_logger.debug(f"convert_excel_file: Attribute nicht lesbar: {_e!r}")
+            try:
+                win32api.SetFileAttributes(prepare_long_path(file_path), win32con.FILE_ATTRIBUTE_NORMAL)
+                orig_attribute = _attr_vorher
+                detail_logger.debug(
+                    f"Dateiattribute voruebergehend auf NORMAL "
+                    f"(vorher 0x{(_attr_vorher or 0):X}): {file_path}")
+            except Exception as _e:
+                detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
 
         wait_for_file_unlocked(file_path, timeout=AV_WAIT_TIMEOUT)
 
@@ -3332,18 +3504,33 @@ def convert_excel_file(
             pbar.write(
                 "      (Trust Center: 'Zugriff auf VBA-Projektobjektmodell vertrauen' aktivieren)"
             )
+        # XLM-Makros: Typ 4 (internationales Makroblatt) fehlte hier - 4b
+        # prueft beide Typen schon. Dazu XLM-Funktionen in definierten
+        # Namen (siehe _hat_xlm_namen): ohne diese Pruefung wurde eine .xls
+        # mit GET.CELL-/EVALUATE-Namen als .xlsx gespeichert, die Namen
+        # fielen weg und jede Zelle darauf zeigte #NAME?.
         if not has_macros:
             try:
                 for sheet in wb.Sheets:
-                    if sheet.Type == XL_EXCEL4_MACRO_SHEET:
+                    if sheet.Type in (XL_EXCEL4_MACRO_SHEET,
+                                      XL_EXCEL4_INTL_MACRO_SHEET):
                         has_macros = True
                         detail_logger.info(
-                            f"Excel 4.0 Makroblatt erkannt: "
+                            f"Excel 4.0 Makroblatt erkannt (Typ {sheet.Type}): "
                             f"'{sheet.Name}' in {original_path}"
                         )
                         break
             except Exception as _e:
                 detail_logger.debug(f"convert_excel_file: Exception verworfen: {_e!r}")
+        if not has_macros:
+            _xlm_namen, _xlm_grund = _hat_xlm_namen(wb)
+            if _xlm_namen:
+                has_macros = True
+                detail_logger.info(
+                    f"XLM in definierten Namen ({_xlm_grund}) - speichere im "
+                    f"Makroformat: {original_path}"
+                )
+                pbar.write(f"  ⚠  {_xlm_grund} → Makroformat")
 
         if is_addin:
             new_format = XL_XLAM
@@ -3483,6 +3670,8 @@ def convert_excel_file(
 
         pbar.write(f"  ✓  Aktualisiert: '{_truncate_display(os.path.basename(original_path))}'")
         detail_logger.info(f"Erfolgreich: {original_path}")
+        # Ab hier gilt die Ergebnisdatei als Traeger der Original-Attribute.
+        ergebnis_pfad = target_path
         return "UPDATED"
 
     except Exception:
@@ -3568,6 +3757,39 @@ def convert_excel_file(
             safe_remove(file_path)
         if temp_save_path and safe_exists(temp_save_path):
             safe_remove(temp_save_path)
+        # Zuletzt, nach Zeitstempel und ACL: Original-Attribute zurueck -
+        # auf die Ergebnisdatei (UPDATED) bzw. das Original (alle anderen
+        # Ausgaenge; nach einem Rollback steht dort wieder das Original).
+        if orig_attribute is not None:
+            _dateiattribute_zurueck(ergebnis_pfad or original_path, orig_attribute)
+
+# ==================================================================
+# Dateiattribute zurueckschreiben
+# ==================================================================
+# Nur diese Bits laesst SetFileAttributes setzen; alles andere (Verzeichnis,
+# Komprimiert, Verschluesselt, Reparse ...) wird von Windows verwaltet.
+_SETZBARE_ATTRIBUTE = (
+    win32con.FILE_ATTRIBUTE_READONLY
+    | win32con.FILE_ATTRIBUTE_HIDDEN
+    | win32con.FILE_ATTRIBUTE_SYSTEM
+    | win32con.FILE_ATTRIBUTE_ARCHIVE
+    | 0x2000  # FILE_ATTRIBUTE_NOT_CONTENT_INDEXED
+)
+
+
+def _dateiattribute_zurueck(pfad: str, attribute: int) -> None:
+    """Schreibt gemerkte Dateiattribute zurueck (best effort, protokolliert)."""
+    if not pfad or not safe_exists(pfad):
+        return
+    wert = attribute & _SETZBARE_ATTRIBUTE
+    if not wert:
+        wert = win32con.FILE_ATTRIBUTE_NORMAL
+    try:
+        win32api.SetFileAttributes(prepare_long_path(pfad), wert)
+        detail_logger.debug(f"Dateiattribute wiederhergestellt (0x{wert:X}): {pfad}")
+    except Exception as _e:
+        detail_logger.warning(
+            f"Dateiattribute (0x{wert:X}) nicht wiederherstellbar: {pfad} – {_e!r}")
 
 # ==================================================================
 # Wrapper mit Retry
@@ -3594,10 +3816,38 @@ def process_file_with_retries(
             excel_app = excel_app_global
             detail_logger.debug(
                 "process_file_with_retries: Excel-Instanz nach Neustart nachgezogen.")
+        # Vor jeder WIEDERHOLUNG: lebt die Instanz noch? Ein RPC-Absturz
+        # (0x800706BA/0x800706BE/0x80010108 aus HRESULT_EXCEL_BUSY_OR_CRASH)
+        # wurde frueher gegen die tote Instanz wiederholt - jeder Versuch
+        # scheiterte schon beim Oeffnen, am Ende stand "Zugriff verweigert"
+        # (SKIPPED) statt eines Fehlers. Jetzt wird neu gestartet wie im
+        # Lebendtest von process_directory.
+        if attempt > 0:
+            try:
+                excel_app = _excel_lebend_oder_neu(excel_app)
+            except Exception as e_neu:
+                log_error(full_path, Exception(
+                    f"Excel-Neustart vor erneutem Versuch fehlgeschlagen: {e_neu}"))
+                result = "ERROR"
+                break
         try:
             result = convert_excel_file(
                 full_path, excel_app, pbar,
                 passwords, force_update, break_links, dry_run=dry_run)
+            break
+        # TimeoutError VOR OSError: er ist eine Unterklasse davon und lief
+        # frueher in den Dateisystem-Zweig - mit Wiederholung gegen die vom
+        # Waechter bereits getoetete Instanz und am Ende "Zugriff verweigert".
+        # Ein Timeout heisst: Excel hing (modaler Dialog, Freigabe haengt)
+        # und wurde beendet. Nicht wiederholen (jeder Versuch kostete bis zu
+        # SAVE_TIMEOUT), sondern als FEHLER werten; die naechste Datei
+        # bekommt ueber den Lebendtest in process_directory eine neue
+        # Instanz.
+        except TimeoutError as e:
+            log_error(full_path, Exception(
+                f"Zeitueberschreitung - Excel wurde vom Waechter beendet: {e}"))
+            pbar.write("  ✗  FEHLER: Zeitüberschreitung (Excel beendet) – siehe Fehler-Log.")
+            result = "ERROR"
             break
         except pythoncom.com_error as e:
             if e.hresult in HRESULT_EXCEL_BUSY_OR_CRASH and attempt < MAX_RETRIES - 1:
@@ -3618,6 +3868,23 @@ def process_file_with_retries(
             pbar.write(f"  ✗  Unerwarteter Fehler ({type(e).__name__}): siehe Detail-Log.")
             break
     return result
+
+
+def _excel_lebend_oder_neu(excel_app):
+    """Gibt excel_app zurueck, wenn die Instanz antwortet - sonst eine neu
+    gestartete (gleicher Ablauf wie der Lebendtest in process_directory)."""
+    try:
+        _ = excel_app.Version
+        return excel_app
+    except Exception:
+        detail_logger.warning(
+            "Excel-Instanz antwortet nicht (Absturz/Timeout) - starte neu vor erneutem Versuch.")
+    _quit_excel_app(excel_app)
+    _kill_orphaned_excel()
+    _cleanup_excel_inetcache()
+    _cleanup_user_recent()
+    time.sleep(2)
+    return _create_excel_app()
 
 # ==================================================================
 # Excel-Instanz-Fabrik
@@ -4245,7 +4512,13 @@ if __name__ == "__main__":
                 resume_file = candidate
                 resume_set  = existing
             else:
-                delete_resume_file(candidate)
+                # Im Probelauf NICHT loeschen: die Datei gehoert dem
+                # abgebrochenen Echtlauf. Frueher war sie nach "von vorn"
+                # im Probelauf weg, und der naechste Echtlauf begann ohne
+                # Fortsetzung von vorn. Der Probelauf prueft dann einfach
+                # alle Dateien.
+                if not args.dry_run:
+                    delete_resume_file(candidate)
                 resume_file = candidate
         else:
             resume_file = candidate
@@ -4402,7 +4675,10 @@ if __name__ == "__main__":
 
         # Auto-Resume-Datei nach vollstaendigem Lauf entfernen (eine vom
         # Nutzer via --resume uebergebene Datei bleibt unangetastet).
-        if auto_resume_owned and run_completed and resume_file:
+        # Nicht nach einem Probelauf: der schreibt keine Resume-Eintraege,
+        # loeschte aber die Datei eines abgebrochenen Echtlaufs - dessen
+        # Fortsetzung war damit verloren.
+        if auto_resume_owned and run_completed and resume_file and not args.dry_run:
             delete_resume_file(resume_file)
             detail_logger.info("Auto-Resume-Datei nach vollständigem Lauf gelöscht.")
 

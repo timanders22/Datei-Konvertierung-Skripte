@@ -379,14 +379,17 @@ function Write-SkipLogEntry {
 # ==============================================================================
 function Remove-LongPathPrefix {
     param ([string]$Path)
-    if ($Path -like '\\?\UNC\*') { return '\\' + $Path.Substring(8) }
-    if ($Path -like '\\?\*')     { return $Path.Substring(4) }
+    # StartsWith statt -like '\\?\*': bei -like ist '?' ein Platzhalter,
+    # ein UNC-Pfad mit einbuchstabigem Server ('\\s\share\...') galt dann
+    # als bereits praefixiert (gemessen unter 5.1). Ebenso unten und in 9.
+    if ($Path.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { return '\\' + $Path.Substring(8) }
+    if ($Path.StartsWith('\\?\'))     { return $Path.Substring(4) }
     return $Path
 }
 
 function Add-LongPathPrefix {
     param ([string]$Path)
-    if ($Path -like '\\?\*') { return $Path }
+    if ($Path.StartsWith('\\?\')) { return $Path }
     if ($Path -like '\\*')   { return '\\?\UNC\' + $Path.TrimStart('\') }
     if ($Path -match '^[A-Za-z]:\\') { return '\\?\' + $Path }
     return $Path
@@ -465,6 +468,25 @@ function Test-HasExcel4Macro {
                 $sr.Close()
             }
             if ($inhalt -match 'ms-excel\.macrosheet') { return $true }
+        }
+
+        # XLM-Funktionen in definierten Namen (GET.CELL, GET.WORKBOOK,
+        # EVALUATE ...). Sie stehen nicht auf einem Makroblatt, sondern in
+        # xl/workbook.xml, und gehen beim Speichern als .xlsx genauso
+        # verloren (Zellen darauf zeigen #NAME?). 3b und 4b sichern solche
+        # Mappen deshalb als .xlsm - ohne diese Pruefung machte 7 sie danach
+        # wieder zu .xlsx. In der Datei steht die Formel immer in der
+        # englischen Makrosprache; Namen mit function/vbProcedure/xlm="1"
+        # sind selbst XLM-Makros. Musterauswahl wie in 3b/4b (_XLM_IN_NAMEN_RE).
+        $wbEntry = $zip.Entries | Where-Object { $_.FullName -eq 'xl/workbook.xml' } | Select-Object -First 1
+        if ($wbEntry) {
+            $sr = New-Object System.IO.StreamReader($wbEntry.Open())
+            try { $wbXml = $sr.ReadToEnd() } finally { $sr.Close() }
+            $xlmMuster = '(?i)(?<![A-Za-z0-9_.])(?:GET\.[A-Za-z0-9_.]+|EVALUATE|FILES|DOCUMENTS|DIRECTORY|ACTIVE\.CELL|CALLER|SELECTION|NAMES|LINKS|WINDOWS|REFTEXT|TEXTREF|ABSREF|RELREF|DEREF|CALL|REGISTER\.ID)\('
+            foreach ($m in [regex]::Matches($wbXml, '(?s)<definedName\b([^>]*)>(.*?)</definedName>')) {
+                if ($m.Groups[1].Value -match '\b(function|vbProcedure|xlm)="(1|true)"') { return $true }
+                if ($m.Groups[2].Value -match $xlmMuster) { return $true }
+            }
         }
         return $false
     } catch {
@@ -744,10 +766,10 @@ function Get-FilesRecursiveSafe {
             # Long-Path-Praefix wird vom Framework nicht unterstuetzt -
             # nur beim Root rethrowen, damit der Fallback ohne \\?\ greift.
             # Bei tiefer liegenden Verzeichnissen einfach ueberspringen.
-            if ($current -eq $RootPath -and $current -like "\\?\*") { throw }
+            if ($current -eq $RootPath -and $current.StartsWith('\\?\')) { throw }
         }
         catch [System.NotSupportedException] {
-            if ($current -eq $RootPath -and $current -like "\\?\*") { throw }
+            if ($current -eq $RootPath -and $current.StartsWith('\\?\')) { throw }
         }
         catch { }
 
@@ -768,10 +790,10 @@ function Get-FilesRecursiveSafe {
         catch [System.IO.PathTooLongException]       { $script:SkippedPathTooLong++ }
         catch [System.IO.DirectoryNotFoundException] { }
         catch [System.ArgumentException] {
-            if ($current -eq $RootPath -and $current -like "\\?\*") { throw }
+            if ($current -eq $RootPath -and $current.StartsWith('\\?\')) { throw }
         }
         catch [System.NotSupportedException] {
-            if ($current -eq $RootPath -and $current -like "\\?\*") { throw }
+            if ($current -eq $RootPath -and $current.StartsWith('\\?\')) { throw }
         }
         catch { }
     }
@@ -1310,6 +1332,17 @@ if (-not $Automated) {
     }
 }
 
+# Relativen Pfad absolut machen. Test-Path loest gegen $PWD auf, die
+# [System.IO]-Aufrufe der Suche aber gegen das Arbeitsverzeichnis des
+# PROZESSES - bei '-RootPath .' oder 'Ordner' wurde so ein anderer Baum
+# durchsucht bzw. aus 'Ordner' ein ungueltiges '\\?\Ordner' (nachgestellt in
+# 9, dasselbe Muster). ProviderPath liefert den echten Dateisystempfad, auch
+# fuer gemappte Laufwerke und UNC.
+try {
+    $rootPath = (Resolve-Path -LiteralPath $rootPath -ErrorAction Stop).ProviderPath
+    if ($rootPath -notmatch '\\$') { $rootPath = $rootPath + '\' }
+} catch {}
+
 # ==============================================================================
 # Fortschrittsanzeige (3-Optionen-Menu, analog zu 2a/2b/2c)
 # ==============================================================================
@@ -1753,6 +1786,16 @@ foreach ($type in $fileTypes) {
                     }
                 }
 
+                # Lief die Frist waehrend der VBA-Pruefung ab, sind die
+                # Fehler der inneren catch-Zweige Folge des Eingriffs und
+                # kein Trust-Center-Problem - sonst stuende die Datei als
+                # "Kein VBA-Zugriff (Trust Center)" in der CSV statt als
+                # TIMEOUT. Die Ausnahme fuehrt in den Fehlerzweig, der die
+                # Datei unveraendert laesst und TIMEOUT protokolliert.
+                if ($null -ne $dateiWaechter -and $dateiWaechter.State.TimedOut) {
+                    throw "Zeitwaechter hat $($type.App) waehrend der VBA-Pruefung beendet"
+                }
+
                 if (-not $hasCode) {
 
                     # ==============================================================================
@@ -1910,9 +1953,34 @@ foreach ($type in $fileTypes) {
                             # Datei uebertragen (Admin: vollstaendig; Nutzer: DACL).
                             Set-FileSecuritySnapshot $networkTargetLong $secSnapshot
 
-                            Invoke-WithRetry -Action {
-                                [System.IO.File]::Delete($backupPathLong)
-                            } -MaxAttempts 4 -DelayMs 500
+                            # Ab hier steht das Ziel. Ein Fehler beim Entfernen
+                            # des Backups darf deshalb NICHT in die
+                            # Wiederherstellung unten laufen: die holte das
+                            # Original zurueck und liess die fertige Datei
+                            # daneben stehen - jeder weitere Lauf erzeugte dann
+                            # '_2', '_3' ... Nachgestellt mit einem
+                            # schreibgeschuetzten Original: File.Delete auf das
+                            # Backup wirft "Zugriff verweigert". Das Attribut
+                            # wird deshalb vorher entfernt und auf das Ziel
+                            # uebertragen; bleibt das Backup trotzdem stehen,
+                            # wird nur gewarnt (das Aufraeumen spaeterer Laeufe
+                            # erfasst es).
+                            $bakAttr = [System.IO.FileAttributes]::Normal
+                            try { $bakAttr = [System.IO.File]::GetAttributes($backupPathLong) } catch {}
+                            if ($bakAttr -band [System.IO.FileAttributes]::ReadOnly) {
+                                try {
+                                    [System.IO.File]::SetAttributes($backupPathLong, ($bakAttr -band (-bnot [System.IO.FileAttributes]::ReadOnly)))
+                                    $zielAttr = [System.IO.File]::GetAttributes($networkTargetLong)
+                                    [System.IO.File]::SetAttributes($networkTargetLong, ($zielAttr -bor [System.IO.FileAttributes]::ReadOnly))
+                                } catch {}
+                            }
+                            try {
+                                Invoke-WithRetry -Action {
+                                    [System.IO.File]::Delete($backupPathLong)
+                                } -MaxAttempts 4 -DelayMs 500
+                            } catch {
+                                Write-Log "Umgewandelt, aber Backup nicht loeschbar - bleibt liegen: $backupPath ($($_.Exception.Message))" -Level "WARN"
+                            }
 
                             if ($wasRenamed) {
                                 Write-Log "KONVERTIERT (umbenannt): $fileName -> $(Split-Path $networkTarget -Leaf)" -Level "SUCCESS"

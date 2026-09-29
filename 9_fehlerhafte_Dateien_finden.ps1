@@ -186,6 +186,10 @@ $script:ExcludeDirNames = @(
 
 $script:LogFile = $null
 $script:ShouldStop = $false
+# Exitcode am Laufende: 1, wenn gar nicht geprueft werden konnte oder der
+# Bericht verloren ist - fuer die Aufgabenplanung (-NoInteractive), die
+# sonst auch in diesen Faellen "Erfolg" sah.
+$script:ExitCode = 0
 $script:ReportShownInExcel = $false
 
 # Strg+C als Eingabe behandeln und in Such- und Pruefschleife pollen:
@@ -317,8 +321,8 @@ function Get-RunningOfficeSessions {
 function Remove-LongPathPrefix {
     param([string]$Path)
     if ([string]::IsNullOrEmpty($Path)) { return $Path }
-    if ($Path -like "\\?\UNC\*") { return "\\" + $Path.Substring(8) }
-    if ($Path -like "\\?\*")     { return $Path.Substring(4) }
+    if ($Path.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { return "\\" + $Path.Substring(8) }
+    if ($Path.StartsWith('\\?\'))     { return $Path.Substring(4) }
     return $Path
 }
 
@@ -681,12 +685,12 @@ function Get-FilesIterative {
             # Pfaden ist es ein einzelner kaputter Ordner (unzulaessige
             # Zeichen, Reserved Name, etc.); den nur loggen, sonst geht
             # der gesammelte Fortschritt aus tausenden Dateien verloren.
-            if ($current -eq $RootPath -and $current -like "\\?\*") { throw }
+            if ($current -eq $RootPath -and $current.StartsWith('\\?\')) { throw }
             $ErrorList.Add((New-ErrorRecord -Ordner "ENUMERATIONSFEHLER" -DateiPfad $clean `
                 -Kategorie "Pfadfehler" -Details "Ungültiger Pfad (Dateisuche): $($_.Exception.Message)"))
         }
         catch [System.NotSupportedException] {
-            if ($current -eq $RootPath -and $current -like "\\?\*") { throw }
+            if ($current -eq $RootPath -and $current.StartsWith('\\?\')) { throw }
             $ErrorList.Add((New-ErrorRecord -Ordner "ENUMERATIONSFEHLER" -DateiPfad $clean `
                 -Kategorie "Pfadfehler" -Details "Pfadformat nicht unterstützt: $($_.Exception.Message)"))
         }
@@ -713,12 +717,12 @@ function Get-FilesIterative {
                 -Kategorie "Zugriff verweigert" -Details "Keine Leseberechtigung (Unterordner von: $clean)"))
         }
         catch [System.ArgumentException] {
-            if ($current -eq $RootPath -and $current -like "\\?\*") { throw }
+            if ($current -eq $RootPath -and $current.StartsWith('\\?\')) { throw }
             $ErrorList.Add((New-ErrorRecord -Ordner "ENUMERATIONSFEHLER" -DateiPfad $clean `
                 -Kategorie "Pfadfehler" -Details "Ungültiger Pfad (Verzeichnissuche): $($_.Exception.Message)"))
         }
         catch [System.NotSupportedException] {
-            if ($current -eq $RootPath -and $current -like "\\?\*") { throw }
+            if ($current -eq $RootPath -and $current.StartsWith('\\?\')) { throw }
             $ErrorList.Add((New-ErrorRecord -Ordner "ENUMERATIONSFEHLER" -DateiPfad $clean `
                 -Kategorie "Pfadfehler" -Details "Pfadformat nicht unterstützt (Verzeichnissuche): $($_.Exception.Message)"))
         }
@@ -745,7 +749,7 @@ function Save-Checkpoint {
 
 if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
     Write-Host "Skript benötigt STA-Modus. Bitte mit 'powershell.exe -STA -File ...' starten." -ForegroundColor Red
-    Stop-Script
+    Stop-Script 1
 }
 
 # ---------------------------------------------------------------------
@@ -898,6 +902,14 @@ if (-not (Test-Path -LiteralPath $rootPath -PathType Container)) {
     Write-Host "dann bitte den UNC-Pfad ueber die manuelle Eingabe verwenden." -ForegroundColor Yellow
     Stop-Script 1
 }
+
+# Relativen Pfad (z. B. '-TargetPath Ordner') absolut machen. Test-Path oben
+# loest gegen $PWD auf; weiter unten wird daraus '\\?\Ordner' (ungueltig, die
+# Suche fand dann 0 Dateien und endete mit Exitcode 0), und ohne Praefix
+# gingen relative Pfade an Office, das gegen sein eigenes Arbeitsverzeichnis
+# aufloest (nachgestellt: EnumerateFiles('\\?\sub') wirft
+# DirectoryNotFoundException, EnumerateFiles('sub') liefert 'sub\a.docx').
+try { $rootPath = (Resolve-Path -LiteralPath $rootPath -ErrorAction Stop).ProviderPath } catch {}
 
 # ---------------------------------------------------------------------
 # 5b. Fortschrittsmodus
@@ -1637,6 +1649,7 @@ try {
             $results.Add((New-ErrorRecord -Ordner "ENUMERATIONSFEHLER" -DateiPfad $resolvedPath `
                 -Kategorie "Pfadfehler" -Details "Verzeichnis nicht durchsuchbar: $($_.Exception.Message)"))
             $allFiles.Clear()
+            $script:ExitCode = 1
         }
     }
 
@@ -1997,6 +2010,7 @@ try {
             } catch {
                 Write-Log -Message "CSV-Fallback fehlgeschlagen ($Reason): $($_.Exception.Message)" -Level ERROR -Color Red
                 Write-Log -Message "Checkpoint bleibt erhalten: $checkpointPath" -Level WARN -Color Yellow
+                $script:ExitCode = 1
             }
         }
 
@@ -2265,4 +2279,4 @@ finally {
     [System.GC]::WaitForPendingFinalizers()
 }
 
-Stop-Script
+Stop-Script $script:ExitCode

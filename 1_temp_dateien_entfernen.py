@@ -6,8 +6,9 @@
 # optionale Entfernung leerer Ordner.
 #
 # Kompatibel mit Microsoft Office 2019 (DE/EN) und Office 2024 – die relevanten
-# Sperr- und Recovery-Patterns (~$, ~wr, .asd, .wbk, .xlk, .~tmp, .~rf) sind
-# sprach- und versionsunabhängig.
+# Sperr- und Recovery-Patterns (~$, ~wr, .asd, .~tmp, .~rf; die
+# Sicherungskopien .wbk/.xlk nur auf Rückfrage) sind sprach- und
+# versionsunabhängig.
 #
 # NUTZUNG:
 #   python 1_temp_dateien_entfernen.py
@@ -129,11 +130,9 @@ _SUFFIX_RULES_BASE: Tuple[Tuple[str, str], ...] = (
     (".temp",         "windows"),
     (".~tmp",         "windows"),
     (".~rf",          "windows"),
-    (".dmp",          "windows"),
+    # .dmp, .wbk und .xlk stehen jetzt in _OPTIONAL_BAK_LOG_SUFFIXES.
     (".chk",          "windows"),
     (".asd",          "windows"),
-    (".wbk",          "windows"),
-    (".xlk",          "windows"),
     (".syd",          "windows"),
     (".swp",          "linux"),
     (".swo",          "linux"),
@@ -161,9 +160,22 @@ _SUFFIX_RULES_BASE: Tuple[Tuple[str, str], ...] = (
     (".!qb",          "other"),
 )
 
+# .dmp, .wbk und .xlk standen frueher in _SUFFIX_RULES_BASE und wurden
+# damit ohne Rueckfrage per os.remove geloescht, waehrend .bak nur auf
+# ausdruecklichen Wunsch faellt. Sie sind aber genauso Sicherungen bzw.
+# Nutzdaten:
+#   .wbk   Word 'Immer Sicherungskopie erstellen' ('Sicherungskopie von
+#          X.wbk') - die vorige Fassung des Dokuments, keine Sperrdatei.
+#   .xlk   dasselbe fuer Excel.
+#   .dmp   nicht nur Speicherabbilder, auch Oracle-Exporte (exp/expdp) -
+#          also Datenbanksicherungen.
+# Deshalb in dieselbe Rueckfrage wie .bak.
 _OPTIONAL_BAK_LOG_SUFFIXES: Tuple[Tuple[str, str], ...] = (
     (".bak", "windows"),
     (".log", "other"),
+    (".dmp", "windows"),
+    (".wbk", "windows"),
+    (".xlk", "windows"),
 )
 
 # Endungen, die NUR im Sonderfall eines Entwicklerprojekts Zwischenstaende
@@ -637,6 +649,54 @@ _RMTREE_KWARGS: Dict[str, Any] = (
 )
 
 # ================================================================================
+# Junctions und andere Umleitungen nicht betreten
+# ================================================================================
+# os.walk(followlinks=False) haelt nur bei SYMLINKS an. os.path.islink()
+# liefert fuer NTFS-Junctions (mklink /J) False, der Walk stieg also
+# hinein. Nachgestellt (29.09., Python 3.14) mit einer Junction auf einen
+# Ordner ausserhalb und einer zweiten auf den eigenen Wurzelordner:
+# walk_and_clean_junk lieferte 253 Dateien, 252 davon ueber die Junctions
+# (Loeschkandidaten ausserhalb des gewaehlten Baums), die Schleife lief
+# bis an die Pfadlaengengrenze, remove_empty_dirs haette 63 Ordner
+# entfernt. Geprueft wird das Reparse-Attribut selbst (st_file_attributes/
+# st_reparse_tag gibt es ab 3.8; os.path.isjunction erst ab 3.12).
+# Uebersprungen werden nur NAMENS-UMLEITUNGEN (Junction, Symlink,
+# Bit 0x20000000 im Reparse-Tag) - Cloud-Platzhalter (OneDrive u. a.)
+# tragen ebenfalls ein Reparse-Attribut, sind aber echte Ordner.
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_IO_REPARSE_TAG_NAME_SURROGATE = 0x20000000
+
+
+def _ist_umleitung(pfad: str) -> bool:
+    try:
+        st = os.lstat(pfad)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    if not getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT:
+        return False
+    tag = getattr(st, "st_reparse_tag", 0)
+    # Tag unbekannt: im Zweifel nicht betreten.
+    return not tag or bool(tag & _IO_REPARSE_TAG_NAME_SURROGATE)
+
+
+def _ohne_umleitungen(root: str, dirs: List[str], melden: bool = False) -> List[str]:
+    """Unterordner ohne Junctions/Symlinks; die Umleitung selbst bleibt
+    unangetastet (weder betreten noch geloescht)."""
+    behalten: List[str] = []
+    for d in dirs:
+        voll = os.path.join(root, d)
+        if _ist_umleitung(voll):
+            if melden:
+                logging.warning(
+                    f"Junction/Verknüpfung nicht betreten: {_strip_long_prefix(voll)}")
+            continue
+        behalten.append(d)
+    return behalten
+
+
+# ================================================================================
 # Kombinierter Walk: Mac-Junk-Dirs räumen + Dateien yielden
 # ================================================================================
 
@@ -691,6 +751,9 @@ def walk_and_clean_junk(
         schluessel = os.path.normcase(_strip_long_prefix(root))
         bereits_erledigt = bool(done_dirs) and schluessel in done_dirs
 
+        # Zuerst Umleitungen heraus: auch ein '__MACOSX', das eine Junction
+        # ist, wird weder betreten noch per rmtree geleert.
+        dirs[:] = _ohne_umleitungen(root, dirs, melden=True)
         junk = [d for d in dirs if d.lower() in _MAC_JUNK_DIRS_LOWER]
         dirs[:] = [d for d in dirs if d not in junk and not is_excluded_dir(d)]
 
@@ -881,7 +944,10 @@ def remove_empty_dirs(base_dir: str, dry_run: bool = False) -> Tuple[int, int]:
         logging.warning(f"Verzeichnis nicht lesbar – übersprungen: {err.filename}")
 
     for root, dirs, files in os.walk(base_dir, topdown=True, onerror=_walk_error):
-        dirs[:] = [d for d in dirs if not is_excluded_dir(d)]
+        # Junctions nicht betreten (siehe _ist_umleitung) - sonst wuerden
+        # leere Ordner AUSSERHALB des gewaehlten Baums entfernt. Gemeldet
+        # hat sie schon walk_and_clean_junk.
+        dirs[:] = [d for d in _ohne_umleitungen(root, dirs) if not is_excluded_dir(d)]
         if os.path.normpath(root) == norm_base:
             continue
         candidates.append(root)
@@ -1185,7 +1251,7 @@ def _count_files_with_progress(base_dir: str) -> int:
     last_print = time.monotonic()
     try:
         for root, dirs, files in os.walk(base_dir, topdown=True, onerror=_walk_error):
-            dirs[:] = [d for d in dirs
+            dirs[:] = [d for d in _ohne_umleitungen(root, dirs)
                        if not is_excluded_dir(d)
                        and d.lower() not in _MAC_JUNK_DIRS_LOWER]
             count += len(files)
@@ -1355,7 +1421,10 @@ def run_cleanup(
         logging.warning("Abgebrochen durch Benutzer")
         if fortschritt.pfad:
             print(f"    Fortschritt vermerkt in: {fortschritt.pfad}")
-            print("    Ein erneuter Start setzt dort fort (--no-resume beginnt neu).")
+            # Einen Schalter '--no-resume' gibt es nicht (das Skript liest
+            # keine Argumente); neu beginnt es nur mit der Umgebungsvariablen.
+            print("    Ein erneuter Start setzt dort fort (Umgebungsvariable")
+            print("    TEMPCLEANER_NO_RESUME=1 beginnt neu).")
         stats.print_summary(dry_run)
         return stats
     except Exception as e:
@@ -1426,8 +1495,9 @@ def main() -> None:
     )
 
     delete_bak_log = ask_yes_no(
-        "\n*.bak und *.log Dateien ebenfalls löschen?\n"
-        "  (⚠️  Riskant auf Netzlaufwerken – können Backups und Anwendungslogs sein)",
+        "\n*.bak, *.log, *.dmp, *.wbk und *.xlk Dateien ebenfalls löschen?\n"
+        "  (⚠️  Riskant auf Netzlaufwerken – können Backups und Anwendungslogs sein;\n"
+        "   *.wbk/*.xlk sind Word-/Excel-Sicherungskopien, *.dmp auch Oracle-Exporte)",
         default_yes=False,
     )
 
@@ -1479,13 +1549,14 @@ def main() -> None:
     print("    • ~wr*-Workfiles (Word)")
     print("    • ._-Artefakte (macOS auf Windows-Shares)")
     print("    • .ds_store, thumbs.db")
-    print("    • *.tmp / *.temp / *.asd / *.wbk / *.xlk")
+    print("    • *.tmp / *.temp / *.asd")
     print("    • *.crdownload, *.part (unvollst. Downloads)")
     print("    • *.swp / *.swo (Editor-Sperrdateien)")
     if delete_bak_log:
-        print("    • *.bak / *.log  (auf Nutzerwunsch aktiviert)")
+        print("    • *.bak / *.log / *.dmp / *.wbk / *.xlk  (auf Nutzerwunsch aktiviert)")
     else:
-        print("    ○ *.bak / *.log  (nicht aktiv – zu riskant auf Netzlaufwerken)")
+        print("    ○ *.bak / *.log / *.dmp / *.wbk / *.xlk  (nicht aktiv – Sicherungen,")
+        print("      Anwendungslogs, Oracle-Exporte)")
     if delete_desktop_ini:
         print("    • desktop.ini    (auf Nutzerwunsch aktiviert)")
     else:

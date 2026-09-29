@@ -824,24 +824,46 @@ def harden_program_dir(path):
     """
     if not IS_WINDOWS or not os.path.isdir(path):
         return False
-    # SIDs statt Klartextnamen: 'Benutzer'/'Users' ist sprachabhaengig.
-    args = ["icacls", path, "/inheritance:r",
-            "/grant", "*S-1-5-32-544:(OI)(CI)F",    # Administratoren
-            "/grant", "*S-1-5-18:(OI)(CI)F",        # SYSTEM
-            "/grant", "*S-1-5-32-545:(OI)(CI)RX"]   # Benutzer: nur lesen/starten
+    befehle = harden_program_dir_befehle(path)
     try:
-        if run_cmd(args, timeout=60).ok:
+        # Alle Aufrufe ausfuehren (auch wenn einer scheitert, ist der
+        # andere noch ein Gewinn); gehaertet ist es nur, wenn beide gingen.
+        ergebnisse = [run_cmd(args, timeout=120).ok for args in befehle]
+        if all(ergebnisse):
             log_info(f"✅ Zugriffsrechte gehärtet: {path}")
             return True
     except Exception as _e:
         logging.debug(f"harden_program_dir: Exception verworfen: {_e!r}")
     log_warn(f"   ⚠️ Zugriffsrechte für {path} konnten nicht gehärtet werden.")
     STATE["manual_actions"].append(
-        f'Zugriffsrechte härten (als Administrator): icacls "{path}" '
-        f'/inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F '
-        f'/grant *S-1-5-32-545:(OI)(CI)RX'
+        "Zugriffsrechte härten (als Administrator): "
+        + "  und  ".join(subprocess.list2cmdline(a) for a in befehle)
     )
     return False
+
+def harden_program_dir_befehle(path):
+    """Die icacls-Aufrufe fuer harden_program_dir (auch fuer den Hinweistext).
+
+    Ohne /setowner blieb der Anwender, der C:\\OCR in Stage 1 angelegt
+    und befuellt hatte, Besitzer von Ordner und Dateien. Der Besitzer hat
+    implizit WRITE_DAC: er konnte sich das entzogene Schreibrecht mit einem
+    einfachen 'icacls C:\\OCR /grant %USERNAME%:F' zurueckgeben und damit die
+    Haertung vollstaendig aushebeln (nachgestellt 29.09. ohne Adminrechte
+    an einem eigenen Ordner: nach der alten Haertung war Schreiben
+    verweigert, nach 'icacls <ordner> /grant <user>:(OI)(CI)F' wieder
+    moeglich). Deshalb zuerst den Besitz rekursiv (/T) auf Administratoren
+    setzen. Bewusst OHNE /C: damit meldet icacls auch bei gescheiterten
+    Eintraegen Exit-Code 0 (gemessen: '0 erfolgreich, 2 Fehler', rc 0) -
+    die Haertung galt dann als gelungen.
+    """
+    # SIDs statt Klartextnamen: 'Benutzer'/'Users' ist sprachabhaengig.
+    return [
+        ["icacls", path, "/setowner", "*S-1-5-32-544", "/T"],
+        ["icacls", path, "/inheritance:r",
+         "/grant", "*S-1-5-32-544:(OI)(CI)F",    # Administratoren
+         "/grant", "*S-1-5-18:(OI)(CI)F",        # SYSTEM
+         "/grant", "*S-1-5-32-545:(OI)(CI)RX"],  # Benutzer: nur lesen/starten
+    ]
 
 def stage_copy_file(source, label=None):
     if not source or not os.path.isfile(long_path(source)):
@@ -955,6 +977,197 @@ def verify_staged_entry(entry):
             return False
     # Bei Ordner-Stages zusaetzlich den gesamten Baum pruefen.
     return verify_staged_dir(entry)
+
+# -----------------------------------------------------------------------------
+# Stage 2: dem Manifest nichts glauben, was nicht im Skript selbst steht
+# -----------------------------------------------------------------------------
+# Das Manifest liegt im Stage-Ordner, auf den das aufrufende Konto Modify
+# behaelt (harden_stage_dir). Stage 2 uebernahm daraus bisher ungeprueft:
+# den Installer-Pfad (auch ausserhalb des Stage-Ordners), die Pruefsumme
+# (vom selben Konto geschrieben - schuetzt also nur gegen Versehen), das
+# Ziel eines 'ocr_binary' (beliebiger Pfad, z. B. C:\Windows\System32) und
+# bei 'pywin32_post' den auszufuehrenden Python-Interpreter. Wer das
+# Manifest aendern kann, liess damit beliebigen Code mit Adminrechten
+# laufen. Nachgestellt (29.09.) mit herausgeloestem stage2_install_pending
+# und Attrappen: ein Eintrag {"tool": "pywin32_post", "python":
+# "<Benutzerordner>\\boese.exe"} wurde als Admin-Aufruf abgesetzt, ebenso
+# ein 'ocr_binary' mit Ziel C:\Windows\System32.
+#
+# Gewaehlte Behebung (Begruendung):
+#  1. Allowlist aus den im Skript hinterlegten Werten: Werkzeugname,
+#     Dateiname passend zu TOOL_INSTALLERS bzw. festen Namen, Installer
+#     direkt im festen Stage-Ordner, 'ocr_binary'-Ziel nur direkt unter
+#     C:\OCR mit demselben Dateinamen, Python nur sys.executable bzw. eine
+#     Installation unter %ProgramFiles%. Was davon abweicht, wird nicht
+#     ausgefuehrt.
+#  2. Stage-Ordner aus dem Aufruf muss der feste STAGE_DIR sein (ohne
+#     Junction dazwischen).
+#  3. Ausgefuehrt wird eine PRIVATE Kopie in einem frischen Ordner, dessen
+#     ACL nur Administratoren und SYSTEM zulaesst; die Pruefsumme wird an
+#     dieser Kopie gebildet. Damit fallen geprueft und ausgefuehrt nicht
+#     mehr auseinander - auch nicht durch ein vorher geoeffnetes
+#     Schreib-Handle oder einen umbenannten Stage-Ordner (TOCTOU).
+#  Verworfen: den Stage-Ordner in Stage 2 in Admin-Besitz nehmen. Das
+#  schuetzt nicht vor einer Aenderung VOR dem Start von Stage 2 und sperrte
+#  den naechsten Stage-1-Lauf aus dem eigenen Stage-Ordner aus.
+#
+# RESTRISIKO: Installer-Inhalt und Pruefsumme stammen weiter aus Stage 1,
+# also aus dem Benutzerkontext. Ein Programm, das in diesem Konto laeuft,
+# kann vor dem Start von Stage 2 einen anderen Installer mit passendem
+# Namen samt Pruefsumme hinterlegen. Das laesst sich nur mit einer fest
+# hinterlegten Hash-Liste oder einer Signaturpruefung schliessen. Ebenso
+# ausserhalb dieser Pruefung: das Skript selbst und ein vom Benutzer
+# beschreibbarer Python-Interpreter, mit denen Stage 2 ohnehin laeuft.
+_STAGE2_WERKZEUGE = frozenset(TOOL_INSTALLERS) | {"verapdf", "ocr_binary", "pywin32_post"}
+_STAGE2_VERAPDF_ORDNER = "verapdf_installer"
+_STAGE2_VERAPDF_BAT    = "verapdf-install.bat"
+_STAGE2_PYWIN32_SKRIPT = "pywin32_postinstall.py"
+
+
+def _stage2_norm(pfad):
+    try:
+        return os.path.normcase(os.path.realpath(_strip_long_prefix(str(pfad))))
+    except Exception:
+        return ""
+
+
+def _stage2_liegt_unter(pfad, wurzel, direkt=False):
+    p, w = _stage2_norm(pfad), _stage2_norm(wurzel)
+    if not p or not w:
+        return False
+    if direkt:
+        return os.path.dirname(p) == w
+    return p.startswith(w.rstrip("\\/") + os.sep)
+
+
+def stage2_stage_root_ok():
+    """Der per --admin-stage uebergebene Ordner muss der feste STAGE_DIR sein.
+
+    realpath loest Junctions auf: zeigt C:\\tmp_skripte\\stage (oder ein
+    Elternordner) woanders hin, weicht das Ergebnis ab.
+    """
+    return (_stage2_norm(STAGE_ROOT) == os.path.normcase(os.path.abspath(STAGE_DIR)))
+
+
+def _stage2_python(wunsch=None):
+    """Python fuer pywin32_post: nur sys.executable oder eine Installation
+    unter %ProgramFiles% - nie ein Pfad, den nur das Manifest nennt."""
+    vertraut = []
+    if not getattr(sys, "frozen", False) and \
+            os.path.basename(sys.executable or "").lower() in ("python.exe", "pythonw.exe"):
+        vertraut.append(sys.executable)
+    for prog in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                 os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+        if prog:
+            vertraut.extend(glob.glob(os.path.join(prog, "Python*", "python.exe")))
+    if wunsch:
+        w = _stage2_norm(wunsch)
+        for v in vertraut:
+            if _stage2_norm(v) == w and os.path.isfile(v):
+                return v
+        return None
+    return vertraut[0] if vertraut else None
+
+
+def stage2_eintrag_pruefen(entry):
+    """Rueckgabe None, wenn der Eintrag zulaessig ist, sonst der Grund."""
+    if not isinstance(entry, dict):
+        return "kein gültiger Eintrag"
+    tool = entry.get("tool")
+    if tool not in _STAGE2_WERKZEUGE:
+        return f"unbekanntes Werkzeug {tool!r}"
+    inst = entry.get("installer")
+    if not isinstance(inst, str) or not inst:
+        return "kein Installer angegeben"
+    name = os.path.basename(_stage2_norm(inst))
+    # Eine Ordnerangabe kennt nur veraPDF; bei allen anderen wuerde sie
+    # einen fremden Baum in die private Kopie holen.
+    if tool != "verapdf" and entry.get("dir"):
+        return "unerwartete Ordnerangabe"
+
+    if tool in TOOL_INSTALLERS:
+        if not _stage2_liegt_unter(inst, STAGE_DIR, direkt=True):
+            return "Installer liegt nicht direkt im Stage-Ordner"
+        muster = [m.lower() for m in TOOL_INSTALLERS[tool].get("patterns", [])]
+        if not any(fnmatch.fnmatch(name, m) for m in muster):
+            return f"Dateiname {name!r} passt zu keinem Muster für {tool}"
+        if os.path.splitext(name)[1] not in (".exe", ".msi", ".msix"):
+            return f"Dateityp von {name!r} nicht zulässig"
+        return None
+
+    if tool == "verapdf":
+        ordner = os.path.join(STAGE_DIR, _STAGE2_VERAPDF_ORDNER)
+        d = entry.get("dir")
+        if not isinstance(d, str) or not d or _stage2_norm(d) != _stage2_norm(ordner):
+            return "veraPDF-Ordner ist nicht der feste Stage-Unterordner"
+        if name != _STAGE2_VERAPDF_BAT or not _stage2_liegt_unter(inst, ordner, direkt=True):
+            return "veraPDF-Installer ist nicht verapdf-install.bat im Stage-Unterordner"
+        return None
+
+    if tool == "ocr_binary":
+        if not _stage2_liegt_unter(inst, STAGE_DIR, direkt=True):
+            return "Datei liegt nicht direkt im Stage-Ordner"
+        if os.path.splitext(name)[1] not in (".exe", ".dll"):
+            return f"Dateityp von {name!r} nicht zulässig"
+        ziel = entry.get("target")
+        if not isinstance(ziel, str) or not ziel:
+            return "kein Ziel angegeben"
+        erlaubt = {os.path.normcase(os.path.abspath(OCR_DIR))} | {
+            os.path.normcase(os.path.abspath(c["target_dir"])) for c in TOOL_BINARIES.values()}
+        if os.path.dirname(_stage2_norm(ziel)) not in erlaubt:
+            return f"Ziel {ziel!r} liegt nicht direkt unter {OCR_DIR}"
+        if os.path.basename(_stage2_norm(ziel)) != name:
+            return "Zielname weicht vom Dateinamen der Stage-Kopie ab"
+        return None
+
+    # pywin32_post: Skript aus der Installation des geprueften Interpreters.
+    py = _stage2_python(entry.get("python"))
+    if not py:
+        return "Python-Interpreter ist weder sys.executable noch unter %ProgramFiles%"
+    if name != _STAGE2_PYWIN32_SKRIPT or not _stage2_liegt_unter(inst, os.path.dirname(py)):
+        return "pywin32_postinstall.py liegt nicht in der Python-Installation"
+    return None
+
+
+def _stage2_privater_ordner():
+    """Frischer Ordner, den nur Administratoren und SYSTEM beschreiben duerfen.
+
+    Unter UAC mit geteiltem Token ist %TEMP% der Ordner des Anwenders - die
+    ACL wird deshalb ausdruecklich gesetzt. Scheitert das, wird nichts
+    ausgefuehrt (zu statt auf).
+    """
+    try:
+        ordner = tempfile.mkdtemp(prefix="vorab_stage2_")
+    except Exception as e:
+        log_err(f"   ❌ Privater Stage-2-Ordner nicht anlegbar: {e}")
+        return None
+    r = run_cmd(["icacls", ordner, "/inheritance:r",
+                 "/grant:r", "*S-1-5-32-544:(OI)(CI)F",
+                 "/grant:r", "*S-1-5-18:(OI)(CI)F"], timeout=60)
+    if not r.ok:
+        log_err(f"   ❌ Zugriffsrechte für {ordner} nicht setzbar – keine Admin-Installation.")
+        shutil.rmtree(ordner, ignore_errors=True)
+        return None
+    return ordner
+
+
+def stage2_privatkopie(entry, privat):
+    """Kopiert Installer bzw. Installer-Ordner in den privaten Ordner und
+    liefert einen Eintrag, der auf die Kopie zeigt (None bei Fehler).
+    Die Pruefsumme bildet danach verify_staged_entry an genau dieser Kopie."""
+    try:
+        if entry.get("dir"):
+            quelle = entry["dir"]
+            ziel = os.path.join(privat, os.path.basename(quelle.rstrip("\\/")))
+            shutil.copytree(long_path(quelle), long_path(ziel))
+            rel = os.path.relpath(entry["installer"], quelle)
+            return dict(entry, dir=ziel, installer=os.path.join(ziel, rel))
+        ziel = os.path.join(privat, os.path.basename(entry["installer"]))
+        shutil.copyfile(long_path(entry["installer"]), long_path(ziel))
+        return dict(entry, installer=ziel)
+    except Exception as e:
+        log_err(f"   ❌ Private Kopie für '{entry.get('tool')}' fehlgeschlagen: {e}")
+        return None
 
 def write_stage_manifest(manifest):
     try:
@@ -2728,13 +2941,26 @@ def _check_multi_user_path():
     # (?:\\|$) statt \\ : sonst wird "C:\Users\meier" ohne Trailing-Backslash nicht erkannt.
     pattern = re.compile(r"^" + re.escape(users_root) + r"\\([^\\]+)(?:\\|$)", re.IGNORECASE)
     ignore = {"public", "default", "default user", "all users", "alluser"}
+    # Der Profilordner heisst nicht zwingend wie %USERNAME%: 'mustermann.DOMAENE'
+    # (gleicher Name lokal und in der Domaene), ein nach dem Umbenennen des
+    # Kontos alter Ordnername oder ein TEMP-Profil. Verglichen wurde nur mit
+    # %USERNAME% - das eigene Profil galt dann als fremd, und die Anleitung
+    # darunter empfahl, die eigenen PATH-Eintraege (Python, pip-Skripte) zu
+    # loeschen. Nachgestellt (29.09.): USERNAME=mustermann, USERPROFILE=
+    # C:\Users\mustermann.DOMAENE -> eigener Python-Pfad als 'fremd' gemeldet.
+    # Massgeblich ist deshalb der Ordnername aus %USERPROFILE%.
+    eigene = {current}
+    profil = (os.environ.get("USERPROFILE") or "").strip().strip('"\'').rstrip("\\/")
+    m_eigen = pattern.match(profil) if profil else None
+    if m_eigen:
+        eigene.add(m_eigen.group(1).lower())
     foreign = []
     for d in path_dirs:
         m = pattern.match(d)
         if not m:
             continue
         user_in_path = m.group(1).lower()
-        if user_in_path == current or user_in_path in ignore:
+        if user_in_path in eigene or user_in_path in ignore:
             continue
         foreign.append((d, user_in_path))
 
@@ -2770,75 +2996,112 @@ def _check_multi_user_path():
 def stage2_install_pending(manifest):
     log_info("--- Stage 2: Installiere vorgemerkte Tools mit Adminrechten ---")
     pending = manifest.get("admin_pending", [])
+    if not isinstance(pending, list):
+        pending = []
     if not pending:
         log_info("   Keine ausstehenden Admin-Installationen.")
         return
-    for entry in pending:
-        tool = entry.get("tool")
-        if not tool:
-            continue
-        if not verify_staged_entry(entry):
-            STATE["manual_actions"].append(
-                f"'{tool}' wurde NICHT installiert (Prüfsumme/Datei ungültig) – Stage 1 erneut ausführen."
-            )
-            continue
-        if tool == "verapdf":
-            # entry mitgeben: der Installer wird aus dem geprueften
-            # Manifest-Pfad gestartet, nicht per Namenssuche.
-            _install_verapdf_silent(deploy_available=False, entry=entry)
-        elif tool == "ocr_binary":
-            src = entry.get("installer")
-            tgt = entry.get("target")
-            if src and tgt:
-                if copy_file_safe(src, tgt):
-                    log_info(f"   ✅ {os.path.basename(tgt)} nach {os.path.dirname(tgt)} kopiert.")
-                    STATE["stage2_summary"].append(f"installed:{os.path.basename(tgt)}")
-                else:
-                    log_err(f"   ❌ {os.path.basename(tgt)} konnte nicht nach {os.path.dirname(tgt)} kopiert werden.")
-            else:
-                log_warn(f"   ⚠️ Stage-Datei für {os.path.basename(str(tgt))} nicht gefunden.")
-        elif tool == "pywin32_post":
-            cand = entry.get("installer")
-            py = entry.get("python") or PYTHON_EXE or find_python_exe()
-            if not py:
-                log_warn("   ⚠️ Kein Python-Interpreter für pywin32 post-install gefunden.")
-            elif cand and os.path.isfile(cand):
-                log_info("   Führe pywin32_postinstall.py (Admin) aus...")
-                rp = run_cmd([py, cand, "-install"], timeout=120)
-                if rp.ok:
-                    log_info("   ✅ pywin32 post-install (Admin) erfolgreich.")
-                    STATE["stage2_summary"].append("installed:pywin32_post")
-                else:
-                    log_err(f"   ❌ pywin32 post-install (Admin) fehlgeschlagen (Exit {rp.returncode}).")
-            else:
-                log_warn("   ⚠️ pywin32_postinstall.py nicht gefunden.")
-        else:
-            # WICHTIG: genau die Datei ausfuehren, die oben geprueft wurde.
-            #
-            # Vorher stand hier 'try_install_tool(tool, ...)'. Das suchte den
-            # Installer im Stage-Ordner NEU ueber ein Dateinamen-Muster
-            # (pick_installer_in_stage). Geprueft wurde damit entry['installer'],
-            # ausgefuehrt aber, was os.listdir als erstes passend lieferte -
-            # und diese Reihenfolge ist nicht zugesichert.
-            #
-            # Der Stage-Ordner ist zwar gehaertet, das aufrufende Konto behaelt
-            # aber Schreibrecht (Modify). Wer dort zwischen Stage 1 und Stage 2
-            # eine ZWEITE, ebenfalls zum Muster passende Datei ablegt, konnte
-            # so an der Pruefsumme vorbei eine beliebige EXE mit Adminrechten
-            # starten lassen - genau die lokale Rechteausweitung, gegen die
-            # das ganze Stage-Modell gebaut ist.
-            verified = entry.get("installer")
-            cfg = TOOL_INSTALLERS.get(tool) or {}
-            if not verified or not os.path.isfile(long_path(verified)):
-                log_err(f"   ❌ Geprüfter Installer für '{tool}' nicht mehr vorhanden – übersprungen.")
+    # Privater Ordner fuer die auszufuehrenden Kopien (siehe
+    # stage2_eintrag_pruefen); wird am Ende immer entfernt.
+    privat = None
+    try:
+        for entry in pending:
+            tool = entry.get("tool") if isinstance(entry, dict) else None
+            if not tool:
+                continue
+            grund = stage2_eintrag_pruefen(entry)
+            if grund:
+                log_err(f"   ❌ Manifest-Eintrag '{tool}' abgelehnt: {grund}")
                 STATE["manual_actions"].append(
-                    f"'{tool}' wurde NICHT installiert (Stage-Datei fehlt) – Stage 1 erneut ausführen."
+                    f"'{tool}' wurde NICHT installiert (Manifest-Eintrag abgelehnt: {grund}) "
+                    f"– Stage 1 erneut ausführen."
                 )
                 continue
-            if run_installer(verified, cfg):
-                STATE["installed_tools"].append(tool)
-                STATE["stage2_summary"].append(f"installed:{tool}")
+            # pywin32_postinstall.py bleibt an seinem Ort (es gehoert zur
+            # Python-Installation, mit der Stage 2 ohnehin laeuft); alles
+            # andere wird aus der privaten Kopie ausgefuehrt.
+            if tool != "pywin32_post":
+                if privat is None:
+                    privat = _stage2_privater_ordner()
+                kopie = stage2_privatkopie(entry, privat) if privat else None
+                if kopie is None:
+                    STATE["manual_actions"].append(
+                        f"'{tool}' wurde NICHT installiert (private Kopie nicht möglich) "
+                        f"– Stage 1 erneut ausführen."
+                    )
+                    continue
+                entry = kopie
+            _stage2_eintrag_ausfuehren(tool, entry)
+    finally:
+        if privat:
+            shutil.rmtree(privat, ignore_errors=True)
     print("")
+
+
+def _stage2_eintrag_ausfuehren(tool, entry):
+    if not verify_staged_entry(entry):
+        STATE["manual_actions"].append(
+            f"'{tool}' wurde NICHT installiert (Prüfsumme/Datei ungültig) – Stage 1 erneut ausführen."
+        )
+        return
+    if tool == "verapdf":
+        # entry mitgeben: der Installer wird aus dem geprueften
+        # Manifest-Pfad gestartet, nicht per Namenssuche.
+        _install_verapdf_silent(deploy_available=False, entry=entry)
+    elif tool == "ocr_binary":
+        src = entry.get("installer")
+        tgt = entry.get("target")
+        if src and tgt:
+            if copy_file_safe(src, tgt):
+                log_info(f"   ✅ {os.path.basename(tgt)} nach {os.path.dirname(tgt)} kopiert.")
+                STATE["stage2_summary"].append(f"installed:{os.path.basename(tgt)}")
+            else:
+                log_err(f"   ❌ {os.path.basename(tgt)} konnte nicht nach {os.path.dirname(tgt)} kopiert werden.")
+        else:
+            log_warn(f"   ⚠️ Stage-Datei für {os.path.basename(str(tgt))} nicht gefunden.")
+    elif tool == "pywin32_post":
+        cand = entry.get("installer")
+        # Nie den Manifest-Wert selbst: nur sys.executable bzw. eine
+        # Installation unter %ProgramFiles% (stage2_eintrag_pruefen).
+        py = _stage2_python(entry.get("python"))
+        if not py:
+            log_warn("   ⚠️ Kein Python-Interpreter für pywin32 post-install gefunden.")
+        elif cand and os.path.isfile(cand):
+            log_info("   Führe pywin32_postinstall.py (Admin) aus...")
+            rp = run_cmd([py, cand, "-install"], timeout=120)
+            if rp.ok:
+                log_info("   ✅ pywin32 post-install (Admin) erfolgreich.")
+                STATE["stage2_summary"].append("installed:pywin32_post")
+            else:
+                log_err(f"   ❌ pywin32 post-install (Admin) fehlgeschlagen (Exit {rp.returncode}).")
+        else:
+            log_warn("   ⚠️ pywin32_postinstall.py nicht gefunden.")
+    else:
+        # WICHTIG: genau die Datei ausfuehren, die oben geprueft wurde.
+        #
+        # Vorher stand hier 'try_install_tool(tool, ...)'. Das suchte den
+        # Installer im Stage-Ordner NEU ueber ein Dateinamen-Muster
+        # (pick_installer_in_stage). Geprueft wurde damit entry['installer'],
+        # ausgefuehrt aber, was os.listdir als erstes passend lieferte -
+        # und diese Reihenfolge ist nicht zugesichert.
+        #
+        # Der Stage-Ordner ist zwar gehaertet, das aufrufende Konto behaelt
+        # aber Schreibrecht (Modify). Wer dort zwischen Stage 1 und Stage 2
+        # eine ZWEITE, ebenfalls zum Muster passende Datei ablegt, konnte
+        # so an der Pruefsumme vorbei eine beliebige EXE mit Adminrechten
+        # starten lassen - genau die lokale Rechteausweitung, gegen die
+        # das ganze Stage-Modell gebaut ist.
+        verified = entry.get("installer")
+        cfg = TOOL_INSTALLERS.get(tool) or {}
+        if not verified or not os.path.isfile(long_path(verified)):
+            log_err(f"   ❌ Geprüfter Installer für '{tool}' nicht mehr vorhanden – übersprungen.")
+            STATE["manual_actions"].append(
+                f"'{tool}' wurde NICHT installiert (Stage-Datei fehlt) – Stage 1 erneut ausführen."
+            )
+            return
+        if run_installer(verified, cfg):
+            STATE["installed_tools"].append(tool)
+            STATE["stage2_summary"].append(f"installed:{tool}")
 
 # =============================================================================
 # Zusammenfassung
@@ -2906,6 +3169,91 @@ def print_summary():
 # Main – Stage-1 (User) und Stage-2 (Admin)
 # =============================================================================
 
+def _stage2_manifest_vorbereiten():
+    """Pruefsummen bilden und das Stage-Manifest fuer DIESEN Lauf schreiben.
+
+    Gemeinsam fuer 'jetzt starten' und 'spaeter nachholen'. Frueher schrieb
+    nur der erste Zweig ein Manifest; beim Nachholen lag dann das eines
+    FRUEHEREN Laufs im Stage-Ordner und waere verarbeitet worden (andere
+    Installer, alte Pruefsummen, die aktuellen Vormerkungen fehlten).
+    Rueckgabe True, wenn das Manifest geschrieben wurde.
+    """
+    # Altes Manifest zuerst weg: scheitert das Schreiben unten, darf kein
+    # Manifest eines frueheren Laufs uebrig bleiben.
+    try:
+        if os.path.isfile(STAGE_MANIFEST_FILE):
+            os.remove(STAGE_MANIFEST_FILE)
+    except Exception as _e:
+        logging.debug(f"_stage2_manifest_vorbereiten: Exception verworfen: {_e!r}")
+        log_err(f"   ❌ Altes Stage-Manifest nicht entfernbar: {STAGE_MANIFEST_FILE}")
+        return False
+    # Ergebnisdatei eines frueheren Laufs entfernen, sonst wuerde ein
+    # abgebrochener Stage-2-Lauf mit altem Ergebnis "bestaetigt".
+    try:
+        if os.path.isfile(STAGE_RESULT_FILE):
+            os.remove(STAGE_RESULT_FILE)
+    except Exception as _e:
+        logging.debug(f"_stage2_manifest_vorbereiten: Exception verworfen: {_e!r}")
+
+    harden_stage_dir()
+    # Ohne belastbare Pruefsumme darf ein Eintrag NICHT ins Manifest:
+    # Stage 2 wuerde ihn sonst mit Adminrechten ungeprueft ausfuehren.
+    # sha256_of() liefert bei jedem Fehler None (gesperrte Datei,
+    # Virenscanner, offenes Handle), hash_tree() ein leeres dict -
+    # genau in dem Moment also, in dem mit der Stage-Datei etwas nicht
+    # stimmt, faellt der Schutz weg, auf dem das ganze Two-Stage-Modell
+    # beruht. Ein Schutz, der bei Fehlern aufmacht statt zumacht, ist
+    # die falsche Richtung: solche Eintraege werden verworfen und als
+    # Handarbeit gemeldet.
+    geprueft = []
+    for entry in STATE["admin_pending"]:
+        name = os.path.basename(entry.get("installer") or entry.get("dir") or "?")
+        digest = sha256_of(entry.get("installer"))
+        if not digest:
+            log_err(f"   ❌ Prüfsumme für {name} nicht bildbar – Eintrag wird NICHT "
+                    f"an Stage 2 übergeben (Datei gesperrt oder nicht lesbar?).")
+            STATE["manual_actions"].append(
+                f"{entry.get('tool', name)}: Prüfsumme nicht bildbar, Installation "
+                f"von Hand nachholen ({entry.get('installer')})."
+            )
+            continue
+        entry["sha256"] = digest
+        if entry.get("dir"):
+            files = hash_tree(entry["dir"])
+            unlesbar = sorted(k for k, v in files.items() if v == HASH_UNREADABLE)
+            if not files or unlesbar:
+                grund = ("keine Datei lesbar" if not files
+                         else f"{len(unlesbar)} Datei(en) nicht lesbar")
+                log_err(f"   ❌ Hash-Liste für Ordner '{name}' unvollständig "
+                        f"({grund}) – Eintrag wird NICHT an Stage 2 übergeben.")
+                for k in unlesbar[:5]:
+                    log_err(f"      nicht lesbar: {k}")
+                STATE["manual_actions"].append(
+                    f"{entry.get('tool', name)}: Hash-Liste unvollständig, Installation "
+                    f"von Hand nachholen ({entry.get('dir')})."
+                )
+                continue
+            entry["files"] = files
+        geprueft.append(entry)
+    STATE["admin_pending"] = geprueft
+
+    manifest = {
+        "deploy_source":  DEPLOY_SOURCE,
+        "stage_root":     STAGE_ROOT,
+        "admin_pending":  STATE["admin_pending"],
+        "user":           get_current_username(),
+        "created":        datetime.now().isoformat(timespec="seconds"),
+    }
+    return write_stage_manifest(manifest)
+
+def _stage2_nachhol_befehl():
+    """Befehlszeile, mit der Stage 2 aus einer Admin-Konsole nachgeholt wird."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" {ADMIN_STAGE_FLAG} "{STAGE_ROOT}"'
+    return (f'"{sys.executable}" "{os.path.abspath(__file__)}" '
+            f'{ADMIN_STAGE_FLAG} "{STAGE_ROOT}"')
+
+
 def main_stage1():
     print()
     print("╔══════════════════════════════════════════════════════════════════════╗")
@@ -2953,70 +3301,14 @@ def main_stage1():
         print()
         if ask("Jetzt Stage 2 mit Adminrechten starten (UAC-Abfrage)? [J/n] ",
                default=not NO_INPUT):
-            # Ergebnisdatei eines frueheren Laufs entfernen, sonst wuerde ein
-            # abgebrochener Stage-2-Lauf mit altem Ergebnis "bestaetigt".
-            try:
-                if os.path.isfile(STAGE_RESULT_FILE):
-                    os.remove(STAGE_RESULT_FILE)
-            except Exception as _e:
-                logging.debug(f"main_stage1: Exception verworfen: {_e!r}")
-
-            harden_stage_dir()
-            # Ohne belastbare Pruefsumme darf ein Eintrag NICHT ins Manifest:
-            # Stage 2 wuerde ihn sonst mit Adminrechten ungeprueft ausfuehren.
-            # sha256_of() liefert bei jedem Fehler None (gesperrte Datei,
-            # Virenscanner, offenes Handle), hash_tree() ein leeres dict -
-            # genau in dem Moment also, in dem mit der Stage-Datei etwas nicht
-            # stimmt, faellt der Schutz weg, auf dem das ganze Two-Stage-Modell
-            # beruht. Ein Schutz, der bei Fehlern aufmacht statt zumacht, ist
-            # die falsche Richtung: solche Eintraege werden verworfen und als
-            # Handarbeit gemeldet.
-            geprueft = []
-            for entry in STATE["admin_pending"]:
-                name = os.path.basename(entry.get("installer") or entry.get("dir") or "?")
-                digest = sha256_of(entry.get("installer"))
-                if not digest:
-                    log_err(f"   ❌ Prüfsumme für {name} nicht bildbar – Eintrag wird NICHT "
-                            f"an Stage 2 übergeben (Datei gesperrt oder nicht lesbar?).")
-                    STATE["manual_actions"].append(
-                        f"{entry.get('tool', name)}: Prüfsumme nicht bildbar, Installation "
-                        f"von Hand nachholen ({entry.get('installer')})."
-                    )
-                    continue
-                entry["sha256"] = digest
-                if entry.get("dir"):
-                    files = hash_tree(entry["dir"])
-                    unlesbar = sorted(k for k, v in files.items() if v == HASH_UNREADABLE)
-                    if not files or unlesbar:
-                        grund = ("keine Datei lesbar" if not files
-                                 else f"{len(unlesbar)} Datei(en) nicht lesbar")
-                        log_err(f"   ❌ Hash-Liste für Ordner '{name}' unvollständig "
-                                f"({grund}) – Eintrag wird NICHT an Stage 2 übergeben.")
-                        for k in unlesbar[:5]:
-                            log_err(f"      nicht lesbar: {k}")
-                        STATE["manual_actions"].append(
-                            f"{entry.get('tool', name)}: Hash-Liste unvollständig, Installation "
-                            f"von Hand nachholen ({entry.get('dir')})."
-                        )
-                        continue
-                    entry["files"] = files
-                geprueft.append(entry)
-            STATE["admin_pending"] = geprueft
-
-            manifest = {
-                "deploy_source":  DEPLOY_SOURCE,
-                "stage_root":     STAGE_ROOT,
-                "admin_pending":  STATE["admin_pending"],
-                "user":           get_current_username(),
-                "created":        datetime.now().isoformat(timespec="seconds"),
-            }
-            if write_stage_manifest(manifest):
+            if _stage2_manifest_vorbereiten():
                 log_info("   Starte UAC-Re-Launch für Stage 2 ...")
                 rc = relaunch_as_admin_and_wait(STAGE_ROOT)
                 if rc is None:
                     log_err("   ❌ Stage 2 wurde nicht gestartet (UAC verweigert/abgebrochen).")
                     STATE["manual_actions"].append(
-                        f"Stage 2 als Administrator nachholen (Stage-Verzeichnis: {STAGE_ROOT})."
+                        "Stage 2 als Administrator nachholen (Admin-Konsole): "
+                        f"{_stage2_nachhol_befehl()}"
                     )
                 elif rc == 0:
                     log_info("   ✅ Stage 2 erfolgreich beendet (Exit 0).")
@@ -3024,11 +3316,24 @@ def main_stage1():
                     log_warn(f"   ⚠️ Stage 2 beendet mit Exit-Code {rc} – Details siehe Stage-2-Ausgabe/Log.")
                 refresh_env_from_registry()
                 _post_stage2_recheck()
+            else:
+                STATE["manual_actions"].append(
+                    "Stage 2 nicht gestartet (Stage-Manifest nicht schreibbar) – "
+                    "Stage 1 erneut ausführen."
+                )
         else:
-            STATE["manual_actions"].append(
-                "Stage 2 später als Administrator nachholen "
-                f"(Stage-Verzeichnis: {STAGE_ROOT})."
-            )
+            # Auch hier das Manifest DIESES Laufs schreiben - sonst verarbeitet
+            # ein spaeteres Nachholen das eines frueheren Laufs (oder keins).
+            if _stage2_manifest_vorbereiten():
+                STATE["manual_actions"].append(
+                    "Stage 2 später als Administrator nachholen (Admin-Konsole): "
+                    f"{_stage2_nachhol_befehl()}"
+                )
+            else:
+                STATE["manual_actions"].append(
+                    "Stage 2 nachholen: Stage-Manifest nicht schreibbar – Stage 1 "
+                    "erneut ausführen und die UAC-Abfrage bestätigen."
+                )
 
     print_summary()
 
@@ -3127,8 +3432,15 @@ def main_stage2():
         log_warn("   Bitte Skript regulär (Stage 1) starten und UAC-Re-Launch zulassen.")
         return 2
 
+    # Nur das Manifest aus dem festen Stage-Ordner - der Pfad kommt per
+    # Befehlszeile aus dem Benutzerkontext (siehe stage2_eintrag_pruefen).
+    if not stage2_stage_root_ok():
+        log_err(f"❌ Stage-Ordner {STAGE_ROOT} ist nicht {STAGE_DIR} (oder führt über "
+                f"eine Junction) – Stage 2 wird abgebrochen.")
+        return 2
+
     manifest = read_stage_manifest()
-    if not manifest:
+    if not isinstance(manifest, dict) or not manifest:
         log_err("❌ Kein gültiges Stage-Manifest – Stage 2 wird abgebrochen.")
         return 2
 

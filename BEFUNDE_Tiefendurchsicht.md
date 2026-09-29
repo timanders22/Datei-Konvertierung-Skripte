@@ -74,6 +74,9 @@ Excel-COM war verfuegbar und wurde benutzt (Kennwortverhalten von `SaveAs`,
 > **Stand 29.09.2026:** Jetzt sind auch `2b`, `3b`, `4b`, `6`, `7` und `9`
 > gegen das echte Office gelaufen, jeweils Probelauf und Echtlauf. Dabei
 > kamen neun weitere Fehler ans Licht, alle behoben - siehe Abschnitt 10.
+> Am Abend folgte eine Durchsicht mit neun kritischen Pruefagenten
+> (rund 95 Meldungen, nachgeprueft, behoben, alle Office-Skripte erneut am
+> echten Office getestet) - siehe Abschnitt 11.
 
 **Empfehlung:** Erster Lauf je Skript mit `-WhatIf` bzw. `--dry-run` auf
 einem Testbestand, nicht auf Q:/R:. Die Probelauf-Pfade wurden in dieser
@@ -606,6 +609,89 @@ niemand klickt, und Laufzeiten gegenpruefen.
 
 **Anonymisierung fuer die Veroeffentlichung:** Hinweise auf die Branche
 und ein 8.3-Profilname in einem Kommentar wurden neutralisiert (22 Stellen).
+
+---
+
+### 11. Nachtrag 29.09.2026 (abends): Durchsicht mit kritischen Pruefagenten
+
+**Vorgehen.** Neun Pruefagenten haben alle 23 Dateien vollstaendig gelesen
+und nur Fehler mit konkretem Ausloeser gemeldet (je Befund: Code, Ausloeser,
+Folge, Beleg). Ergebnis: rund 95 Meldungen. Jede Meldung wurde vor der
+Aenderung nachgeprueft - von Behebungs-Agenten, die sie nachstellen oder
+begruendet widerlegen mussten (ohne Office), und von mir: jede Differenz
+gelesen, alle statischen Pruefungen, danach **jedes Office- und
+OCR-Skript am echten System** (Office 2024, ocrmypdf 17.4) auf
+Wegwerf-Bestaenden, Probelauf und Echtlauf, bewertet am Dateiinhalt.
+Sicherung des Stands davor: Scratchpad `vor_agentenfix`.
+
+**Widerlegt:** 1 (9: Word-Schreibkennwort > 15 Zeichen - Word nimmt es an).
+E1 (5_OCR) nur teilweise: der erste Lauf verlor Dokument-Anhaenge nicht,
+wohl aber Datei-Anmerkungen und ZUGFeRD-Anhaenge im Folgelauf.
+
+**Schwerste bestaetigte und behobene Fehler:**
+
+| Skript | Fehler (Auswahl) |
+|---|---|
+| 2c, 3c, 4c | PowerPoint ist Einzelinstanz: eine offene Sitzung des Anwenders wurde uebernommen, minimiert, per `Quit()` geschlossen oder beim Timeout hart beendet (gemessen: `New-Object`/`DispatchEx` liefert die laufende Sitzung). Jetzt: Abbruch, solange PowerPoint laeuft (2c/3c Exit 3, 4c Exit 2); nachgetestet mit laufender Sitzung - sie bleibt unberuehrt. |
+| 3a | Fehlerpfad loeschte eine fremde, schon vorhandene `.docx`; Bearbeitungsschutz ging beim Neuspeichern verloren (jetzt erhalten, am Office belegt); Word-Prozesse wurden nach Name statt eigener PID beendet. |
+| 2b | Oeffnen-Kennwoerter wurden **nie** entfernt: `$wb.WriteResPassword` ist keine Eigenschaft (Ausnahme brach jeden Versuch ab), zusaetzlich verwarf die Rueckschreib-Bedingung das Ergebnis. Jetzt am Office belegt: Datei entschluesselt. |
+| 5_OCR | Ergebnis ersetzte das Original ohne Vergleich (Anhaenge, Datei-Anmerkungen, Seiten); `repair_pdf` entkernte das Original vor der OCR; ocrmypdf-Rueckgaben 4/10 ignoriert; PDF/A-2b-Dateien wurden in JEDEM Lauf neu kodiert. Belegt: zweiter Lauf aendert nichts mehr. |
+| 8 | 13x `WriteLine("..." -f a, b)`: das Komma trennt Methodenargumente, `-f` warf - die Pruefsummen-Verifikation meldete "0 Dateien bit-identisch" und gab keine Datei frei (belegt: vorher auch bei Abweichung "alles gut", jetzt korrekt 2 OK + 1 ABWEICHUNG). Ausserdem: Vorfahren geschuetzter Ordner (C:\Users) als Quelle erlaubt, abgebrochenes Loeschen als ERFOLG gemeldet, negative robocopy-Exitcodes nicht erkannt. |
+| 4c | Scheiterte die Stage-2-Sicherung, wurde direkt ins Original gespeichert; gescheiterte .ppt-Konvertierung als Erfolg gezaehlt; Waechter ohne Schloss (Kill nach Erfolg). |
+| 4a | `word.Hwnd` gibt es nicht - der Smoke-Test-Waechter konnte Word nie beenden; Metadaten-Typnummern falsch zugeordnet (entfernte @-Erwaehnungen/Aufgaben ohne Zustimmung). Nachtrag beim Office-Test: verschluesselte bzw. schreibkennwortgeschuetzte `.docx` hingen je 180 s und hinterliessen `~$`-Besitzerdateien auf der Ablage - jetzt vorab uebersprungen (Lauf 47 s statt 401 s). |
+| 3b | Echtes Rueckschritt-Zeichen (0x08) im Regex machte den Namens-Pre-Clean wirkungslos; Benutzernamen "Kriterien"/"Extract" wurden geloescht (jetzt erhalten, belegt); Dateiattribute auch im Probelauf zurueckgesetzt (jetzt erhalten, belegt). |
+| 3b, 4b, 7 | XLM-Funktionen in definierten Namen (GET.CELL, EVALUATE ...) gingen beim Speichern als .xlsx verloren - 3b/4b sichern jetzt als .xlsm, 7 erkennt sie und wandelt nicht mehr um. |
+| 10 | "Plus-Heilung" benannte legitime Namen falsch um (`Antrag+§34` -> `Antragä34`, `C++Kurs ©` -> `CüKurs ©`); belegt an 336 Faellen ohne Verlust echter Heilungen. |
+| 1, 10, 4c | NTFS-Junctions wurden betreten (Loeschen/Umbenennen ausserhalb des gewaehlten Baums, Zyklen). |
+| 0 | Stage 2 (Admin) uebernahm Installer, Zielpfade und Python-Pfad ungeprueft aus einer vom Benutzer beschreibbaren Datei; C:\OCR-Haertung liess den Benutzer als Besitzer. |
+| 2a, 2b, 2c | `add_CancelKeyPress`-Skriptblock liess powershell.exe bei Strg+C hart abstuerzen (mitten im Rueckschreiben). |
+| 2c | `ppAlertsNone` stand auf 2 (= alle Warnungen); `noRot`/`noChangeArrowheads` stehen ebenfalls von PowerPoint aus in Vorlagen (Notizseiten, Bilder) - weiter unnoetiges Umschreiben; Backup-Aufraeumer loeschte Anwender-`.bak`. |
+
+Dazu viele mittlere und geringe Fehler (Schreibschutz-Attribute, relative
+Pfade, `-like '\\?\*'`-Platzhalter, Statistik-, Protokoll- und
+Exitcode-Fehler, Probelaeufe, die Resume-Dateien loeschten ...). Die
+einzelnen Belege liegen in den Kommentaren an den geaenderten Stellen.
+
+**Verhaltensaenderungen, die man kennen muss:**
+
+- 2c, 3c, 4c laufen nicht, solange PowerPoint offen ist.
+- 5_OCR: bei PDF/A-Ziel werden Dateien mit Anhaengen (ZUGFeRD, XRechnung,
+  Datei-Anmerkungen) uebersprungen (`SKIP_HAS_ATTACHMENTS`); ersetzt wird
+  nur, wenn Seiten, Anhaenge, Anmerkungen und Formularfelder vollstaendig
+  sind; kein Upgrade 2b -> 2u ohne veraPDF und `--pdfa-upgrade`; keine
+  `.pdf.backup` mehr; auch mit einem Worker 60-Minuten-Limit je Datei.
+- 1: `.dmp`, `.wbk`, `.xlk` nur noch mit der Rueckfrage wie `.bak`.
+- 10: Namen mit "+" neben §, £, ½, «, ©, ° bleiben stehen.
+- 0: Stage 2 akzeptiert nur Eintraege aus der Allowlist, fuehrt Installer
+  aus einem privaten Admin-Ordner aus, setzt Administratoren als Besitzer
+  von C:\OCR.
+- 8: die Pruefsummen-Verifikation arbeitet erstmals - damit wird das
+  Loeschen der Quelle nach bestandener Pruefung tatsaechlich erreicht.
+  **Vor dem ersten echten Lauf an einem kleinen, unkritischen Ordner
+  ausprobieren.**
+
+**Offen / bewusst nicht geaendert:**
+
+- **Entscheidungen fuer den Anwender:** 4b stellt auch Symbolschriften
+  (Wingdings, Symbol) auf Arial um - aus Haekchen werden Buchstaben; 2c/6
+  legen Arbeitskopien in "Dokumente" (bei OneDrive-Umleitung werden sie
+  hochgeladen); 3a/3c leeren die Zuletzt-verwendet-Listen von Word und
+  Windows komplett, nicht nur Skriptspuren.
+- 4b und 4c: verschluesselte bzw. mit Aenderungskennwort geschuetzte
+  Mappen/Praesentationen kosten je 60 bzw. 180 s bis zum Waechter (kein
+  Haenger, keine Reste). In der vorgesehenen Reihenfolge entfernen 2b/2c die
+  Kennwoerter vorher.
+- 4b: wandelt es selbst eine `.xls` um, gehen Schreibschutz/Versteckt
+  verloren (3b erhaelt sie; in der Reihenfolge laeuft 3b vorher).
+- XLM-Namen: am echten Excel nicht gemessen (die deutsche Oberflaeche
+  nahm GET.CELL-Namen per COM in keiner Variante an); belegt mit Attrappen
+  und Paketdateien.
+- 0 Stage 2: Installer-Inhalt und Pruefsumme stammen weiter aus dem
+  Benutzerkontext (Schliessen nur mit fester Hash-Liste oder Signatur).
+- 2c/3c/4c: oeffnet der Anwender WAEHREND des Laufs PowerPoint, landet die
+  Datei in der Skript-Instanz; ein Waechter-Eingriff traefe sie mit.
+- 5_OCR: `try_remove_empty_password` ersetzt das Original weiterhin sofort
+  (verlustarm, nur ohne Verschluesselung).
 
 ---
 

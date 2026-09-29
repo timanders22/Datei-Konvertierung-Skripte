@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Sammel-Prüfung über beide Sprachen: PowerShell und Python.
 
@@ -231,11 +231,25 @@ Test-Muster -Name '-replace mit ungeklammerter Verkettung' `
 
 # --- 5.2  Provider-Cmdlets auf Langpfad-Variablen -----------------
 Test-Muster -Name 'Provider-Cmdlets auf Langpfad-Variablen' `
-    -Erklaerung "PowerShell 5.1 behandelt '\\?\'-Pfade in Test-Path/Remove-Item/Rename-Item unzuverlässig - [System.IO] verwenden." `
+    -Erklaerung "'\\?\'-Pfade in Provider-Cmdlets (Test-Path, New-Item, Move-Item, Remove-Item ...) sind unter 5.1 nur lokal belegt, nicht für UNC/G: - [System.IO] verwenden." `
     -Dateimuster '*.ps1' `
     -Pruefung {
         param($z)
-        ($z -match '(Test-Path|Remove-Item|Rename-Item|Copy-Item|Get-Item)\b[^#]*\$\w*(Long|LongPath)\b') -and ($z -notmatch '^\s*#')
+        # Vorher nur Variablen, die auf 'Long'/'LongPath' ENDEN ($srcLong):
+        # '$longTarget', '$longSourceTest', '$longFinalDest', '$longTestFile'
+        # in 8_verschieben_auf_Google_Drive.ps1 fielen durch, ebenso
+        # Move-Item und New-Item. Jetzt zusaetzlich 'long'/'Long' als
+        # Wortanfang, gefolgt von einem Grossbuchstaben ($longTarget,
+        # $LongLogFile) - dieser Teil ist schreibweisengenau, damit etwa
+        # '$longest' nicht anschlaegt.
+        # Bewusst KEINE Ausnahme fuer die Fundstellen in 8: gemessen
+        # (29.09., PS 5.1.26100) arbeiten Test-Path/New-Item/Move-Item/
+        # Remove-Item mit '\\?\' lokal auf C: korrekt, auch bei 430
+        # Zeichen - aber nur mit LongPathsEnabled=1; UNC ('\\?\UNC\'),
+        # Netzlaufwerke und das Drive-Laufwerk G: sind nicht nachgemessen.
+        # Mehrzeilige Aufrufe (Cmdlet und Variable auf zwei Zeilen) sieht
+        # die zeilenweise Pruefung weiterhin nicht.
+        ($z -cmatch '(?i:\b(?:Test-Path|Remove-Item|Rename-Item|Copy-Item|Move-Item|New-Item|Get-Item))\b[^#]*\$(?:[Ll]ong[A-Z0-9_]\w*|\w*(?i:Long)(?:Path)?\b)') -and ($z -notmatch '^\s*#')
     }
 
 # --- 5.3  Python: Ausgabe von Sonderzeichen ohne UTF-8-Umstellung --

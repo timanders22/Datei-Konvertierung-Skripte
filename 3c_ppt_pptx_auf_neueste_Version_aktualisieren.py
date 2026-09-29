@@ -669,17 +669,41 @@ def _release_lock(lock_path: Optional[str]) -> None:
 # ==================================================================
 # Signal-Handler (Ctrl+C / SIGTERM)
 # ==================================================================
+# Erster Strg+C: aufraeumen und mit sys.exit(1) beenden. Zweiter Strg+C
+# waehrend des Aufraeumens: sofort hart beenden (os._exit) - so kann ein
+# haengender Aufraeumschritt den Abbruch nie blockieren.
+_abbruch_laeuft = False
+
+
 def _signal_handler(sig, frame) -> None:
-    print("\n\n*** ABBRUCH durch Benutzer – raeume auf ...")
-
-    if ppt_app_global is not None:
+    # Frueher endete der Handler immer mit os._exit(1). Dann laufen KEINE
+    # finally-/except-Bloecke mehr: robust_move raeumte seine Staging-Datei
+    # '<Ziel>.tmp_new' nicht weg (sein Kommentar erwartet ausdruecklich
+    # sys.exit/SystemExit), convert_ppt_file gab den reservierten
+    # 0-Byte-Platzhalter nicht frei - beides blieb auf der Ablage liegen.
+    # 3a beendet sich mit sys.exit(1). Moeglicher Grund fuer os._exit war
+    # ein Haenger beim Aufraeumen; dafuer beendet jetzt ein ZWEITES Strg+C
+    # hart. pythoncom.CoUninitialize() steht nicht mehr hier, sondern nur
+    # im finally des Hauptblocks: nach einem Uninitialize im Handler
+    # liefen die finally-Bloecke mit ihren COM-Aufrufen (pres.Close) sonst
+    # gegen ein bereits abgebautes COM.
+    global _abbruch_laeuft, ppt_app_global
+    if _abbruch_laeuft:
         try:
-            ppt_app_global.Quit()
-            time.sleep(1)
-        except Exception as _e:
-            detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
+            _release_lock(active_lock_path)
+        except BaseException:
+            pass
+        os._exit(1)
+    _abbruch_laeuft = True
+    print("\n\n*** ABBRUCH durch Benutzer – raeume auf ... "
+          "(erneut Strg+C: sofort beenden)")
 
-    _kill_user_powerpoint()
+    # (c) Quit nur ohne Praesentationen des Anwenders; (d) Kill nur eigene PID.
+    try:
+        _eigene_powerpoint_beenden(ppt_app_global)
+    except Exception as _e:
+        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
+    ppt_app_global = None
 
     try:
         _cleanup_ppt_inetcache()
@@ -697,13 +721,8 @@ def _signal_handler(sig, frame) -> None:
         except Exception as e:
             print(f"  Temp-Bereinigung fehlgeschlagen: {e}")
 
-    try:
-        pythoncom.CoUninitialize()
-    except Exception as _e:
-        detail_logger.debug(f"_signal_handler: Exception verworfen: {_e!r}")
-
     _release_lock(active_lock_path)
-    os._exit(1)
+    sys.exit(1)
 
 
 # ==================================================================
@@ -727,20 +746,25 @@ def log_error(file_path: str, exc: Exception) -> None:
 #
 # Vor dem Start der eigenen COM-Instanz wird deshalb einmal festgehalten,
 # welche PowerPoint-Prozesse es bereits gab. Diese gelten dauerhaft als fremd
-# und werden nie beendet.
-_FOREIGN_POWERPOINT_PIDS: set = set()
+# und werden nie beendet. Das allein reichte nicht (Sitzungen, die waehrend
+# des Laufs entstehen; Einzelinstanz) - beendet wird inzwischen nur noch die
+# eigene Instanz, siehe _kill_eigene_powerpoint() und den Abschnitt
+# 'Laufende PowerPoint-Sitzung: kein COM-Zugriff'.
+# PID -> Erstellungszeit. Mit Erstellungszeit, damit eine spaeter neu
+# vergebene PID nicht verwechselt wird.
+_FOREIGN_POWERPOINT_PIDS: dict = {}
 
 
 def snapshot_foreign_powerpoint_pids() -> None:
     """Merkt sich alle PowerPoint-Prozesse, die vor dem Skriptstart liefen."""
     global _FOREIGN_POWERPOINT_PIDS
-    found = set()
+    found = {}
     try:
-        for p in psutil.process_iter(["pid", "name"]):
+        for p in psutil.process_iter(["pid", "name", "create_time"]):
             try:
                 nm = p.info.get("name") or ""
                 if "POWERPNT.EXE" in nm.upper():
-                    found.add(p.info["pid"])
+                    found[p.info["pid"]] = p.info.get("create_time")
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
     except Exception as _e:
@@ -753,24 +777,97 @@ def snapshot_foreign_powerpoint_pids() -> None:
             f"- diese werden nicht beendet: {sorted(found)}")
 
 
-def is_foreign_powerpoint_pid(pid) -> bool:
-    return pid in _FOREIGN_POWERPOINT_PIDS
+def is_foreign_powerpoint_pid(pid, ct=None) -> bool:
+    """PID stammt aus der Start-Momentaufnahme. Mit ct nur bei gleicher
+    Erstellungszeit (sonst ist die PID inzwischen neu vergeben)."""
+    if pid not in _FOREIGN_POWERPOINT_PIDS:
+        return False
+    alt_ct = _FOREIGN_POWERPOINT_PIDS.get(pid)
+    if ct is None or alt_ct is None:
+        return True
+    return abs(alt_ct - ct) <= 0.001
 
 
 # ==================================================================
-# Startwarnung: laufende PowerPoint-Sitzungen
+# Laufende PowerPoint-Sitzung: kein COM-Zugriff
 # ==================================================================
+# PowerPoint ist eine Einzelinstanz-Anwendung. VOM AUFTRAGGEBER GEMESSEN:
+# laeuft bereits eine PowerPoint-Sitzung, liefert DispatchEx (ebenso
+# New-Object -ComObject) GENAU DIESE Sitzung, und ihr HWND ergibt deren
+# PID. Das Skript hat sie dann minimiert, Warnhinweise abgeschaltet, sein
+# Waechter hat sie bei einer Zeitueberschreitung getoetet und Quit() hat
+# sie am Ende beendet - samt ungespeicherter Arbeit. 'Trotzdem fortfahren'
+# und der Automatikmodus liefen einfach weiter. Die Start-Momentaufnahme
+# schuetzte davor nicht: _configure_ppt_instance ermittelte die PID erst
+# NACH dem Umkonfigurieren, und Quit() fragt nicht nach der PID.
+#
+# Deshalb jetzt verbindlich:
+#   (a) laeuft beim Start PowerPoint, wird NICHT per COM gearbeitet -
+#       interaktiv Hinweis und erneute Pruefung, im Automatikmodus
+#       Abbruch mit Exitcode EXIT_POWERPOINT_LAEUFT;
+#   (b) nach dem Erzeugen: ist die Instanz nicht nachweislich neu (PID lief
+#       schon vorher / steht in der Start-Momentaufnahme / nicht
+#       ermittelbar), wird abgebrochen - ohne Quit, ohne Kill, ohne eine
+#       Einstellung an ihr zu aendern;
+#   (c) Quit/Neustart nur, wenn nach dem Schliessen der eigenen
+#       Praesentationen Presentations.Count == 0 ist;
+#   (d) getoetet wird nur die eigene PID mit passender Erstellungszeit.
+EXIT_POWERPOINT_LAEUFT = 3
+
+
+class FremdePowerPointSitzung(Exception):
+    """Die COM-Instanz ist nicht nachweislich die eigene."""
+
+
+# Eigene PowerPoint-Prozesse: PID -> Erstellungszeit (nur von
+# _starte_eigene_powerpoint eingetragen).
+_EIGENE_POWERPOINT_PROZESSE: dict = {}
+
+# Pfade (klein geschrieben) der Praesentation, die das Skript gerade
+# bearbeitet. Alles, was in der eigenen Instanz offen ist und weder hier
+# steht noch im Temp-Arbeitsordner liegt, hat der Anwender dort geoeffnet
+# (Einzelinstanz: ein Doppelklick auf eine .pptx landet in UNSERER Instanz).
+_EIGENE_PRAESENTATIONEN: set = set()
+
+# Werte der eigenen Instanz vor dem Umkonfigurieren - werden
+# zurueckgesetzt, wenn die Instanz dem Anwender ueberlassen wird.
+_PPT_WERTE_VORHER: dict = {}
+
+
+def _powerpoint_prozesse() -> dict:
+    """Alle laufenden POWERPNT.EXE als {PID: Erstellungszeit}."""
+    gefunden = {}
+    try:
+        for p in psutil.process_iter(["pid", "name", "create_time"]):
+            try:
+                nm = p.info.get("name") or ""
+                if "POWERPNT.EXE" in nm.upper():
+                    gefunden[p.info["pid"]] = p.info.get("create_time")
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    except Exception as _e:
+        detail_logger.debug(f"_powerpoint_prozesse: Exception verworfen: {_e!r}")
+    return gefunden
+
+
 def find_running_powerpoint_pids() -> list:
-    """PIDs aller PowerPoint-Prozesse des angemeldeten Benutzers."""
+    """PIDs aller PowerPoint-Prozesse des angemeldeten Benutzers.
+
+    Ist der eigene Benutzer nicht ermittelbar, zaehlt JEDER PowerPoint-
+    Prozess (frueher: leere Liste - dann galt PowerPoint als geschlossen).
+    """
     pids = []
     try:
         me = psutil.Process().username().lower().split("\\")[-1].split("@")[0]
     except Exception:
-        return pids
+        me = None
     for proc in psutil.process_iter(["pid", "name"]):
         try:
             nm = proc.info.get("name") or ""
             if "POWERPNT.EXE" not in nm.upper():
+                continue
+            if me is None:
+                pids.append(proc.info["pid"])
                 continue
             try:
                 u = proc.username().lower().split("\\")[-1].split("@")[0]
@@ -783,90 +880,249 @@ def find_running_powerpoint_pids() -> list:
     return pids
 
 
-def warn_running_powerpoint(auto_mode: bool = False) -> None:
-    """Warnt vor bereits laufenden PowerPoint-Sitzungen.
+def pruefe_powerpoint_geschlossen(auto_mode: bool = False) -> None:
+    """Verlangt ein geschlossenes PowerPoint, bevor per COM gearbeitet wird.
 
-    PowerPoint wird per COM automatisiert. Laeuft bereits eine Sitzung des
-    Anwenders, hat das zwei Auswirkungen, die man vorher kennen sollte:
-
-      1. Die Automatisierung kann sich an die vorhandene Sitzung haengen.
-         Warnhinweise werden dann abgeschaltet und das Fenster ausgeblendet
-         - fuer den Anwender sieht das aus, als sei PowerPoint abgestuerzt.
-      2. Die Aufraeumroutinen des Skripts koennen die eigene Instanz nicht
-         mehr sicher von der fremden unterscheiden.
-
-    Die Sitzung wird NICHT beendet (dafuer sorgt die Momentaufnahme der
-    fremden Prozess-IDs beim Start), aber ein sauberer Lauf setzt ein
-    geschlossenes PowerPoint voraus.
+    Interaktiv: Hinweis und erneute Pruefung, bis PowerPoint geschlossen
+    ist oder der Anwender abbricht. Automatikmodus: Abbruch mit
+    Exitcode EXIT_POWERPOINT_LAEUFT (ungleich 0).
     """
-    pids = find_running_powerpoint_pids()
-    if not pids:
-        return
-    pids_str = ", ".join(str(p) for p in pids)
+    while True:
+        pids = find_running_powerpoint_pids()
+        if not pids:
+            return
+        pids_str = ", ".join(str(p) for p in pids)
 
-    if auto_mode:
-        detail_logger.warning(
-            f"Automatikmodus: laufende PowerPoint-Sitzungen (PID: {pids_str}) - "
-            f"sie werden geschuetzt, aber nicht geschlossen."
-        )
-        return
+        if auto_mode:
+            meldung = (f"PowerPoint laeuft bereits (PID: {pids_str}). PowerPoint "
+                       f"ist Einzelinstanz - das Skript wuerde diese Sitzung "
+                       f"uebernehmen. Abbruch (Exitcode {EXIT_POWERPOINT_LAEUFT}).")
+            print(f"\n❌  {meldung}")
+            detail_logger.error(meldung)
+            file_logger.error(meldung)
+            sys.exit(EXIT_POWERPOINT_LAEUFT)
 
-    print()
-    print("=" * 66)
-    print("  WARNUNG: PowerPoint laeuft bereits")
-    print("=" * 66)
-    print(f"  Gefundene PowerPoint-Prozesse (PID): {pids_str}")
-    print()
-    print("  Ihre Sitzung wird vom Skript NICHT beendet. Waehrend des Laufs")
-    print("  kann sie aber ausgeblendet werden und Warnhinweise sind")
-    print("  abgeschaltet - das wirkt wie ein Absturz.")
-    print("  Ausserdem laesst sich die eigene Automatisierungs-Instanz dann")
-    print("  nicht mehr zuverlaessig von Ihrer Sitzung unterscheiden.")
-    print()
-    print("  EMPFEHLUNG: PowerPoint jetzt schliessen und das Skript neu starten.")
-    print("=" * 66)
-    print()
-    if not ask_yes_no("Trotzdem fortfahren?"):
-        print("Abgebrochen. Bitte PowerPoint schliessen und neu starten.")
-        sys.exit(0)
+        print()
+        print("=" * 66)
+        print("  PowerPoint laeuft bereits - bitte schliessen")
+        print("=" * 66)
+        print(f"  Gefundene PowerPoint-Prozesse (PID): {pids_str}")
+        print()
+        print("  PowerPoint ist eine Einzelinstanz-Anwendung: das Skript wuerde")
+        print("  nicht eine eigene Instanz starten, sondern IHRE Sitzung")
+        print("  uebernehmen (minimieren, Warnhinweise abschalten, am Ende")
+        print("  beenden). Deshalb startet das Skript erst, wenn PowerPoint")
+        print("  vollstaendig geschlossen ist.")
+        print()
+        print("  Bitte alle PowerPoint-Fenster speichern und schliessen")
+        print("  (ggf. auch im Task-Manager pruefen).")
+        print("=" * 66)
+        if not ask_yes_no("PowerPoint geschlossen? Erneut pruefen", default_yes=True):
+            print("Abgebrochen. Bitte PowerPoint schliessen und neu starten.")
+            sys.exit(0)
 
 
-def _kill_user_powerpoint() -> None:
-    try:
-        current_user = psutil.Process().username()
-    except Exception:
-        detail_logger.warning(
-            "_kill_user_powerpoint: Benutzerermittlung fehlgeschlagen "
-            "– Prozesse werden nicht beendet.")
-        return
-    for proc in psutil.process_iter(["pid", "name"]):
+def _kill_eigene_powerpoint() -> None:
+    """Beendet liegengebliebene EIGENE PowerPoint-Prozesse - nie fremde.
+
+    Frueher (_kill_user_powerpoint) traf es jeden POWERPNT.EXE des Benutzers
+    ausser der Start-Momentaufnahme - also auch eine Sitzung, die der
+    Anwender waehrend des Laufs startet, und parallel laufende Skripte.
+    """
+    for pid, ct in list(_EIGENE_POWERPOINT_PROZESSE.items()):
         try:
-            if proc.info["name"] and "POWERPNT.EXE" in proc.info["name"].upper():
+            proc = psutil.Process(pid)
+            if "POWERPNT.EXE" not in (proc.name() or "").upper():
+                _EIGENE_POWERPOINT_PROZESSE.pop(pid, None)
+                continue
+            if ct is None or abs(proc.create_time() - ct) > 0.001:
+                _EIGENE_POWERPOINT_PROZESSE.pop(pid, None)
+                continue
+            if is_foreign_powerpoint_pid(pid, ct):
+                _EIGENE_POWERPOINT_PROZESSE.pop(pid, None)
+                continue
+            proc.kill()
+            proc.wait(timeout=3)
+            _EIGENE_POWERPOINT_PROZESSE.pop(pid, None)
+            detail_logger.debug(f"Eigener PPT-Prozess beendet: PID {pid}")
+        except psutil.NoSuchProcess:
+            _EIGENE_POWERPOINT_PROZESSE.pop(pid, None)
+        except psutil.AccessDenied:
+            detail_logger.warning(f"Kein Zugriff auf PID {pid}")
+        except psutil.TimeoutExpired:
+            detail_logger.warning(f"Prozess reagiert nicht: PID {pid}")
+        except Exception as _e:
+            detail_logger.debug(f"_kill_eigene_powerpoint: Exception verworfen: {_e!r}")
+
+
+def _ist_eigene_praesentation(full_name: str) -> bool:
+    fn = (full_name or "").strip().lower()
+    if not fn:
+        return False
+    if fn in _EIGENE_PRAESENTATIONEN:
+        return True
+    if "\\" not in fn and "/" not in fn:
+        return False    # ungespeichert ('Praesentation1') - nie unsere
+    tmp = os.path.normcase(os.path.abspath(TEMP_PROCESS_PATH)).lower()
+    try:
+        return os.path.normcase(os.path.abspath(fn)).lower().startswith(tmp + os.sep)
+    except Exception:
+        return False
+
+
+def _fremde_praesentationen(ppt_app) -> Optional[int]:
+    """Zahl der offenen Praesentationen, die NICHT vom Skript stammen.
+
+    None = nicht feststellbar (Instanz tot/unerreichbar).
+    """
+    if ppt_app is None:
+        return 0
+    try:
+        n = int(ppt_app.Presentations.Count)
+    except Exception:
+        return None
+    fremd = 0
+    for i in range(1, n + 1):
+        try:
+            if not _ist_eigene_praesentation(str(ppt_app.Presentations(i).FullName)):
+                fremd += 1
+        except Exception:
+            fremd += 1   # im Zweifel fremd
+    return fremd
+
+
+def _powerpoint_dem_anwender_ueberlassen(ppt_app) -> None:
+    """Instanz enthaelt Praesentationen des Anwenders: nicht beenden.
+
+    Einstellungen zuruecksetzen, Eintrag als eigene Instanz loeschen (damit
+    weder Waechter noch Aufraeumen sie spaeter toeten).
+    """
+    global ppt_app_pid
+    for attr in ("DisplayAlerts", "AutomationSecurity"):
+        if attr in _PPT_WERTE_VORHER:
+            try:
+                setattr(ppt_app, attr, _PPT_WERTE_VORHER[attr])
+            except Exception as _e:
+                detail_logger.debug(f"_powerpoint_dem_anwender_ueberlassen: {_e!r}")
+    _EIGENE_POWERPOINT_PROZESSE.clear()
+    ppt_app_pid = None
+
+
+def _eigene_powerpoint_beenden(ppt_app) -> bool:
+    """Schliesst die eigenen Praesentationen und beendet die eigene Instanz.
+
+    Beendet wird nur, wenn danach Presentations.Count == 0 ist. Sonst hat
+    der Anwender in der Instanz etwas geoeffnet: kein Quit, kein Kill,
+    Warnung - Rueckgabe False. Ist die Instanz nicht erreichbar, wird nur
+    die eigene PID (mit Erstellungszeit) beendet.
+    """
+    if ppt_app is not None:
+        try:
+            n = int(ppt_app.Presentations.Count)
+        except Exception:
+            n = None
+        if n:
+            for i in range(n, 0, -1):
                 try:
-                    proc_user = proc.username().lower().split("\\")[-1].split("@")[0]
-                    cur_user  = current_user.lower().split("\\")[-1].split("@")[0]
-                    if proc_user != cur_user:
-                        continue
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    continue
-                if is_foreign_powerpoint_pid(proc.info["pid"]):
-                    continue
-                try:
-                    proc.kill()
-                    proc.wait(timeout=3)
-                    detail_logger.debug(f"PPT-Prozess beendet: PID {proc.info['pid']}")
-                except psutil.AccessDenied:
-                    detail_logger.warning(f"Kein Zugriff auf PID {proc.info['pid']}")
-                except psutil.NoSuchProcess:
-                    pass
-                except psutil.TimeoutExpired:
-                    detail_logger.warning(f"Prozess reagiert nicht: PID {proc.info['pid']}")
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+                    p = ppt_app.Presentations(i)
+                    if _ist_eigene_praesentation(str(p.FullName)):
+                        p.Close()
+                except Exception as _e:
+                    detail_logger.debug(f"_eigene_powerpoint_beenden: {_e!r}")
+            try:
+                n = int(ppt_app.Presentations.Count)
+            except Exception:
+                n = None
+        if n:
+            meldung = (f"PowerPoint wird NICHT beendet: {n} Praesentation(en) des "
+                       f"Anwenders sind in der Instanz des Skripts geoeffnet. "
+                       f"Bitte dort speichern und PowerPoint selbst schliessen.")
+            print(f"\n  ⚠  {meldung}")
+            detail_logger.warning(meldung)
+            _powerpoint_dem_anwender_ueberlassen(ppt_app)
+            return False
+        try:
+            ppt_app.Quit()
+        except Exception as _e:
+            detail_logger.debug(f"_eigene_powerpoint_beenden: Quit verworfen: {_e!r}")
+        # Quit ist asynchron - der Prozess darf kurz nachlaufen, bevor die
+        # eigene PID notfalls beendet wird.
+        for pid, ct in list(_EIGENE_POWERPOINT_PROZESSE.items()):
+            try:
+                proc = psutil.Process(pid)
+                if ct is not None and abs(proc.create_time() - ct) <= 0.001:
+                    proc.wait(timeout=5)
+            except Exception as _e:
+                detail_logger.debug(f"_eigene_powerpoint_beenden: {_e!r}")
+    _kill_eigene_powerpoint()
+    return True
+
+
+def _starte_eigene_powerpoint():
+    """Startet PowerPoint per COM und stellt sicher, dass es die EIGENE ist.
+
+    Wirft FremdePowerPointSitzung, wenn PowerPoint schon laeuft oder die
+    gelieferte Instanz nicht nachweislich neu ist - ohne sie anzufassen.
+    """
+    global ppt_app_pid
+    ppt_app_pid = None
+    laufend = find_running_powerpoint_pids()
+    if laufend:
+        raise FremdePowerPointSitzung(
+            f"PowerPoint laeuft bereits (PID: {', '.join(map(str, laufend))}) - "
+            f"kein COM-Zugriff auf eine fremde Sitzung.")
+    vorher = _powerpoint_prozesse()
+    app = win32com.client.DispatchEx("PowerPoint.Application")
+
+    # PID ermitteln, BEVOR irgendetwas an der Instanz geaendert wird.
+    pid = None
+    try:
+        hwnd_attr = app.HWND
+        hwnd_val  = hwnd_attr() if callable(hwnd_attr) else hwnd_attr
+        if hwnd_val:
+            _, p = win32process.GetWindowThreadProcessId(int(hwnd_val))
+            if p:
+                pid = int(p)
+    except Exception as e:
+        detail_logger.debug(f"PID-Ermittlung via HWND fehlgeschlagen: {e}")
+    if pid is None:
+        neu = [p for p, c in _powerpoint_prozesse().items()
+               if not (p in vorher and vorher[p] == c)]
+        if len(neu) == 1:
+            pid = neu[0]
+            detail_logger.debug(f"PID via psutil-Rueckfall (einziger neuer Prozess): {pid}")
+
+    ct = None
+    if pid is not None:
+        try:
+            proc = psutil.Process(pid)
+            if "POWERPNT.EXE" in (proc.name() or "").upper():
+                ct = proc.create_time()
+        except Exception as _e:
+            detail_logger.debug(f"_starte_eigene_powerpoint: {_e!r}")
+    if (pid is None or ct is None
+            or (pid in vorher and vorher[pid] == ct)
+            or is_foreign_powerpoint_pid(pid, ct)):
+        # Nur die Referenz loslassen: kein Quit, kein Kill, keine Einstellung.
+        app = None
+        raise FremdePowerPointSitzung(
+            f"COM lieferte keine nachweislich eigene PowerPoint-Instanz "
+            f"(PID {pid}) - Abbruch ohne Eingriff in diese Sitzung.")
+
+    _EIGENE_POWERPOINT_PROZESSE[pid] = ct
+    ppt_app_pid = pid
+    _configure_ppt_instance(app)
+    return app
 
 
 def _configure_ppt_instance(ppt_app) -> None:
-    global ppt_app_pid
+    # Nur fuer die nachweislich eigene Instanz (_starte_eigene_powerpoint).
+    for attr in ("DisplayAlerts", "AutomationSecurity"):
+        if attr not in _PPT_WERTE_VORHER:
+            try:
+                _PPT_WERTE_VORHER[attr] = getattr(ppt_app, attr)
+            except Exception as _e:
+                detail_logger.debug(f"_configure_ppt_instance: Exception verworfen: {_e!r}")
 
     ppt_app.Visible = COM_TRUE
     try:
@@ -881,37 +1137,6 @@ def _configure_ppt_instance(ppt_app) -> None:
         ppt_app.AutomationSecurity = 3   # msoAutomationSecurityForceDisable
     except Exception as _e:
         detail_logger.debug(f"_configure_ppt_instance: Exception verworfen: {_e!r}")
-
-    ppt_app_pid = None
-    try:
-        hwnd_attr = ppt_app.HWND
-        hwnd_val  = hwnd_attr() if callable(hwnd_attr) else hwnd_attr
-        if hwnd_val:
-            _, pid = win32process.GetWindowThreadProcessId(int(hwnd_val))
-            if pid:
-                ppt_app_pid = int(pid)
-    except Exception as e:
-        detail_logger.debug(f"PID-Ermittlung via HWND fehlgeschlagen: {e}")
-
-    if ppt_app_pid is None:
-        try:
-            current_user = psutil.Process().username().lower().split("\\")[-1]
-            candidates = []
-            for proc in psutil.process_iter(["pid", "name", "create_time"]):
-                try:
-                    name = proc.info["name"]
-                    if not name or "POWERPNT.EXE" not in name.upper():
-                        continue
-                    proc_user = proc.username().lower().split("\\")[-1].split("@")[0]
-                    if proc_user == current_user:
-                        candidates.append((proc.info["create_time"], proc.info["pid"]))
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    continue
-            if candidates:
-                ppt_app_pid = max(candidates)[1]   # juengster Prozess
-                detail_logger.debug(f"PID via psutil-Fallback: {ppt_app_pid}")
-        except Exception as e:
-            detail_logger.debug(f"PID via psutil-Fallback fehlgeschlagen: {e}")
 
 
 def _ppt_call_with_watchdog(call_label: str, timeout: float, ppt_pid,
@@ -935,12 +1160,17 @@ def _ppt_call_with_watchdog(call_label: str, timeout: float, ppt_pid,
     # abstuerzen, Windows die PID an eine neue (vom Benutzer geoeffnete)
     # PowerPoint-Sitzung vergeben - und der Watchdog merkte sich deren
     # create_time als "erwartet" und killte nach Timeout den falschen Prozess.
-    expected_ct = None
-    if ppt_pid:
-        try:
-            expected_ct = psutil.Process(ppt_pid).create_time()
-        except Exception:
-            expected_ct = None
+    #
+    # (d) Massgeblich ist die beim Start eingetragene Erstellungszeit der
+    # EIGENEN Instanz (_EIGENE_POWERPOINT_PROZESSE), nicht die zur Laufzeit
+    # gelesene: frueher wurde jede uebergebene PID getoetet, auch wenn sie
+    # zu einer vom Skript nur uebernommenen Anwender-Sitzung gehoerte.
+    # Ohne Eintrag wird nicht getoetet.
+    expected_ct = _EIGENE_POWERPOINT_PROZESSE.get(ppt_pid) if ppt_pid else None
+    if ppt_pid and expected_ct is None:
+        detail_logger.debug(
+            f"Waechter: PID {ppt_pid} ist keine eingetragene eigene "
+            f"PowerPoint-Instanz - kein Kill bei Zeitueberschreitung.")
 
     def _watchdog():
         if not done_event.wait(timeout):
@@ -953,7 +1183,9 @@ def _ppt_call_with_watchdog(call_label: str, timeout: float, ppt_pid,
                     proc = psutil.Process(ppt_pid)
                     if "powerpnt" not in proc.name().lower():
                         proc = None
-                    if proc is not None and expected_ct is not None:
+                    if proc is not None and expected_ct is None:
+                        proc = None  # nicht als eigene eingetragen
+                    if proc is not None:
                         try:
                             if abs(proc.create_time() - expected_ct) > 0.001:
                                 proc = None  # recycelt -> fremde Instanz
@@ -2378,16 +2610,17 @@ def convert_ppt_file(
         com_path    = strip_com_path(file_path)
         mru_paths_to_clean.append(com_path)
 
+        # Schreibschutz-Attribut des Originals nur MERKEN. Frueher wurde es
+        # hier entfernt - auch im Probelauf, der danach aussteigt (die Ablage
+        # war veraendert) - und nie wiederhergestellt. Noetig war das nur
+        # fuers schreibende Oeffnen; mit ReadOnly=True (siehe _do_open)
+        # entfaellt es. Nach erfolgreicher Ersetzung wird das Attribut auf
+        # die neue Datei uebertragen (wie ACL und Zeitstempel).
+        orig_readonly = False
         try:
-            p_attr = prepare_long_path(file_path) if len(file_path) > MAX_PATH_LEN else file_path
+            p_attr = prepare_long_path(original_path) if len(original_path) > MAX_PATH_LEN else original_path
             attrs  = win32api.GetFileAttributes(p_attr)
-            if attrs & win32con.FILE_ATTRIBUTE_READONLY:
-                win32api.SetFileAttributes(
-                    p_attr, attrs & ~win32con.FILE_ATTRIBUTE_READONLY
-                )
-                detail_logger.debug(
-                    f"Read-Only-Attribut entfernt: {display_path(file_path)}"
-                )
+            orig_readonly = bool(attrs & win32con.FILE_ATTRIBUTE_READONLY)
         except Exception as e:
             detail_logger.debug(f"Read-Only-Check fehlgeschlagen: {e}")
 
@@ -2396,7 +2629,8 @@ def convert_ppt_file(
             try:
                 pres_holder = [None]
                 def _do_open():
-                    # Im Probelauf ZWINGEND schreibgeschuetzt oeffnen.
+                    # IMMER schreibgeschuetzt oeffnen - im Probelauf wie im
+                    # Echtlauf.
                     # Nachgemessen an einer .ppt: PowerPoint schreibt eine
                     # schreibend geoeffnete Datei im Altformat schon beim
                     # Oeffnen neu auf die Platte - 258560 -> 260608 Bytes,
@@ -2406,9 +2640,16 @@ def convert_ppt_file(
                     # wird spaeter wiederhergestellt, die Aenderung war
                     # deshalb unsichtbar - der Probelauf hat seine Zusage
                     # "es wurde NICHTS geaendert" gebrochen.
+                    # Im Echtlauf galt dasselbe: scheiterte danach SaveAs,
+                    # Verifikation oder Verschieben, blieb das Original
+                    # veraendert zurueck (neuer Inhalt, keine Sicherung).
+                    # Schreibzugriff braucht der Echtlauf nicht: beide
+                    # SaveAs-Aufrufe schreiben in temp_save_path (neuer
+                    # Pfad im Temp-Ordner), ein pres.Save() gibt es nicht;
+                    # die Ablage wird erst per robust_move beschrieben.
                     pres_holder[0] = ppt_app.Presentations.Open(
                         com_path,
-                        ReadOnly   = COM_TRUE if dry_run else COM_FALSE,
+                        ReadOnly   = COM_TRUE,
                         Untitled   = COM_FALSE,
                         WithWindow = COM_FALSE,
                     )
@@ -2417,6 +2658,13 @@ def convert_ppt_file(
                 )
                 pres = pres_holder[0]
                 pres_opened = True
+                # Als eigene Praesentation merken - siehe
+                # _eigene_powerpoint_beenden (Quit nur ohne fremde).
+                _EIGENE_PRAESENTATIONEN.add(com_path.lower())
+                try:
+                    _EIGENE_PRAESENTATIONEN.add(str(pres.FullName).lower())
+                except Exception as _e:
+                    detail_logger.debug(f"convert_ppt_file: Exception verworfen: {_e!r}")
                 detail_logger.debug("Geöffnet")
                 break
             except TimeoutError:
@@ -2726,6 +2974,21 @@ def convert_ppt_file(
                     else:
                         time.sleep(0.5)
 
+        # Schreibschutz-Attribut des Originals auf die neue Datei
+        # uebertragen (NACH den Zeitstempeln, damit SetFileTime nicht am
+        # Attribut scheitert). Frueher ging es verloren, weil es vor dem
+        # Oeffnen entfernt und nie wieder gesetzt wurde.
+        if orig_readonly and safe_exists(target_path):
+            try:
+                p_ro = prepare_long_path(target_path) if len(target_path) > MAX_PATH_LEN else target_path
+                attrs_neu = win32api.GetFileAttributes(p_ro)
+                win32api.SetFileAttributes(
+                    p_ro, attrs_neu | win32con.FILE_ATTRIBUTE_READONLY)
+            except Exception as e_ro:
+                detail_logger.warning(
+                    f"Schreibschutz-Attribut nicht uebertragbar: "
+                    f"{display_path(target_path)} ({e_ro})")
+
         # Nachweisliste: Pfadwechsel (z.B. .ppt -> .pptx, oder Ausweichname
         # bei Kollision) in die Konvertierungs-CSV.
         if original_path.lower() != target_path.lower():
@@ -2780,9 +3043,16 @@ def convert_ppt_file(
         if pres is not None:
             try:
                 pres.Close()
+                pres = None
             except Exception as _e:
                 detail_logger.debug(f"convert_ppt_file: Exception verworfen: {_e!r}")
-            pres = None
+        # Nur wenn die eigene Praesentation sicher zu ist, den Merker
+        # leeren. Blieb sie offen, bleibt sie als 'eigene' erkennbar.
+        # Ein Anwender, der spaeter dieselbe Datei in der Instanz oeffnet,
+        # soll nicht als 'eigene' gelten und ohne Speichern geschlossen werden.
+        if pres is None:
+            _EIGENE_PRAESENTATIONEN.clear()
+        pres = None
         try:
             _remove_from_mru(ppt_app, *mru_paths_to_clean)
         except Exception as _e:
@@ -2885,6 +3155,22 @@ def process_directory(
     with tqdm(total=total, desc="Verarbeite", unit="Datei",
               bar_format=bar_fmt, disable=not show_progress) as pbar:
         for full_path in iterable:
+            # Einzelinstanz: oeffnet der Anwender waehrend des Laufs eine
+            # Praesentation, landet sie in der Instanz des Skripts (dort
+            # sind Warnhinweise abgeschaltet, und der Waechter wuerde sie
+            # bei einer Zeitueberschreitung mit toeten). Dann nicht weiter
+            # per COM arbeiten und die Instanz nicht beenden (siehe (c)).
+            n_fremd = _fremde_praesentationen(ppt_app_global)
+            if n_fremd:
+                meldung = (f"{n_fremd} Praesentation(en) des Anwenders in der "
+                           f"PowerPoint-Instanz des Skripts geoeffnet - Lauf wird "
+                           f"beendet, PowerPoint bleibt offen.")
+                pbar.write(f"  ⚠  {meldung}")
+                detail_logger.warning(meldung)
+                _powerpoint_dem_anwender_ueberlassen(ppt_app_global)
+                ppt_app_global = None
+                break
+
             # Im Probelauf NICHT umbenennen - das Dateisystem bleibt
             # vollstaendig unangetastet.
             if not dry_run:
@@ -2912,12 +3198,18 @@ def process_directory(
                         raise AttributeError("ppt_app_global is None")
                 except (pythoncom.com_error, AttributeError):
                     pbar.write("  ↻  PowerPoint reagiert nicht mehr. Starte PPT-Engine neu...")
-                    _kill_user_powerpoint()
+                    # Nur die eigene PID (mit Erstellungszeit) beenden.
+                    _kill_eigene_powerpoint()
+                    ppt_app_global = None
                     _cleanup_ppt_inetcache()
                     _cleanup_user_recent()
                     try:
-                        ppt_app_global = win32com.client.DispatchEx("PowerPoint.Application")
-                        _configure_ppt_instance(ppt_app_global)
+                        ppt_app_global = _starte_eigene_powerpoint()
+                    except FremdePowerPointSitzung as e_fremd:
+                        pbar.write(f"  ✕  Kein Neustart: {e_fremd}")
+                        detail_logger.warning(f"Kein Neustart: {e_fremd}")
+                        ppt_app_global = None
+                        break
                     except Exception as fatal_e:
                         pbar.write(f"  ✕  Kritisch: PPT konnte nicht neu gestartet werden: {fatal_e}")
                         ppt_app_global = None
@@ -2931,18 +3223,24 @@ def process_directory(
                     f"  ↻  Speicher-Reset: Starte PowerPoint nach "
                     f"{PPT_RESTART_INTERVAL} Dateien neu..."
                 )
-                try:
-                    if ppt_app_global is not None:
-                        ppt_app_global.Quit()
-                except Exception as _e:
-                    detail_logger.debug(f"process_directory: Exception verworfen: {_e!r}")
-                _kill_user_powerpoint()
+                # (c) Neustart nur, wenn keine Praesentation des Anwenders
+                # in der Instanz offen ist - sonst weder Quit noch Kill.
+                if not _eigene_powerpoint_beenden(ppt_app_global):
+                    pbar.write("  ⚠  Kein Neustart: PowerPoint enthaelt Praesentationen "
+                               "des Anwenders - Lauf wird beendet.")
+                    ppt_app_global = None
+                    break
+                ppt_app_global = None
                 _cleanup_ppt_inetcache()
                 _cleanup_user_recent()
                 time.sleep(2)
                 try:
-                    ppt_app_global = win32com.client.DispatchEx("PowerPoint.Application")
-                    _configure_ppt_instance(ppt_app_global)
+                    ppt_app_global = _starte_eigene_powerpoint()
+                except FremdePowerPointSitzung as e_fremd:
+                    pbar.write(f"  ✕  Kein Neustart: {e_fremd}")
+                    detail_logger.warning(f"Kein Neustart: {e_fremd}")
+                    ppt_app_global = None
+                    break
                 except Exception as e_restart:
                     pbar.write(f"  ✗  Fehler beim PPT-Neustart: {e_restart}")
                     ppt_app_global = None
@@ -2989,10 +3287,11 @@ if __name__ == "__main__":
             f"\n"
             f"WICHTIG – --auto-start:\n"
             f"  Ausschließlich für automatisierte Dienste (Task Scheduler, SCCM, CI/CD).\n"
-            f"  Das Skript beendet im Automatikmodus ALLE PowerPoint-Prozesse des\n"
-            f"  ausführenden Benutzers ohne Rückfrage und ohne Vorwarnung. Ungespeicherte\n"
-            f"  Änderungen gehen unwiederbringlich verloren. Niemals interaktiv mit\n"
-            f"  offenen PowerPoint-Fenstern verwenden!"
+            f"  PowerPoint ist eine Einzelinstanz-Anwendung. Läuft beim Start bereits\n"
+            f"  PowerPoint für den ausführenden Benutzer, bricht das Skript ohne\n"
+            f"  COM-Zugriff mit Exitcode {EXIT_POWERPOINT_LAEUFT} ab. Beendet wird nur die\n"
+            f"  eigene, vom Skript gestartete Instanz - und auch die nur, wenn darin\n"
+            f"  keine Präsentation des Anwenders geöffnet ist."
         ),
     )
     parser.add_argument(
@@ -3062,8 +3361,11 @@ if __name__ == "__main__":
 
     auto_mode = args.auto_start
 
-    # Vor dem ersten COM-Zugriff auf bereits laufende Sitzungen hinweisen.
-    warn_running_powerpoint(auto_mode)
+    # Vor dem ersten COM-Zugriff: laufendes PowerPoint -> nicht starten
+    # (interaktiv: Hinweis + erneute Pruefung; Automatik: Abbruch).
+    # Unmittelbar vor dem Start wird noch einmal geprueft - der
+    # Trust-Center-Hinweis unten bittet ausdruecklich, PowerPoint zu oeffnen.
+    pruefe_powerpoint_geschlossen(auto_mode)
 
     # --- Trust-Center-Erinnerung ---
     if not auto_mode:
@@ -3227,8 +3529,9 @@ if __name__ == "__main__":
     print("  ⚠️  PowerPoint-Fenster:")
     print("     PowerPoint MUSS sichtbar laufen (technische Einschränkung).")
     print("     Das Fenster wird minimiert. NICHT schließen!")
-    print("     ALLE laufenden PowerPoint-Sitzungen des Benutzers werden")
-    print("     beendet, sobald der Lauf bestätigt wurde.")
+    print("     PowerPoint muss beim Start geschlossen sein (Einzelinstanz).")
+    print("     Während des Laufs KEINE Präsentation öffnen – sie landet in")
+    print("     der Instanz des Skripts; der Lauf wird dann beendet.")
     print("=" * 66)
 
     if not auto_mode and not ask_yes_no("\nJetzt starten?"):
@@ -3258,10 +3561,19 @@ if __name__ == "__main__":
     stats_result = None
 
     try:
-        _kill_user_powerpoint()
+        # (a) Erneut pruefen - zwischen Startfrage und hier kann PowerPoint
+        # geoeffnet worden sein (Trust-Center-Hinweis).
+        pruefe_powerpoint_geschlossen(auto_mode)
 
-        ppt_app_global = win32com.client.DispatchEx("PowerPoint.Application")
-        _configure_ppt_instance(ppt_app_global)
+        # (b) Nur mit nachweislich eigener Instanz weiterarbeiten.
+        try:
+            ppt_app_global = _starte_eigene_powerpoint()
+        except FremdePowerPointSitzung as e_fremd:
+            print(f"\n❌  {e_fremd}")
+            file_logger.error(f"Abbruch: {e_fremd}")
+            ppt_app_global = None
+            exit_code = EXIT_POWERPOINT_LAEUFT
+            raise SystemExit(exit_code)
 
         ppt_version = "Unbekannt"
         try:
@@ -3324,12 +3636,13 @@ if __name__ == "__main__":
         exit_code = 1
 
     finally:
-        if ppt_app_global is not None:
-            try:
-                ppt_app_global.Quit()
-            except Exception:
-                pass
-        _kill_user_powerpoint()
+        # (c)/(d): Quit nur ohne Praesentationen des Anwenders, Kill nur
+        # der eigenen PID mit passender Erstellungszeit.
+        try:
+            _eigene_powerpoint_beenden(ppt_app_global)
+        except Exception:
+            pass
+        ppt_app_global = None
         if os.path.exists(TEMP_PROCESS_PATH):
             try:
                 time.sleep(1)

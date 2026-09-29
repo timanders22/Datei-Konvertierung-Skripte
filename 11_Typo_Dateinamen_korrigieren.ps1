@@ -272,6 +272,59 @@ function Test-DownloadHashes {
     Write-Host "  Sollwerte geschrieben: $hashFile" -ForegroundColor DarkGray
 }
 
+function Save-Woerterbuch {
+    <#
+        Laedt ein Hunspell-Woerterbuch ueber eine Zwischendatei '<Ziel>.part'
+        und benennt erst nach bestandener Plausibilitaetspruefung um. Wirft
+        bei jedem Fehler; die Zwischendatei wird in jedem Fall entfernt.
+
+        Plausibel heisst (gemessen an de_DE_frami, Commit 31bc2a11):
+          .dic  4.356.903 Bytes, erste Zeile = Wortzahl 258200, 258220 Zeilen,
+                letztes Byte LF  -> Mindestgroesse 1 MB, Kopfzeile numerisch,
+                mindestens 90 % der angekuendigten Eintraege (die Zahl ist
+                laut Hunspell nur ein Richtwert), Ende auf LF.
+          .aff  19.067 Bytes, 'SET ISO8859-1' in Zeile 1, letztes Byte LF
+                -> Mindestgroesse 4 KB, eine 'SET '-Zeile, Ende auf LF.
+        Ein abgebrochener Download endet praktisch immer mitten in einer
+        Zeile; eine Fehlerseite (Proxy, HTML) hat weder Wortzahl noch SET.
+    #>
+    param([string]$Uri, [string]$Ziel, [ValidateSet('dic','aff')][string]$Art)
+    $teil = $Ziel + '.part'
+    try {
+        if (Test-Path -LiteralPath $teil) { Remove-Item -LiteralPath $teil -Force }
+        Invoke-WebRequest -Uri $Uri -OutFile $teil -UseBasicParsing
+        $bytes = [System.IO.File]::ReadAllBytes($teil)
+        $mindest = if ($Art -eq 'dic') { 1MB } else { 4KB }
+        if ($bytes.Length -lt $mindest) {
+            throw "Download von '$Uri' unvollstaendig: nur $($bytes.Length) Bytes (erwartet mindestens $mindest)."
+        }
+        if ($bytes[$bytes.Length - 1] -ne 10) {
+            throw "Download von '$Uri' endet mitten in einer Zeile - vermutlich abgebrochen."
+        }
+        # ISO-8859-1 bildet jedes Byte 1:1 ab - fuer die Strukturpruefung genuegt das.
+        $text   = [System.Text.Encoding]::GetEncoding(28591).GetString($bytes)
+        $zeilen = $text.Split([char]10)
+        if ($Art -eq 'dic') {
+            $kopf = $zeilen[0].Trim()
+            $anzahl = 0
+            if (-not [int]::TryParse($kopf, [ref]$anzahl) -or $anzahl -le 0) {
+                throw "Download von '$Uri' ist keine Hunspell-.dic (erste Zeile '$kopf' ist keine Wortzahl)."
+            }
+            # -2: Kopfzeile und das leere Element hinter dem letzten LF.
+            if (($zeilen.Length - 2) -lt [int]($anzahl * 0.9)) {
+                throw "Download von '$Uri' unvollstaendig: $($zeilen.Length - 2) Zeilen, angekuendigt $anzahl."
+            }
+        } else {
+            if (-not ($zeilen | Where-Object { $_ -match '^SET\s+\S' } | Select-Object -First 1)) {
+                throw "Download von '$Uri' ist keine Hunspell-.aff (keine SET-Zeile)."
+            }
+        }
+        Move-Item -LiteralPath $teil -Destination $Ziel -Force
+    } finally {
+        if (Test-Path -LiteralPath $teil) { Remove-Item -LiteralPath $teil -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Initialize-Hunspell {
     if (-not (Test-Path -LiteralPath $HunspellDir)) {
         New-Item -ItemType Directory -Path $HunspellDir -Force | Out-Null
@@ -300,13 +353,20 @@ function Initialize-Hunspell {
         Remove-Item $nupkg -Force
     }
 
+    # Woerterbuecher nie direkt in die Zieldatei laden. Vorher schrieb
+    # Invoke-WebRequest -OutFile unmittelbar nach de_DE_frami.dic/.aff: ein
+    # abgebrochener Download hinterliess eine Teildatei, der naechste Lauf
+    # sah sie per Test-Path als vorhanden an und Test-DownloadHashes schrieb
+    # ihren Hash per TOFU als Sollwert fest (nachgestellt mit einem
+    # Download, der nach der Haelfte abbricht). Jetzt: in eine Zwischendatei
+    # laden, Groesse und Aufbau pruefen, erst dann umbenennen.
     if (-not (Test-Path $dicPath)) {
         Write-Host "Lade de_DE_frami.dic ..." -ForegroundColor Cyan
-        Invoke-WebRequest -Uri $DicUrl -OutFile $dicPath -UseBasicParsing
+        Save-Woerterbuch -Uri $DicUrl -Ziel $dicPath -Art 'dic'
     }
     if (-not (Test-Path $affPath)) {
         Write-Host "Lade de_DE_frami.aff ..." -ForegroundColor Cyan
-        Invoke-WebRequest -Uri $AffUrl -OutFile $affPath -UseBasicParsing
+        Save-Woerterbuch -Uri $AffUrl -Ziel $affPath -Art 'aff'
     }
 
     # Zwingend VOR dem Add-Type: danach ist der native Code bereits im
@@ -381,8 +441,14 @@ function Get-EditDistance {
 }
 
 # ---------- Spell-Cache ----------
-$script:SpellCache   = @{}
-$script:SuggestCache = @{}
+# Ordinale Schluessel, Gross-/Kleinschreibung zaehlt. '@{}' vergleicht
+# kulturabhaengig und ohne Gross-/Kleinschreibung: unter de-DE sind
+# 'Straße' und 'Strasse' derselbe Schluessel (gemessen, PS 5.1). Hunspell
+# prueft aber schreibweisengenau - der Cache lieferte dann das Ergebnis
+# des jeweils anderen Worts, und ß/ss-Tippfehler fielen je nach
+# Reihenfolge durch oder erzeugten Vorschlaege ohne Aenderung.
+$script:SpellCache   = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
+$script:SuggestCache = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
 
 function Test-Spell {
     param([string]$word)
@@ -430,7 +496,9 @@ function Build-CorpusVocabulary {
         [string[]]$Files,
         [string[]]$Dirs
     )
-    $vocab = @{}
+    # Ordinal statt '@{}': kulturabhaengig fielen 'strasse' und 'straße'
+    # auf einen Schluessel und ihre Haeufigkeiten wurden zusammengezaehlt.
+    $vocab = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
 
     $addTokens = {
         param([string]$text)
@@ -478,7 +546,8 @@ function Build-CorpusVocabulary {
 #     ueber Tokens passender Laenge statt ueber das ganze Vokabular.
 function Build-VocabIndex {
     param([hashtable]$Vocab)
-    $anagram = @{}
+    # Ordinal wie das Vokabular selbst (siehe Build-CorpusVocabulary).
+    $anagram = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
     $byLength = @{}
     foreach ($key in $Vocab.Keys) {
         $chars = $key.ToCharArray()
@@ -541,18 +610,28 @@ function Test-NameForCorpusTransposition {
             if ($Index.Anagram.ContainsKey($sig)) {
                 foreach ($k in $Index.Anagram[$sig]) { $bucket.Add($k) }
             }
-            foreach ($len in @($key.Length - 1, $key.Length, $key.Length + 1)) {
+            # Klammern sind Pflicht: das Komma bindet staerker als '-', ohne
+            # sie wurde "$key.Length - (1, $key.Length, ...)" gerechnet und
+            # warf (op_Subtraction auf Object[], gemessen unter 5.1) - bei
+            # fast jedem seltenen Wort landete die Datei als "Fehler".
+            foreach ($len in @(($key.Length - 1), $key.Length, ($key.Length + 1))) {
                 if ($Index.ByLength.ContainsKey($len)) {
                     foreach ($k in $Index.ByLength[$len]) { $bucket.Add($k) }
                 }
             }
-            $candidateKeys = @($bucket | Select-Object -Unique)
+            # Ordinal entdoppeln. 'Select-Object -Unique' vergleicht unter
+            # de-DE kulturabhaengig und warf 'straße' als Dublette von
+            # 'strasse' hinaus (gemessen) - der Kandidat fehlte dann.
+            $gesehen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+            $candidateKeys = New-Object System.Collections.Generic.List[string]
+            foreach ($k in $bucket) { if ($gesehen.Add($k)) { $candidateKeys.Add($k) } }
         } else {
             $candidateKeys = $Vocab.Keys
         }
 
         foreach ($otherKey in $candidateKeys) {
-            if ($otherKey -eq $key) { continue }
+            # Ordinal: '-eq' haelt unter de-DE 'straße' und 'strasse' fuer gleich.
+            if ([string]::Equals($otherKey, $key, [System.StringComparison]::Ordinal)) { continue }
             if ($Vocab[$otherKey] -lt $CorpusMinDominantFreq) { continue }
             if ([Math]::Abs($otherKey.Length - $key.Length) -gt 1) { continue }
 
@@ -712,14 +791,20 @@ function Invoke-SafeRename {
     # Wirklich unveraendert nur, wenn auch die Gross-/Kleinschreibung
     # uebereinstimmt. Frueheres -ieq blockierte gewollte Case-Korrekturen
     # (z.B. "dokument.txt" -> "Dokument.txt") faelschlich als "Unveraendert".
-    if ($target -ceq $FullPath) { return @{ Status='Unveraendert' } }
+    # Ordinal vergleichen: -ceq/-ieq/-cne vergleichen kulturabhaengig, und
+    # unter de-DE ist 'Strasse' -ceq 'Straße' $true (gemessen, PS 5.1) -
+    # jede ß/ss-Korrektur wurde so als "Unveraendert" verbucht und nie
+    # ausgefuehrt. Fuer NTFS sind die beiden Namen verschieden.
+    if ([string]::Equals($target, $FullPath, [System.StringComparison]::Ordinal)) { return @{ Status='Unveraendert' } }
 
     # Case-Only-Aenderung erkennen: alter und neuer Pfad sind auf einem
     # case-insensitiven Dateisystem (NTFS) "gleich", unterscheiden sich aber
     # in der Schreibweise. Direktes File.Move scheitert dann mit
     # "Source and destination path must be different" - Workaround: ueber
-    # eindeutigen Zwischennamen umbenennen.
-    $isCaseOnly = ($target -ieq $FullPath) -and ($target -cne $FullPath)
+    # eindeutigen Zwischennamen umbenennen. OrdinalIgnoreCase statt -ieq
+    # (kulturabhaengig, s.o.): sonst galt 'Straße' -> 'Strasse' als
+    # Case-Only und lief unnoetig ueber den Zwischennamen.
+    $isCaseOnly = [string]::Equals($target, $FullPath, [System.StringComparison]::OrdinalIgnoreCase)
 
     # Langpfad-Fassungen fuer alle Dateisystem-Zugriffe.
     $srcLong    = Add-LongPathPrefix $FullPath
@@ -780,7 +865,22 @@ function Invoke-SafeRename {
             }
             return @{ Status='Umbenannt' }
         } catch {
-            if ($i -eq 3) { return @{ Status='Fehler'; Details=$_.Exception.Message } }
+            if ($i -eq 3) {
+                $fehlerText = $_.Exception.Message
+                # Schreibschutz zuruecksetzen, wenn die Umbenennung endgueltig
+                # gescheitert ist. Vorher blieb das oben entfernte ReadOnly-
+                # Attribut dann dauerhaft weg (nachgestellt: gesperrte,
+                # schreibgeschuetzte Datei -> 'Fehler', danach ohne ReadOnly).
+                if ($restoreRO) {
+                    try {
+                        $a = [System.IO.File]::GetAttributes($srcLong)
+                        [System.IO.File]::SetAttributes($srcLong, $a -bor [System.IO.FileAttributes]::ReadOnly)
+                    } catch {
+                        Write-Warning "ReadOnly-Attribut auf '$FullPath' konnte nicht wiederhergestellt werden: $($_.Exception.Message)"
+                    }
+                }
+                return @{ Status='Fehler'; Details=$fehlerText }
+            }
             Start-Sleep -Milliseconds (250*$i)
         }
     }
@@ -937,12 +1037,24 @@ function Invoke-WindowsTempCleanup {
     # Best-effort Bereinigung von %LOCALAPPDATA%\Temp am Skriptende -
     # ausschliesslich per Whitelist bekannter Praefixe.
     # Gesperrte/in-Nutzung-Dateien werden stillschweigend uebersprungen.
+    #
+    # Protokolle dieses Skripts sind KEINE Reste. Landet das Protokoll im
+    # TEMP-Rueckfall von Get-WritableDir, traegt es das Whitelist-Praefix
+    # '11_typo_dateinamen_korrigieren' und wurde hier am Ende desselben
+    # Laufs geloescht - die Zusammenfassung nannte danach einen Pfad, den
+    # es nicht mehr gab (nachgestellt mit umgelenktem TEMP). Ebenso traf
+    # es die Scan-CSV eines frueheren Laufs, die Eingabe fuer Modus 3.
+    param([string[]]$Ausnehmen = @())
     $winTemp = $env:TEMP
     if (-not $winTemp) { $winTemp = $env:TMP }
     if (-not $winTemp -or -not (Test-Path -LiteralPath $winTemp)) { return }
     Get-ChildItem -LiteralPath $winTemp -Force -ErrorAction SilentlyContinue | ForEach-Object {
         try {
             if (-not (Test-WhitelistedTempEntry $_.Name)) { return }
+            $eintrag = $_.FullName
+            if (@($Ausnehmen | Where-Object { $_ -and [string]::Equals($_, $eintrag, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) { return }
+            if (-not $_.PSIsContainer -and
+                $_.Name -match '^11_Typo_Dateinamen_korrigieren_(Scan|Interactive|Apply)_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.csv$') { return }
             if ($_.PSIsContainer) {
                 Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
             } else {
@@ -1504,7 +1616,7 @@ finally {
     if ($script:Hunspell) {
         try { $script:Hunspell.Dispose() } catch {}
     }
-    Invoke-WindowsTempCleanup
+    Invoke-WindowsTempCleanup -Ausnehmen @($logPath)
     try { if ($script:CtrlCAsInput) { [Console]::TreatControlCAsInput = $false } } catch {}
     if ($script:InteractiveLaunch) {
         Read-SingleKey "Beliebige Taste druecken zum Beenden"

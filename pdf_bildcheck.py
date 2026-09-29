@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import glob
+import math
 from typing import Optional
 
 # ==================================================================
@@ -154,15 +155,25 @@ def check_pdf(path: str) -> None:
                 if comps >= 4:
                     has_cmyk = True
 
+                # Bildkanten ueber die Platzierungsmatrix vermessen, nicht
+                # ueber das umschliessende Rechteck: bei einem um 90 Grad
+                # gedrehten Bild liegt die Pixelbreite entlang der
+                # Rechteckhoehe. Gemessen: 1000x500 px gedreht in 3x6 Zoll
+                # platziert = 166,7 dpi; die alte Rechnung max(w/Breite,
+                # h/Hoehe) meldete 333 dpi. Die Matrix bildet das
+                # Einheitsquadrat des Bildes auf die Seite ab; die Laengen
+                # ihrer Zeilen (a, b) und (c, d) sind die platzierten Kanten
+                # in pt - unabhaengig von Drehung und Scherung.
                 try:
-                    rects = page.get_image_rects(xref)
+                    platzierungen = page.get_image_rects(xref, transform=True)
                 except Exception:
-                    rects = []
-                if not rects:
+                    platzierungen = []
+                if not platzierungen:
                     print(f"  {pno+1:>5}  {w:>6}x{h:<6}  {'—':>13}  {'—':>6}  {_farbraum_name(comps)}")
                     continue
-                for r in rects:
-                    wi, hi = float(r.width) / 72.0, float(r.height) / 72.0
+                for r, mat in platzierungen:
+                    wi = math.hypot(mat.a, mat.b) / 72.0
+                    hi = math.hypot(mat.c, mat.d) / 72.0
                     if wi <= 0 or hi <= 0:
                         continue
                     dpi = max(w / wi, h / hi)
@@ -211,7 +222,9 @@ def check_pdf(path: str) -> None:
 
 def collect(arg: str):
     if os.path.isdir(arg):
-        return sorted(glob.glob(os.path.join(arg, "**", "*.pdf"), recursive=True))
+        # glob.escape: eckige Klammern im Ordnernamen ('Akte [2024]') sind
+        # sonst Zeichenklassen - gemessen: 0 statt 1 Treffer.
+        return sorted(glob.glob(os.path.join(glob.escape(arg), "**", "*.pdf"), recursive=True))
     if os.path.isfile(arg) and arg.lower().endswith(".pdf"):
         return [arg]
     return []

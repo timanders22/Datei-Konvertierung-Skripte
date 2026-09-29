@@ -91,10 +91,16 @@ function Resolve-WritableDirectory {
 # ==================================================================
 # Langpfade
 # ==================================================================
+# StartsWith statt -like: im Muster '\\?\*' ist das '?' ein Platzhalter fuer
+# ein beliebiges Zeichen. Gemessen unter 5.1: '\\s\share\a.xlsx' -like '\\?\*'
+# ist True - ein UNC-Pfad mit einbuchstabigem Servernamen galt als schon
+# praefixiert (kein '\\?\UNC\'), und Remove-LongPathPrefix schnitt daraus
+# 'hare\a.xlsx'. Skripte mit eigener Kopie gleichen Namens ueberschatten
+# diese Fassung (6 ist mitkorrigiert).
 function Add-LongPathPrefix {
     param([string]$Path)
     if ([string]::IsNullOrEmpty($Path))  { return $Path }
-    if ($Path -like '\\?\*')             { return $Path }
+    if ($Path.StartsWith('\\?\', [System.StringComparison]::Ordinal)) { return $Path }
     if ($Path -match '^[A-Za-z]:$')      { return '\\?\' + $Path + '\' }
     if ($Path -like '\\*')               { return '\\?\UNC\' + $Path.TrimStart('\') }
     if ($Path -match '^[A-Za-z]:\\')     { return '\\?\' + $Path }
@@ -104,8 +110,8 @@ function Add-LongPathPrefix {
 function Remove-LongPathPrefix {
     param([string]$Path)
     if ([string]::IsNullOrEmpty($Path))  { return $Path }
-    if ($Path -like '\\?\UNC\*')         { return '\\' + $Path.Substring(8) }
-    if ($Path -like '\\?\*')             { return $Path.Substring(4) }
+    if ($Path.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { return '\\' + $Path.Substring(8) }
+    if ($Path.StartsWith('\\?\', [System.StringComparison]::Ordinal))               { return $Path.Substring(4) }
     return $Path
 }
 

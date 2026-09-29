@@ -308,9 +308,40 @@ function Test-SourcePathSafe {
         $env:LOCALAPPDATA,
         $env:TEMP
     ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    # Vorher nur auf Gleichheit geprueft: 'C:\Users' (Vorfahr aller
+    # Profile), 'C:\Users\<Name>\AppData' (Vorfahr von APPDATA und
+    # LOCALAPPDATA) oder 'C:\Program Files\Common Files' (Nachfahr von
+    # ProgramFiles) gingen durch (nachgestellt per herausgeloester
+    # Funktion). Jetzt gilt:
+    #   - gleich oder VORFAHR eines geschuetzten Verzeichnisses: immer
+    #     gesperrt (der Loeschschritt traefe das geschuetzte Verzeichnis
+    #     mit).
+    #   - NACHFAHR: nur fuer die systemeigenen Verzeichnisse (Windows,
+    #     Programme, ProgramData) gesperrt. Unterhalb des Nutzerprofils
+    #     bleibt es erlaubt - Desktop und Downloads sind feste Praesets
+    #     dieses Skripts, Dokumente-Unterordner ein ueblicher Fall.
     foreach ($prot in $protected) {
-        if ($p -ieq $prot.TrimEnd('\')) {
+        $pr = $prot.TrimEnd('\')
+        if ($p -ieq $pr) {
             return "'$Path' ist ein geschuetztes Systemverzeichnis."
+        }
+        if ($pr.StartsWith($p + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            return "'$Path' enthaelt das geschuetzte Systemverzeichnis '$pr'."
+        }
+    }
+    # ProgramW6432 ergaenzt: in einem 32-Bit-Prozess zeigt ProgramFiles auf
+    # 'Program Files (x86)', das 64-Bit-Verzeichnis fehlte dann ganz.
+    $systemEigen = @(
+        $env:SystemRoot,
+        $env:ProgramFiles,
+        ${env:ProgramFiles(x86)},
+        $env:ProgramW6432,
+        $env:ProgramData
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    foreach ($prot in $systemEigen) {
+        $pr = $prot.TrimEnd('\')
+        if (($p + '\').StartsWith($pr + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            return "'$Path' liegt im geschuetzten Systemverzeichnis '$pr'."
         }
     }
 
@@ -349,6 +380,33 @@ function Stop-Script {
     try { Clear-TempLeftovers } catch { }
     Wait-ForKey
     exit $Code
+}
+
+function Stop-WennAbgebrochen {
+    <#
+        Strg+C-Pruefpunkt auf oberster Ebene. Die Schleifen der Phasen vor
+        dem Kopieren (Namensbereinigung, Kompatibilitaetspruefung,
+        Zeitstempel-Export) brechen bei Strg+C nur ab und liefern ihr
+        Teilergebnis zurueck - bei einem Abbruch gleich zu Beginn also 0
+        Probleme bzw. 0 Eintraege. Der Ablauf meldete dann gruen und startete
+        danach den vollstaendigen Robocopy-Lauf, weil das Flag erst in der
+        Verifikation wieder abgefragt wurde. Hier ist nach jeder Phase
+        Schluss; die Quelle bleibt erhalten.
+    #>
+    param(
+        [string]$Phase,
+        [System.Text.Encoding]$Encoding = $null
+    )
+    if (-not (Test-ShouldStop)) { return }
+    Write-Host ""
+    Write-Warning "Abbruch durch Anwender (Strg+C) waehrend: $Phase"
+    Write-Warning "Das Ergebnis dieser Phase ist unvollstaendig und wird nicht verwendet."
+    Write-Warning "Es wird nichts weiter kopiert und nichts geloescht - die Quelle bleibt erhalten."
+    if ($LogFile) {
+        Add-LogLine -Path $LogFile -Message "[$(Get-Date)] ABBRUCH (Strg+C) waehrend: $Phase. Nichts geloescht, Quelle bleibt erhalten." `
+                    -Encoding $Encoding
+    }
+    Stop-Script
 }
 
 # ==================================================================
@@ -620,7 +678,12 @@ function Export-Timestamps {
         Write-Host "  Liste: $ReparseReportFile" -ForegroundColor Yellow
     }
 
-    Write-Host "  Zeitstempel exportiert: $count Eintraege -> $OutputFile"
+    if (Test-ShouldStop) {
+        # Teilexport - nicht als abgeschlossen melden (der Aufrufer bricht ab).
+        Write-Warning "  Zeitstempel-Export abgebrochen - nur $count Eintraege erfasst."
+    } else {
+        Write-Host "  Zeitstempel exportiert: $count Eintraege -> $OutputFile"
+    }
     return @{
         Count      = $count
         MaxDepth   = $maxDepth
@@ -805,10 +868,17 @@ function Test-GDriveCompatibility {
                         $writer.WriteLine('"Typ","Pfad","Probleme"')
                     }
                     $typ = if ($_ -is [System.IO.DirectoryInfo]) { 'Ordner' } else { 'Datei' }
-                    $writer.WriteLine("{0},{1},{2}" -f `
+                    # Doppelte Klammer ist Pflicht (hier und an den zwoelf
+                    # weiteren WriteLine-Stellen mit -f): in einer
+                    # Methoden-Argumentliste trennt das Komma die ARGUMENTE,
+                    # -f bekam nur den ersten Wert und warf FormatException
+                    # (gemessen unter 5.1). Die Pruefsummen- und
+                    # Kompatibilitaetspruefung brachen dadurch bei der ersten
+                    # Datei ab und meldeten fuer 0 Dateien "alles in Ordnung".
+                    $writer.WriteLine(("{0},{1},{2}" -f `
                         (ConvertTo-CsvField $typ), `
                         (ConvertTo-CsvField $realPath), `
-                        (ConvertTo-CsvField ($issues -join '; ')))
+                        (ConvertTo-CsvField ($issues -join '; '))))
                     $count++
                 }
             }
@@ -818,6 +888,13 @@ function Test-GDriveCompatibility {
         if ($writer) { $writer.Close() }
     }
 
+    # Bei Strg+C bricht Get-FilesStreaming ab und $count ist nur ein
+    # Teilergebnis - vorher folgte dann "Alle Dateinamen sind Google
+    # Drive-kompatibel" in Gruen. Der Aufrufer bricht danach ab.
+    if (Test-ShouldStop) {
+        Write-Warning "  Kompatibilitaetspruefung abgebrochen - Ergebnis unvollstaendig ($count Problem(e) bis zum Abbruch)."
+        return $count
+    }
     if ($count -gt 0) {
         Write-Warning "  $count Datei(en)/Ordner mit GDrive-Kompatibilitaetsproblemen gefunden."
         Write-Warning "  Details: $csvFile"
@@ -890,7 +967,11 @@ function Repair-GDrivePaths {
         $targetPath = Join-Path $parentReal $newName
         $longTarget = Add-LongPathPrefix $targetPath
 
-        if (Test-Path -LiteralPath $longTarget) {
+        # [System.IO] statt Test-Path: Provider-Cmdlets sind mit '\\?\'-Pfaden
+        # unter 5.1 nicht verlaesslich (siehe 7; fuer UNC/G: nicht messbar),
+        # und ein falsches "frei" liesse unten eine bestehende Datei
+        # ueberschreiben. Gemeldet von pruefe_alles (Muster 5.2).
+        if ([System.IO.File]::Exists($longTarget) -or [System.IO.Directory]::Exists($longTarget)) {
             $baseName = [System.IO.Path]::GetFileNameWithoutExtension($newName)
             $ext      = [System.IO.Path]::GetExtension($newName)
             $counter  = 2
@@ -899,7 +980,7 @@ function Repair-GDrivePaths {
                 $targetPath = Join-Path $parentReal $candidate
                 $longTarget = Add-LongPathPrefix $targetPath
                 $counter++
-            } while (Test-Path -LiteralPath $longTarget)
+            } while ([System.IO.File]::Exists($longTarget) -or [System.IO.Directory]::Exists($longTarget))
             $newName = $candidate
         }
 
@@ -915,12 +996,12 @@ function Repair-GDrivePaths {
                 $writer = [System.IO.StreamWriter]::new($csvFile, $false, $Utf8Bom)
                 $writer.WriteLine('"Typ","AlterName","NeuerName","Pfad","Status"')
             }
-            $writer.WriteLine("{0},{1},{2},{3},{4}" -f `
+            $writer.WriteLine(("{0},{1},{2},{3},{4}" -f `
                 (ConvertTo-CsvField $typ), `
                 (ConvertTo-CsvField $oldName), `
                 (ConvertTo-CsvField $newName), `
                 (ConvertTo-CsvField $parentReal), `
-                (ConvertTo-CsvField 'OK'))
+                (ConvertTo-CsvField 'OK')))
             $written++
             $ok++
 
@@ -934,12 +1015,12 @@ function Repair-GDrivePaths {
                 $writer = [System.IO.StreamWriter]::new($csvFile, $false, $Utf8Bom)
                 $writer.WriteLine('"Typ","AlterName","NeuerName","Pfad","Status"')
             }
-            $writer.WriteLine("{0},{1},{2},{3},{4}" -f `
+            $writer.WriteLine(("{0},{1},{2},{3},{4}" -f `
                 (ConvertTo-CsvField $typ), `
                 (ConvertTo-CsvField $oldName), `
                 (ConvertTo-CsvField $newName), `
                 (ConvertTo-CsvField $parentReal), `
-                (ConvertTo-CsvField "FEHLER: $_"))
+                (ConvertTo-CsvField "FEHLER: $_")))
             $written++
             $fail++
             Write-Warning "  Fehler beim Umbenennen von '$oldName': $_"
@@ -1019,18 +1100,24 @@ function Compare-FileChecksums {
                 $srcLong = Add-LongPathPrefix (Remove-LongPathPrefix $srcItem.FullName)
                 $srcHash = $null
                 try {
+                    # Initialize() vor JEDEM Versuch: ComputeHash(Stream) setzt
+                    # das gemeinsame SHA256-Objekt nur nach einem vollstaendigen
+                    # Durchlauf zurueck. Warf das Lesen mittendrin, blieb der
+                    # Teilzustand stehen, und der naechste Versuch bzw. die
+                    # naechste Datei bekam einen falschen Hash (nachgestellt
+                    # mit einem Stream, der nach 64 KB wirft).
                     $srcHash = Invoke-WithRetry -ScriptBlock {
                         $fs = [System.IO.File]::OpenRead($srcLong)
-                        try   { [BitConverter]::ToString($sha.ComputeHash($fs)).Replace('-', '') }
+                        try   { $sha.Initialize(); [BitConverter]::ToString($sha.ComputeHash($fs)).Replace('-', '') }
                         finally { $fs.Close() }
                     }
                 } catch {
-                    $writer.WriteLine("{0},{1},{2},{3},{4}" -f `
+                    $writer.WriteLine(("{0},{1},{2},{3},{4}" -f `
                         (ConvertTo-CsvField $rel), `
                         (ConvertTo-CsvField 'FEHLER_QUELLE'), `
                         (ConvertTo-CsvField "LESEFEHLER: $_"), `
                         (ConvertTo-CsvField ''), `
-                        (ConvertTo-CsvField $srcItem.Length))
+                        (ConvertTo-CsvField $srcItem.Length)))
                     $counters.Error++
                     return
                 }
@@ -1039,12 +1126,12 @@ function Compare-FileChecksums {
                 $dstLong = Add-LongPathPrefix $dstPath
 
                 if (-not [System.IO.File]::Exists($dstLong)) {
-                    $writer.WriteLine("{0},{1},{2},{3},{4}" -f `
+                    $writer.WriteLine(("{0},{1},{2},{3},{4}" -f `
                         (ConvertTo-CsvField $rel), `
                         (ConvertTo-CsvField 'FEHLT_IM_ZIEL'), `
                         (ConvertTo-CsvField $srcHash), `
                         (ConvertTo-CsvField ''), `
-                        (ConvertTo-CsvField $srcItem.Length))
+                        (ConvertTo-CsvField $srcItem.Length)))
                     $counters.Missing++
                     return
                 }
@@ -1053,37 +1140,37 @@ function Compare-FileChecksums {
                 try {
                     $dstHash = Invoke-WithRetry -ScriptBlock {
                         $fs = [System.IO.File]::OpenRead($dstLong)
-                        try   { [BitConverter]::ToString($sha.ComputeHash($fs)).Replace('-', '') }
+                        try   { $sha.Initialize(); [BitConverter]::ToString($sha.ComputeHash($fs)).Replace('-', '') }
                         finally { $fs.Close() }
                     }
                 } catch {
-                    $writer.WriteLine("{0},{1},{2},{3},{4}" -f `
+                    $writer.WriteLine(("{0},{1},{2},{3},{4}" -f `
                         (ConvertTo-CsvField $rel), `
                         (ConvertTo-CsvField 'FEHLER_ZIEL'), `
                         (ConvertTo-CsvField $srcHash), `
                         (ConvertTo-CsvField "LESEFEHLER: $_"), `
-                        (ConvertTo-CsvField $srcItem.Length))
+                        (ConvertTo-CsvField $srcItem.Length)))
                     $counters.Error++
                     return
                 }
 
                 if ($srcHash -eq $dstHash) {
-                    $writer.WriteLine("{0},{1},{2},{3},{4}" -f `
+                    $writer.WriteLine(("{0},{1},{2},{3},{4}" -f `
                         (ConvertTo-CsvField $rel), `
                         (ConvertTo-CsvField 'OK'), `
                         (ConvertTo-CsvField $srcHash), `
                         (ConvertTo-CsvField $dstHash), `
-                        (ConvertTo-CsvField $srcItem.Length))
+                        (ConvertTo-CsvField $srcItem.Length)))
                     $counters.Match++
                     $counters.Bytes += $srcItem.Length
                     $okPaths.Add($rel)
                 } else {
-                    $writer.WriteLine("{0},{1},{2},{3},{4}" -f `
+                    $writer.WriteLine(("{0},{1},{2},{3},{4}" -f `
                         (ConvertTo-CsvField $rel), `
                         (ConvertTo-CsvField 'ABWEICHUNG'), `
                         (ConvertTo-CsvField $srcHash), `
                         (ConvertTo-CsvField $dstHash), `
-                        (ConvertTo-CsvField $srcItem.Length))
+                        (ConvertTo-CsvField $srcItem.Length)))
                     $counters.Mismatch++
                 }
             }
@@ -1170,11 +1257,11 @@ function Compare-FileExistence {
                 $dstLong = Add-LongPathPrefix $dstPath
 
                 if (-not [System.IO.File]::Exists($dstLong)) {
-                    $writer.WriteLine("{0},{1},{2},{3}" -f `
+                    $writer.WriteLine(("{0},{1},{2},{3}" -f `
                         (ConvertTo-CsvField $rel), `
                         (ConvertTo-CsvField 'FEHLT_IM_ZIEL'), `
                         (ConvertTo-CsvField $srcItem.Length), `
-                        (ConvertTo-CsvField ''))
+                        (ConvertTo-CsvField '')))
                     $counters.Missing++
                     return
                 }
@@ -1183,22 +1270,32 @@ function Compare-FileExistence {
                     $dstInfo = New-Object System.IO.FileInfo($dstLong)
                     $dstSize = $dstInfo.Length
                 } catch {
-                    $writer.WriteLine("{0},{1},{2},{3}" -f `
+                    $writer.WriteLine(("{0},{1},{2},{3}" -f `
                         (ConvertTo-CsvField $rel), `
                         (ConvertTo-CsvField 'FEHLER_ZIEL'), `
                         (ConvertTo-CsvField $srcItem.Length), `
-                        (ConvertTo-CsvField "LESEFEHLER: $_"))
+                        (ConvertTo-CsvField "LESEFEHLER: $_")))
                     $counters.Error++
                     return
                 }
 
                 # Cloud-Platzhalter erkennen, BEVOR die Datei als geprueft
-                # gilt. Google Drive for Desktop (und OneDrive) legen
-                # Platzhalter an, die die volle Groesse melden, obwohl der
-                # Inhalt noch nicht oben ist. Der Light-Check haette solche
-                # Dateien als "OK" gewertet - und die Quelle wird auf genau
-                # dieser Grundlage geloescht. Beim CRC-Verfahren faellt das
-                # nicht an, weil das Lesen den Download erzwingt.
+                # gilt. Ein Platzhalter (Attribute unten) ist eine Datei,
+                # deren Inhalt NICHT lokal liegt, sondern erst beim Zugriff
+                # aus der Cloud geholt wird; ihre Groesse ist nur die
+                # gemeldete Groesse, kein Beleg fuer den Inhalt. Deshalb
+                # zaehlt sie hier bewusst NICHT als OK und bleibt in der
+                # Quelle. Das CRC-Verfahren liest den Inhalt (und holt ihn
+                # dabei herunter) und vergleicht ihn damit tatsaechlich.
+                # Frueher hiess es hier, der Inhalt sei "noch nicht oben" -
+                # das ist umgekehrt: Drive for Desktop macht eine Datei erst
+                # NACH dem Hochladen zum Platzhalter. Umgekehrt beweist eine
+                # lokal vorhandene Datei (kein Platzhalter) NICHT, dass sie
+                # schon hochgeladen ist - sie liegt womoeglich nur im Cache.
+                # Der Light-Check prueft also Existenz und Groesse im
+                # lokalen Ziel (Drive-Cache), nicht den Upload. Die
+                # Zaehlung bleibt absichtlich so: sie erleichtert das
+                # Loeschen der Quelle in keinem Fall.
                 #   0x00400000 FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
                 #   0x00040000 FILE_ATTRIBUTE_RECALL_ON_OPEN
                 #   0x00001000 FILE_ATTRIBUTE_OFFLINE
@@ -1209,30 +1306,30 @@ function Compare-FileExistence {
                 } catch { }
 
                 if ($isPlaceholder) {
-                    $writer.WriteLine("{0},{1},{2},{3}" -f `
+                    $writer.WriteLine(("{0},{1},{2},{3}" -f `
                         (ConvertTo-CsvField $rel), `
                         (ConvertTo-CsvField 'PLATZHALTER'), `
                         (ConvertTo-CsvField $srcItem.Length), `
-                        (ConvertTo-CsvField "$dstSize (nur Platzhalter - Inhalt nicht lokal verfuegbar)"))
+                        (ConvertTo-CsvField "$dstSize (nur Platzhalter - Inhalt nicht lokal verfuegbar)")))
                     $counters.Placeholder++
                     return
                 }
 
                 if ($srcItem.Length -eq $dstSize) {
-                    $writer.WriteLine("{0},{1},{2},{3}" -f `
+                    $writer.WriteLine(("{0},{1},{2},{3}" -f `
                         (ConvertTo-CsvField $rel), `
                         (ConvertTo-CsvField 'OK'), `
                         (ConvertTo-CsvField $srcItem.Length), `
-                        (ConvertTo-CsvField $dstSize))
+                        (ConvertTo-CsvField $dstSize)))
                     $counters.Match++
                     $counters.Bytes += $srcItem.Length
                     $okPaths.Add($rel)
                 } else {
-                    $writer.WriteLine("{0},{1},{2},{3}" -f `
+                    $writer.WriteLine(("{0},{1},{2},{3}" -f `
                         (ConvertTo-CsvField $rel), `
                         (ConvertTo-CsvField 'ABWEICHUNG'), `
                         (ConvertTo-CsvField $srcItem.Length), `
-                        (ConvertTo-CsvField $dstSize))
+                        (ConvertTo-CsvField $dstSize)))
                     $counters.Mismatch++
                 }
             }
@@ -1261,10 +1358,11 @@ function Compare-FileExistence {
         if ($counters.Error    -gt 0) { Write-Host "    LESEFEHLER:            $($counters.Error)"    -ForegroundColor Yellow }
         if ($counters.Placeholder -gt 0) {
             Write-Host "    NUR PLATZHALTER:       $($counters.Placeholder)" -ForegroundColor Yellow
-            Write-Host "      Diese Dateien melden zwar die richtige Groesse, ihr Inhalt ist aber" -ForegroundColor DarkYellow
-            Write-Host "      noch nicht in der Cloud. Sie gelten als NICHT verifiziert und werden" -ForegroundColor DarkYellow
-            Write-Host "      in der Quelle behalten. Entweder spaeter erneut pruefen oder das" -ForegroundColor DarkYellow
-            Write-Host "      CRC-Verfahren waehlen - dessen Lesevorgang erzwingt den Abgleich." -ForegroundColor DarkYellow
+            Write-Host "      Der Inhalt dieser Dateien liegt nicht lokal (nur in der Cloud); die" -ForegroundColor DarkYellow
+            Write-Host "      gemeldete Groesse belegt den Inhalt nicht. Sie gelten als NICHT" -ForegroundColor DarkYellow
+            Write-Host "      verifiziert und werden in der Quelle behalten. Fuer einen" -ForegroundColor DarkYellow
+            Write-Host "      Inhaltsvergleich das CRC-Verfahren waehlen - es liest die Dateien" -ForegroundColor DarkYellow
+            Write-Host "      (und laedt sie dafuer herunter)." -ForegroundColor DarkYellow
         }
         Write-Host "    Details: $ReportFile"
     }
@@ -1663,7 +1761,7 @@ if ($SourcePath.Length -eq 2 -and $SourcePath -match '^[A-Za-z]:$') {
 }
 
 $longSourceTest = Add-LongPathPrefix $SourcePath
-if (-not (Test-Path -LiteralPath $longSourceTest)) {
+if (-not ([System.IO.Directory]::Exists($longSourceTest) -or [System.IO.File]::Exists($longSourceTest))) {
     Write-Warning "Der Pfad '$SourcePath' wurde nicht gefunden!"
     Write-Warning "Tipp fuer Administratoren: Bei erhoehten Rechten ('Als Administrator' gestartet) sind"
     Write-Warning "Netzlaufwerksbuchstaben (Q:, R:) oft ausgeblendet. Bitte Option 3 oder 4 (UNC-Pfad) nutzen."
@@ -1673,7 +1771,7 @@ if (-not (Test-Path -LiteralPath $longSourceTest)) {
 # Vorher wurde nur auf Existenz geprueft. Zeigte die Eingabe auf eine
 # DATEI, lief Robocopy in einen unverstaendlichen Fehler, und der
 # anschliessende /MIR-Purge haette das Elternverzeichnis getroffen.
-if (-not (Test-Path -LiteralPath $longSourceTest -PathType Container)) {
+if (-not [System.IO.Directory]::Exists($longSourceTest)) {
     Write-Warning "'$SourcePath' ist keine Ordner-, sondern eine Dateiangabe."
     Write-Warning "Bitte den uebergeordneten Ordner angeben."
     Stop-Script
@@ -1705,9 +1803,13 @@ if ($SourcePath -match '^[A-Za-z]:') {
 # Der Leer-Guard ist zwingend: bei leerem $UncBaseQ liefert StartsWith('')
 # immer $true, wodurch JEDE Quelle als Geteilte Ablage behandelt und in das
 # falsche Ziel migriert wuerde.
+# Vergleich ueber Test-PathInside (Gleichheit oder Praefix MIT '\'):
+# StartsWith ohne Trennzeichen hielt '\\server\dfsarchiv\...' fuer einen
+# Pfad unter '\\server\dfs' und migrierte ihn in die Geteilte Ablage
+# (nachgestellt).
 $isQDrive = ($DriveLetter -eq "Q:") -or
-            ($UncBaseQ -and $SourcePath.StartsWith($UncBaseQ, [System.StringComparison]::OrdinalIgnoreCase))
-$isRDrive = ($DriveLetter -eq "R:") -or ($UncBaseR -and $SourcePath.StartsWith($UncBaseR, [System.StringComparison]::OrdinalIgnoreCase))
+            ($UncBaseQ -and (Test-PathInside -Child $SourcePath -Parent $UncBaseQ))
+$isRDrive = ($DriveLetter -eq "R:") -or ($UncBaseR -and (Test-PathInside -Child $SourcePath -Parent $UncBaseR))
 
 # ==================================================================
 # ZIELPFAD-ERMITTLUNG
@@ -1857,6 +1959,7 @@ if ($MethodChoice -eq "1") {
         if ($repairChoice -match '^[JjYy]$') {
             Write-Host ""
             $repairCount = Repair-GDrivePaths -RootPath $SourcePath -LogFile $LogFile -SkipReparsePoints $SkipReparsePoints
+            Stop-WennAbgebrochen -Phase 'Dateinamen-Bereinigung' -Encoding ([System.Text.Encoding]::Unicode)
             if ($repairCount -gt 0) {
                 Write-Host ""
                 Write-Host "Bereinigung abgeschlossen. Fuehre jetzt Kontrollpruefung durch ..."
@@ -1866,6 +1969,7 @@ if ($MethodChoice -eq "1") {
 
     Write-Host ""
     $gdProblems = Test-GDriveCompatibility -RootPath $SourcePath -LogFile $LogFile -SkipReparsePoints $SkipReparsePoints -DestRoot $FinalDest
+    Stop-WennAbgebrochen -Phase 'Google-Drive-Kompatibilitaetspruefung' -Encoding ([System.Text.Encoding]::Unicode)
     if ($gdProblems -gt 0) {
         Write-Host ""
         Write-Host "Es wurden $gdProblems verbleibende Kompatibilitaetsprobleme gefunden." -ForegroundColor Red
@@ -1997,13 +2101,13 @@ if ($MethodChoice -eq "1") {
         Write-Host "Pruefe Schreibrechte auf Zielverzeichnis ..."
         try {
             $longFinalDest = Add-LongPathPrefix $FinalDest
-            if (-not (Test-Path -LiteralPath $longFinalDest)) {
-                New-Item -ItemType Directory -Path $longFinalDest -Force -ErrorAction Stop | Out-Null
+            if (-not [System.IO.Directory]::Exists($longFinalDest)) {
+                [void][System.IO.Directory]::CreateDirectory($longFinalDest)
             }
             $testFile     = Join-Path $FinalDest ".write_test_$([guid]::NewGuid().Guid).tmp"
             $longTestFile = Add-LongPathPrefix $testFile
             [System.IO.File]::WriteAllText($longTestFile, "rwtest")
-            Remove-Item -LiteralPath $longTestFile -Force -ErrorAction Stop
+            [System.IO.File]::Delete($longTestFile)
             Write-Host "  Schreibrechte OK." -ForegroundColor Green
         } catch {
             Write-Warning "Keine Schreibrechte auf Zielverzeichnis '$FinalDest':"
@@ -2034,6 +2138,7 @@ if ($MethodChoice -eq "1") {
     }
     $srcStats = Export-Timestamps -RootPath $SourcePath -OutputFile $TimestampFile `
                     -SkipReparsePoints $SkipReparsePoints -ReparseReportFile $ReparseFile
+    Stop-WennAbgebrochen -Phase 'Zeitstempel-Export/Quell-Statistik' -Encoding ([System.Text.Encoding]::Unicode)
 
     # --- Google-Drive-Limits & Cache-Speicher pruefen ---
     if ($srcStats) {
@@ -2108,6 +2213,9 @@ if ($MethodChoice -eq "1") {
     if ($SkipReparsePoints) { $RoboArgs += @("/XJ") }
     if ($DryRun)            { $RoboArgs += @("/L") }
 
+    # Letzter Pruefpunkt vor dem Kopieren (Strg+C waehrend einer Rueckfrage).
+    Stop-WennAbgebrochen -Phase 'Vorbereitung vor dem Kopieren' -Encoding ([System.Text.Encoding]::Unicode)
+
     Write-Host "Starte Kopiervorgang ..."
     Write-Host ""
     $colWidth = try { [Math]::Max(40, [Console]::WindowWidth - 6) } catch { 80 }
@@ -2137,7 +2245,20 @@ if ($MethodChoice -eq "1") {
         try {
             $reader  = [System.IO.StreamReader]::new($LogFile, [System.Text.Encoding]::Unicode)
             $writer  = [System.IO.StreamWriter]::new($tmpFile, $false, [System.Text.Encoding]::Unicode)
-            $regex   = [regex]::new("(?<=\s)" + $sourceEscaped, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            # Zweck der Ersetzung: die Dateizeilen (/FP /NC: Einrueckung,
+            # Groesse, TAB, voller Quellpfad) sollen zeigen, WOHIN die Datei
+            # kopiert wurde. Nur diese Zeilen werden umgeschrieben. Vorher
+            # traf die Ersetzung jeden Quellpfad hinter einem Leerzeichen -
+            # auch Robocopys eigene Kopfzeile '   Quelle : ...' und die
+            # FEHLER-Zeilen ('... FEHLER 32 (0x00000020) Folgende Datei wird
+            # kopiert <Quellpfad>'). Im Log standen dann Quelle und Ziel mit
+            # demselben Pfad, und die fehlgeschlagenen Quelldateien waren
+            # nicht mehr auffindbar (nachgestellt mit robocopy zwischen zwei
+            # Temp-Ordnern und einer gesperrten Datei). Groessenangabe wie
+            # von robocopy geschrieben: '3', '3.0 m', je nach Sprache ',' .
+            $regex   = [regex]::new('^(\s+[0-9][0-9.,]*(?:\s[kmgt])?\t)' + $sourceEscaped + '(?=\\|$)',
+                                    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            $ersatz  = '${1}' + $finalDestCleanSafe
             # Alles bis einschliesslich der zweiten '==='-Markerzeile ist der
             # Skript-Log-Header -- er nennt bewusst den Quellpfad und darf
             # nicht durch die Substitution verfaelscht werden.
@@ -2148,7 +2269,7 @@ if ($MethodChoice -eq "1") {
                     $writer.WriteLine($line)
                     continue
                 }
-                $writer.WriteLine($regex.Replace($line, $finalDestCleanSafe, 1))
+                $writer.WriteLine($regex.Replace($line, $ersatz, 1))
             }
             $logSuccess = $true
         } catch {
@@ -2172,10 +2293,16 @@ if ($MethodChoice -eq "1") {
         }
     }
 
+    # Strg+C waehrend robocopy: robocopy haengt an derselben Konsole und
+    # endet mit 0xC000013A (STATUS_CONTROL_C_EXIT), in $LASTEXITCODE als
+    # negative Zahl -1073741510 (gemessen). Vorher lief der Ablauf danach
+    # als "Kopiervorgang abgeschlossen" weiter bis zu den Rueckfragen.
+    Stop-WennAbgebrochen -Phase "Kopiervorgang (Robocopy, Exit-Code $RoboExit)" -Encoding ([System.Text.Encoding]::Unicode)
+
     # --- Probelauf: hier ist Schluss ---
     if ($DryRun) {
         Write-Host ""
-        if ($RoboExit -ge 16) {
+        if ($RoboExit -ge 16 -or $RoboExit -lt 0) {
             Write-Warning "Robocopy meldet einen kritischen Fehler (Exit-Code $RoboExit) -- bitte Log pruefen."
         }
         Write-Host "PROBELAUF abgeschlossen -- es wurde nichts kopiert, umbenannt oder geloescht." -ForegroundColor Green
@@ -2186,7 +2313,13 @@ if ($MethodChoice -eq "1") {
     }
 
     # --- Robocopy-Exit-Code-Bewertung ---
-    if ($RoboExit -ge 16) {
+    # Negative Exit-Codes sind NTSTATUS-Werte eines gewaltsam beendeten
+    # robocopy (0xC000013A nach Strg+C, gemessen -1073741510; ebenso ein
+    # Absturz wie 0xC0000005). Sie fielen durch '-ge 16', '-ge 8' und
+    # '-ge 4' hindurch und galten als fehlerfreier Lauf - endete robocopy
+    # ohne gesetztes Strg+C-Flag, gab Option [3] danach das Komplett-
+    # Loeschen der Quelle frei. Jetzt: kritischer Fehler.
+    if ($RoboExit -ge 16 -or $RoboExit -lt 0) {
         Write-Host ""
         Write-Warning "Robocopy meldet einen KRITISCHEN FEHLER (Exit-Code $RoboExit)."
         Write-Warning "  Ursache: Laufwerk nicht erreichbar, ungueltiger Pfad oder schwerwiegendes Problem."
@@ -2262,15 +2395,22 @@ if ($MethodChoice -eq "1") {
     Write-Host "  ZIEL-VERIFIKATION"
     Write-Host "================================================"
     Write-Host ""
+    # Beide Verfahren pruefen das Ziel so, wie es LOKAL unter G:\ erscheint
+    # (Drive-Cache), nicht den Stand in der Cloud. Frueher klangen die
+    # Texte nach einer Cloud-Pruefung; massgeblich fuer den Upload bleibt
+    # die Rueckfrage oben (Kontrolle in drive.google.com).
+    Write-Host "  Hinweis: Beide Verfahren pruefen das Ziel unter G:\ (lokaler Drive-Cache)," -ForegroundColor Yellow
+    Write-Host "  NICHT, ob der Upload in die Cloud abgeschlossen ist." -ForegroundColor Yellow
+    Write-Host ""
     Write-Host "  [1] SHA-256 Pruefsumme (bit-genau, sehr sicher, langsamer)"
-    Write-Host "      -- hashed jede Quell- und Zieldatei"
+    Write-Host "      -- hashed jede Quell- und Zieldatei (Inhalt, wie er unter G:\ gelesen wird)"
     Write-Host "      -- Cloud-Platzhalter werden dabei automatisch heruntergeladen"
     Write-Host ""
     Write-Host "  [2] Light-Check (Existenz + Dateigroesse, schnell)"
     Write-Host "      -- prueft fuer jede Quelldatei, ob sie im Ziel liegt"
     Write-Host "      -- vergleicht nur die Dateigroesse, nicht den Inhalt"
-    Write-Host "      -- Cloud-Platzhalter werden erkannt und gelten als NICHT geprueft"
-    Write-Host "         (sie melden die volle Groesse, obwohl der Inhalt fehlt)"
+    Write-Host "      -- Cloud-Platzhalter (Inhalt nicht lokal) gelten als NICHT geprueft"
+    Write-Host "         und bleiben in der Quelle; ihre Groesse belegt den Inhalt nicht"
     Write-Host "      -- empfohlen, wenn der CRC-Check zu lange dauern wuerde"
     Write-Host ""
     Write-Host "  [3] Keine Verifikation (nur bei RoboExit < 4 erlaubtes Komplett-Loeschen)"
@@ -2523,7 +2663,15 @@ if ($MethodChoice -eq "1") {
             } catch { }
         }
 
-        if ($csProblems -gt 0) {
+        # Strg+C in der Loeschschleife: vorher stand trotzdem "ERFOLG" im
+        # Log, obwohl ein Teil der verifizierten Dateien noch in der
+        # Quelle lag.
+        if (Test-ShouldStop) {
+            Write-Warning "Loeschen durch Anwender abgebrochen (Strg+C): $delOk von $($csOkPaths.Count) verifizierten Datei(en) geloescht."
+            Add-LogLine -Path $LogFile -Message "[$(Get-Date)] ABBRUCH (Strg+C): Loeschen der Quelle unterbrochen - $delOk von $($csOkPaths.Count) verifizierten Datei(en) geloescht, der Rest bleibt in der Quelle." `
+                        -Encoding ([System.Text.Encoding]::Unicode)
+            $DeleteErrors.Add("Loeschen durch Anwender abgebrochen (Strg+C) - die Quelle wurde nur teilweise geloescht.")
+        } elseif ($csProblems -gt 0) {
             Write-Host "  Erfolgreich geloescht: $delOk Dateien." -ForegroundColor Green
             Write-Host "  ACHTUNG: $csProblems nicht verifizierte Datei(en) wurden absichtlich im Quellordner behalten."
             Add-LogLine -Path $LogFile -Message "[$(Get-Date)] ERFOLG (PARTIELL/$verifyMode): $delOk Dateien geloescht. $csProblems Datei(en) absichtlich im Quellordner behalten." `
@@ -2623,7 +2771,9 @@ if ($MethodChoice -eq "1") {
                     $mirrorArgs = @($emptyDir, $SourcePath, "/MIR", "/R:5", "/W:5", "/NP", "/NFL", "/NDL", "/NJH", "/NJS", "/XD") + $ExcludedDirNames
                     if ($SkipReparsePoints) { $mirrorArgs += "/XJ" }
                     & robocopy $mirrorArgs | Out-Null
-                    if ($LASTEXITCODE -ge 8) {
+                    # Negativ = robocopy gewaltsam beendet (Strg+C: -1073741510,
+                    # gemessen) - fiel vorher durch '-ge 8' und galt als Erfolg.
+                    if ($LASTEXITCODE -ge 8 -or $LASTEXITCODE -lt 0) {
                         $label = if ($isRootPath) { "Root" } else { "Unterordner" }
                         $DeleteErrors.Add("Robocopy Mirror-Fehler bei $label-Loeschen (Exit-Code $LASTEXITCODE)")
                     }
@@ -2678,6 +2828,28 @@ if ($MethodChoice -eq "1") {
             if ($emptyDir) {
                 Remove-Item -LiteralPath $emptyDir -Recurse -Force -ErrorAction SilentlyContinue
             }
+
+            # Nachkontrolle, bevor unten "ERFOLG: Quelle ... geloescht" steht.
+            # Vorher genuegte dafuer eine leere Fehlerliste: ein per Strg+C
+            # abgebrochener Purge (robocopy negativ, die Schleifen oben per
+            # break/return verlassen) hinterliess keinen Eintrag, und bei
+            # einer Laufwerks-/Freigabewurzel wurde gar nicht nachgesehen.
+            # Erfolg heisst jetzt: kein Abbruch und keine Datei mehr in der
+            # Quelle ausser in den absichtlich behaltenen Ausschlussordnern
+            # (die Get-FilesStreaming ueberspringt).
+            if (Test-ShouldStop) {
+                $DeleteErrors.Add("Abbruch durch Anwender (Strg+C) - die Quelle wurde nur teilweise geloescht.")
+            } elseif ($DeleteErrors.Count -eq 0 -and
+                      [System.IO.Directory]::Exists((Add-LongPathPrefix $SourcePath))) {
+                $restDateien = 0
+                Get-FilesStreaming -RootPath $SourcePath -SkipReparsePoints $SkipReparsePoints -IncludeFiles |
+                    ForEach-Object { $restDateien++ }
+                if (Test-ShouldStop) {
+                    $DeleteErrors.Add("Abbruch durch Anwender (Strg+C) - Restbestand der Quelle nicht vollstaendig geprueft.")
+                } elseif ($restDateien -gt 0) {
+                    $DeleteErrors.Add("$restDateien Datei(en) liegen nach dem Loeschen weiterhin in der Quelle (ausserhalb der absichtlich behaltenen Ausschlussordner).")
+                }
+            }
         }
     }
 
@@ -2718,14 +2890,16 @@ if ($MethodChoice -eq "1") {
 
     # Dieselben Verzeichnisse ausschliessen wie die Robocopy-Methode
     # (Papierkorb, Systemordner, NAS-Snapshots).
+    $RcloneExcludeArgs = @()
     foreach ($exDir in $ExcludedDirNames) {
         # Zwei Muster sind noetig: '<dir>/**' haelt den Inhalt heraus,
         # '<dir>/' den Ordner selbst. Ohne das zweite Muster legt
         # --create-empty-src-dirs im Ziel leere Papierkorb- und
         # Snapshot-Ordner an.
-        $RcloneArgs += @("--exclude", "$exDir/**")
-        $RcloneArgs += @("--exclude", "$exDir/")
+        $RcloneExcludeArgs += @("--exclude", "$exDir/**")
+        $RcloneExcludeArgs += @("--exclude", "$exDir/")
     }
+    $RcloneArgs += $RcloneExcludeArgs
 
     if ($SkipReparsePoints) { $RcloneArgs += "--skip-links" }
     if (-not $isRootPath)   { $RcloneArgs += "--delete-empty-src-dirs" }
@@ -2753,6 +2927,9 @@ if ($MethodChoice -eq "1") {
         Write-Host ""
     }
 
+    # Strg+C waehrend der Rueckfragen: vor dem Transfer aussteigen.
+    Stop-WennAbgebrochen -Phase 'Vorbereitung vor dem rclone-Transfer'
+
     Write-Host "Starte rclone-Transfer (direkt in die Cloud) ..."
     Write-Host ""
     $colWidth     = try { [Math]::Max(40, [Console]::WindowWidth - 6) } catch { 80 }
@@ -2777,7 +2954,17 @@ if ($MethodChoice -eq "1") {
     $RcloneExit = $LASTEXITCODE
 
     if ($RcloneExit -eq 0 -and $isRootPath -and -not $DryRun) {
-        $RmdirArgs = @("rmdirs", $SourcePath, "--leave-root", "--log-file", $LongLogFile, "--log-level", "WARNING")
+        # Dieselben Ausschluesse wie beim move. Ohne sie lief rmdirs auch
+        # durch ~snapshot/.snapshot, 'System Volume Information' und
+        # $RECYCLE.BIN (read-only bzw. gesperrt) - Fehler dort setzten den
+        # Exit-Code und damit "rclone meldet Fehler", obwohl diese Ordner
+        # absichtlich nie migriert werden. Die Filter sind globale Optionen;
+        # laut rclone-Doku (v1.73.1, README.txt) gelten sie fuer alle
+        # Befehle, nur "Rclone purge does not obey filters"; Changelog
+        # v1.55: "rmdirs: Make --rmdirs obey the filters". Beim lokalen
+        # Backend (kein ListR) steigt rclone in per '<dir>/' ausgeschlossene
+        # Ordner nicht hinab ("Directory recursion optimisation").
+        $RmdirArgs = @("rmdirs", $SourcePath, "--leave-root", "--log-file", $LongLogFile, "--log-level", "WARNING") + $RcloneExcludeArgs
         & $RcloneExe $RmdirArgs
         if ($LASTEXITCODE -ne 0) { $RcloneExit = $LASTEXITCODE }
     }

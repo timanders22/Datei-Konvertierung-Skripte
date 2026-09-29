@@ -66,9 +66,19 @@ function Confirm-Write {
     try {
         return $script:ScriptCmdlet.ShouldProcess($Target, $Action)
     } catch {
-        return (-not $WhatIfPreference)
+        # Wirft ShouldProcess, wird NICHT geschrieben. Der fruehere Rueckfall
+        # (-not $WhatIfPreference) lieferte hier $true: gemessen unter 5.1 wirft
+        # ShouldProcess mit -Confirm im NonInteractive-Modus ("Lese- und
+        # Eingabeaufforderungsfunktionen sind nicht verfuegbar") - und das
+        # Skript schrieb dann ohne die ausdruecklich verlangte Bestaetigung.
+        if (-not $script:ConfirmFehlerGemeldet) {
+            $script:ConfirmFehlerGemeldet = $true
+            Write-Host "[WARNUNG]   Bestaetigung nicht moeglich ($($_.Exception.Message)) - es wird NICHTS geschrieben." -ForegroundColor Red
+        }
+        return $false
     }
 }
+$script:ConfirmFehlerGemeldet = $false
 
 # Verzeichnisse, die bei der Suche nicht betreten werden. Ohne diese Liste
 # wurden auch Mappen im Papierkorb und in Schattenkopien korrigiert.
@@ -122,10 +132,14 @@ try {
 
 # --- HILFSFUNKTIONEN ---
 
+# StartsWith statt -like: im Muster '\\?\*' ist das '?' ein Platzhalter fuer
+# ein beliebiges Zeichen. Gemessen unter 5.1: '\\s\share\a.xlsx' -like '\\?\*'
+# ist True - ein UNC-Pfad mit einbuchstabigem Servernamen galt als schon
+# praefixiert, und Remove-LongPathPrefix schnitt daraus 'hare\a.xlsx'.
 function Add-LongPathPrefix {
     param([string]$Path)
     if ([string]::IsNullOrEmpty($Path)) { return $Path }
-    if ($Path -like "\\?\*") { return $Path }
+    if ($Path.StartsWith('\\?\', [System.StringComparison]::Ordinal)) { return $Path }
     if ($Path -like "\\*")   { return "\\?\UNC\" + $Path.TrimStart('\') }
     return "\\?\" + $Path
 }
@@ -133,9 +147,17 @@ function Add-LongPathPrefix {
 function Remove-LongPathPrefix {
     param([string]$Path)
     if ([string]::IsNullOrEmpty($Path)) { return $Path }
-    if ($Path -like "\\?\UNC\*") { return "\\" + $Path.Substring(8) }
-    if ($Path -like "\\?\*")     { return $Path.Substring(4) }
+    if ($Path.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { return "\\" + $Path.Substring(8) }
+    if ($Path.StartsWith('\\?\', [System.StringComparison]::Ordinal))               { return $Path.Substring(4) }
     return $Path
+}
+
+function New-Kennung {
+    # 8 Hex-Zeichen, klein, mit mindestens einem Buchstaben. Eine reine
+    # Ziffernfolge saehe aus wie ein Datum ('.bak_20240101') und fiele beim
+    # Aufraeumen bewusst NICHT unter das eigene Muster.
+    do { $k = [guid]::NewGuid().ToString("N").Substring(0, 8) } while ($k -notmatch '[a-f]')
+    return $k
 }
 
 function Format-CsvField {
@@ -212,13 +234,20 @@ function Restore-FileAttributes {
     #>
     param(
         [string]$FilePath,
-        [string[]]$Attributes
+        [string[]]$Attributes,
+        # Fehlerpfad: das Original ist unveraendert (nie ueberschrieben oder
+        # aus dem Backup zurueckgeholt) - dann auch ReadOnly zurueckgeben.
+        [switch]$AuchReadOnly
     )
     if (-not $Attributes -or $Attributes.Count -eq 0) { return @() }
     $restored = New-Object System.Collections.Generic.List[string]
     try {
         $attrs = [System.IO.File]::GetAttributes($FilePath)
         $neu   = $attrs
+        if ($AuchReadOnly -and $Attributes -contains 'ReadOnly') {
+            $neu = $neu -bor [System.IO.FileAttributes]::ReadOnly
+            $restored.Add('ReadOnly')
+        }
         if ($Attributes -contains 'Hidden') {
             $neu = $neu -bor [System.IO.FileAttributes]::Hidden
             $restored.Add('Hidden')
@@ -470,6 +499,21 @@ if (-not (Test-Path -LiteralPath $rootPath)) {
     exit 1
 }
 
+# Absolut machen und normalisieren, BEVOR das '\\?\'-Praefix davorkommt.
+# Mit Praefix normalisiert Windows nichts mehr. Gemessen unter 5.1:
+# '\\?\C:/.../ziel' (Schraegstriche) und '\\?\ziel' (relativ) werfen in
+# EnumerateFiles "Teil des Pfades nicht gefunden"; Get-FilesRecursiveSafe
+# schluckt das, der Lauf fand 0 Dateien und meldete "Vorgang abgeschlossen".
+# Resolve-Path loest gegen den PowerShell-Ort auf (wie Test-Path oben),
+# GetFullPath macht aus '/' ein '\'.
+try {
+    $rootPath = [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $rootPath -ErrorAction Stop).ProviderPath)
+} catch {
+    Write-Host "FEHLER: Pfad nicht aufloesbar: $rootPath - $($_.Exception.Message)" -ForegroundColor Red
+    Wait-AnyKey
+    exit 1
+}
+
 Write-Host ""
 Write-Host "Gewaehltes Verzeichnis: $rootPath" -ForegroundColor Green
 Write-Host ""
@@ -611,6 +655,8 @@ $countErrors        = 0
 $countSkippedTemp   = 0
 $countSkippedBinary = 0
 $countSkippedNoZip  = 0
+$countSkippedBadXml     = 0   # workbook.xml nicht als XML lesbar
+$countSkippedNoWorkbook = 0   # ZIP ohne xl/workbook.xml
 
 $script:ShouldStop   = $false
 $script:CtrlCAsInput = $false
@@ -658,8 +704,21 @@ Write-Host "--------------------------------------------"
 # --- VERWAISTE BACKUPS FRUEHERER LAEUFE ---
 # Das Skript legt vor dem Zurueckkopieren '<datei>.bak_<id>' an und loescht
 # es bei Erfolg. Nach einem harten Abbruch bleiben diese Reste liegen.
-# Geloescht wird nur, wenn das Original existiert, nicht leer und das
-# Backup aelter als $script:BackupCleanupMinAgeHours ist.
+# Geloescht wird nur, wenn ALLE Bedingungen gelten:
+#  1. Name exakt im eigenen Muster: '.bak_' + 8 Hex klein mit mindestens
+#     einem Buchstaben (so erzeugt es New-Kennung). Vorher genuegte
+#     '\.bak_[0-9a-fA-F]+$' - das traf auch Anwender-Sicherungen wie
+#     'Budget.xlsx.bak_2024' oder 'Budget.xlsx.bak_20240101'.
+#  2. Das Original ist mindestens so gross wie das Backup. 'Length -gt 0'
+#     liess ein halb geschriebenes Original durchgehen (File.Copy kuerzt das
+#     Ziel zuerst) - und das Backup mit der einzigen vollstaendigen Fassung
+#     wurde geloescht. Gleiche Pruefung wie in 2a, 2b, 2c.
+#  3. Das Backup ist aelter als $script:BackupCleanupMinAgeHours, gemessen
+#     an der CreationTime. Die LastWriteTime taugt nicht: File.Copy
+#     uebernimmt sie von der Quelle (gemessen: Backup einer Datei von 2015
+#     trug LastWriteTime 2015, CreationTime heute) - jedes frische Backup
+#     galt sofort als verwaist, auch das eines parallel laufenden Laufs.
+$script:EigenesBackupMuster = '\.bak_(?=[0-9a-f]*[a-f])[0-9a-f]{8}$'
 if (-not $SkipBackupCleanup) {
     Write-Host ""
     Write-Host "Suche zurueckgebliebene Backups frueherer Laeufe ..." -ForegroundColor Cyan
@@ -675,22 +734,24 @@ if (-not $SkipBackupCleanup) {
         try {
             foreach ($f in [System.IO.Directory]::EnumerateFiles($d, "*.bak_*")) {
                 try {
-                    $orig = $f -replace '\.bak_[0-9a-fA-F]+$', ''
+                    $orig = $f -creplace $script:EigenesBackupMuster, ''
                     if ($orig -eq $f) { continue }
                     if ($orig -notmatch '\.(xlsx|xlsm|xltx|xltm)$') { continue }
                     $fi = New-Object System.IO.FileInfo $f
                     if (-not $fi.Exists) { continue }
-                    $origOk = $false
+                    $origLen = [long]-1
                     if ([System.IO.File]::Exists($orig)) {
-                        try { $origOk = (New-Object System.IO.FileInfo $orig).Length -gt 0 } catch { }
+                        try { $origLen = (New-Object System.IO.FileInfo $orig).Length } catch { }
                     }
-                    if (-not $origOk) {
+                    if ($origLen -le 0 -or $origLen -lt $fi.Length) {
                         $bakOrphans++
-                        Write-Host "[BACKUP]    Ohne intaktes Original - NICHT geloescht: $(Remove-LongPathPrefix $f)" -ForegroundColor Yellow
-                        Write-Log -FileName (Split-Path $f -Leaf) -FilePath $f -Status "WARNUNG" -Details "Backup ohne intaktes Original - bitte pruefen"
+                        $grund = if ($origLen -le 0) { "Backup ohne intaktes Original" }
+                                 else { "Backup groesser als das Original ($($fi.Length) statt $origLen Bytes) - Original moeglicherweise abgeschnitten" }
+                        Write-Host "[BACKUP]    $grund - NICHT geloescht: $(Remove-LongPathPrefix $f)" -ForegroundColor Yellow
+                        Write-Log -FileName (Split-Path $f -Leaf) -FilePath $f -Status "WARNUNG" -Details "$grund - bitte pruefen"
                         continue
                     }
-                    if ($fi.LastWriteTime -gt $bakCutoff) { $bakKept++; continue }
+                    if ($fi.CreationTime -gt $bakCutoff) { $bakKept++; continue }
                     if (Confirm-Write (Remove-LongPathPrefix $f) 'Verwaistes Backup loeschen') {
                         try { [System.IO.File]::Delete($f); $bakDeleted++ } catch { }
                     } else { $bakKept++ }
@@ -778,7 +839,7 @@ foreach ($file in $files) {
     try {
         $baseName  = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
         $extension = [System.IO.Path]::GetExtension($fileName)
-        $uniqueId  = [guid]::NewGuid().ToString("N").Substring(0, 8)
+        $uniqueId  = New-Kennung
         # Basisname kuerzen, damit Tempfile-Komponente nicht NTFS-Limit (255) reisst
         if ($baseName.Length -gt 180) { $baseName = $baseName.Substring(0, 180) }
         $tempFile     = Join-Path $tempFolder "${baseName}_${uniqueId}${extension}"
@@ -875,8 +936,10 @@ foreach ($file in $files) {
             if (-not $xmlUsable) {
                 # Bereits oben als SKIP protokolliert - hier nichts weiter tun,
                 # sonst meldete das Skript die unlesbare Datei zusaetzlich als
-                # "Bereits automatisch".
-                $countSkippedNoZip++
+                # "Bereits automatisch". Eigener Zaehler: vorher lief das
+                # unter "keine ZIP-Signatur", obwohl die Datei ein gueltiges
+                # ZIP ist und nur ihre workbook.xml nicht lesbar war.
+                $countSkippedBadXml++
             } elseif ($needsFix) {
                 $countFound++
 
@@ -940,39 +1003,69 @@ foreach ($file in $files) {
                     # 0 Bytes - bricht der Kopiervorgang ab (Netzwerk-Drop,
                     # AV-Scanner), waere das Original ohne Backup zerstoert
                     # (die Temp-Kopie wird im finally-Block geloescht).
-                    $backupLong = $null
-                    if ([System.IO.File]::Exists($longFile)) {
-                        $backupLong = Add-LongPathPrefix ((Remove-LongPathPrefix $file) + ".bak_" + $uniqueId)
-                        [System.IO.File]::Copy($longFile, $backupLong, $true)
-                    }
-                    $copySuccess = $false
-                    $copyRetry   = 0
-                    $maxRetries  = 3
-                    while (-not $copySuccess -and $copyRetry -lt $maxRetries) {
-                        try {
-                            [System.IO.File]::Copy($tempFileLong, $longFile, $true)
-                            $copySuccess = $true
-                        } catch {
-                            $copyRetry++
-                            if ($copyRetry -lt $maxRetries) {
-                                Write-Host "[RETRY]     $fileName - Zurueckkopieren fehlgeschlagen, Versuch $($copyRetry + 1)/$maxRetries..." -ForegroundColor DarkYellow
-                                Start-Sleep -Seconds $copyRetry
-                            } else {
-                                if ($null -ne $backupLong -and [System.IO.File]::Exists($backupLong)) {
-                                    try {
-                                        [System.IO.File]::Copy($backupLong, $longFile, $true)
-                                        [System.IO.File]::Delete($backupLong)
-                                        Write-Host "[RESTORE]   $fileName - Original aus Backup wiederhergestellt" -ForegroundColor DarkYellow
-                                        Write-Log -FileName $fileName -FilePath $file -Status "RESTORE" -Details "Zurueckkopieren fehlgeschlagen - Original aus Backup wiederhergestellt"
-                                    } catch {
-                                        $bakDisplay = Remove-LongPathPrefix $backupLong
-                                        Write-Host "[WARNUNG]   $fileName - Backup-Restore fehlgeschlagen, Backup bleibt: $bakDisplay" -ForegroundColor Red
-                                        Write-Log -FileName $fileName -FilePath $file -Status "WARNUNG" -Details "Backup-Restore fehlgeschlagen - Backup bleibt erhalten: $bakDisplay"
+                    #
+                    # Fehlerpfad: vorher liefen Restore-FileAttributes und das
+                    # Aufraeumen nur im Erfolgsfall. Scheiterte schon die
+                    # Backup-Kopie (Platte voll, Netz weg), blieb ein halbes
+                    # '.bak_' liegen und das Original verlor ReadOnly/Hidden/
+                    # System, obwohl es nie angefasst wurde; nach einem
+                    # Rueckgriff aufs Backup ebenso. Jetzt: ist das Original
+                    # unveraendert, gehen ALLE Attribute zurueck und ein
+                    # unvollstaendiges Backup wird entfernt.
+                    $backupLong      = $null
+                    $originalBeruehrt = $false
+                    $originalZurueck  = $false
+                    try {
+                        if ([System.IO.File]::Exists($longFile)) {
+                            $backupLong = Add-LongPathPrefix ((Remove-LongPathPrefix $file) + ".bak_" + $uniqueId)
+                            [System.IO.File]::Copy($longFile, $backupLong, $true)
+                            # Alter fuer das Aufraeumen an der CreationTime messen
+                            # (siehe oben); ausdruecklich stempeln.
+                            try { [System.IO.File]::SetCreationTime($backupLong, (Get-Date)) } catch { }
+                        }
+                        $copySuccess = $false
+                        $copyRetry   = 0
+                        $maxRetries  = 3
+                        while (-not $copySuccess -and $copyRetry -lt $maxRetries) {
+                            try {
+                                $originalBeruehrt = $true
+                                [System.IO.File]::Copy($tempFileLong, $longFile, $true)
+                                $copySuccess = $true
+                            } catch {
+                                $copyRetry++
+                                if ($copyRetry -lt $maxRetries) {
+                                    Write-Host "[RETRY]     $fileName - Zurueckkopieren fehlgeschlagen, Versuch $($copyRetry + 1)/$maxRetries..." -ForegroundColor DarkYellow
+                                    Start-Sleep -Seconds $copyRetry
+                                } else {
+                                    if ($null -ne $backupLong -and [System.IO.File]::Exists($backupLong)) {
+                                        try {
+                                            [System.IO.File]::Copy($backupLong, $longFile, $true)
+                                            $originalZurueck = $true
+                                            [System.IO.File]::Delete($backupLong)
+                                            Write-Host "[RESTORE]   $fileName - Original aus Backup wiederhergestellt" -ForegroundColor DarkYellow
+                                            Write-Log -FileName $fileName -FilePath $file -Status "RESTORE" -Details "Zurueckkopieren fehlgeschlagen - Original aus Backup wiederhergestellt"
+                                        } catch {
+                                            $bakDisplay = Remove-LongPathPrefix $backupLong
+                                            Write-Host "[WARNUNG]   $fileName - Backup-Restore fehlgeschlagen, Backup bleibt: $bakDisplay" -ForegroundColor Red
+                                            Write-Log -FileName $fileName -FilePath $file -Status "WARNUNG" -Details "Backup-Restore fehlgeschlagen - Backup bleibt erhalten: $bakDisplay"
+                                        }
                                     }
+                                    throw $_
                                 }
-                                throw $_
                             }
                         }
+                    } catch {
+                        if (-not $originalBeruehrt) {
+                            # Backup-Kopie gescheitert: Original nie angefasst,
+                            # ein (halbes) Backup ist ueberfluessig.
+                            if ($null -ne $backupLong -and [System.IO.File]::Exists($backupLong)) {
+                                try { [System.IO.File]::Delete($backupLong) } catch { }
+                            }
+                        }
+                        if ((-not $originalBeruehrt) -or $originalZurueck) {
+                            [void](Restore-FileAttributes -FilePath $longFile -Attributes $removedAttrs -AuchReadOnly)
+                        }
+                        throw
                     }
                     if ($null -ne $backupLong -and [System.IO.File]::Exists($backupLong)) {
                         try {
@@ -1024,6 +1117,9 @@ foreach ($file in $files) {
                 Write-Log -FileName $fileName -FilePath $file -Status "OK" -Details "Bereits automatisch"
             }
         } else {
+            # Vorher in keinem Zaehler - die Summe im Abschlussbericht ging
+            # nicht auf.
+            $countSkippedNoWorkbook++
             Write-Host "[ SKIP ]    $fileName (kein workbook.xml gefunden)" -ForegroundColor DarkGray
             Write-Log -FileName $fileName -FilePath $file -Status "SKIP" -Details "xl/workbook.xml nicht vorhanden"
         }
@@ -1085,7 +1181,7 @@ if ((Test-Path -LiteralPath $tempFolder) -and (@(Get-ChildItem -LiteralPath $tem
 }
 
 # --- ABSCHLUSSBERICHT ---
-$totalSkipped = $countSkippedTemp + $countSkippedBinary + $countSkippedNoZip
+$totalSkipped = $countSkippedTemp + $countSkippedBinary + $countSkippedNoZip + $countSkippedBadXml + $countSkippedNoWorkbook
 Write-Host "--------------------------------------------" -ForegroundColor Cyan
 Write-Host "Gepruefte Dateien gesamt : $countChecked"
 Write-Host "Manuelle Modi gefunden   : $countFound"
@@ -1099,6 +1195,8 @@ Write-Host "Uebersprungen gesamt     : $totalSkipped" -ForegroundColor DarkGray
 Write-Host "  - Excel-Lock-Dateien   : $countSkippedTemp" -ForegroundColor DarkGray
 Write-Host "  - .xlsb (Binary)       : $countSkippedBinary" -ForegroundColor DarkGray
 Write-Host "  - keine ZIP-Signatur   : $countSkippedNoZip" -ForegroundColor DarkGray
+Write-Host "  - workbook.xml defekt  : $countSkippedBadXml" -ForegroundColor DarkGray
+Write-Host "  - ohne workbook.xml    : $countSkippedNoWorkbook" -ForegroundColor DarkGray
 Write-Host "Fehler                   : $countErrors" -ForegroundColor $(if ($countErrors -gt 0) { "Red" } else { "DarkGray" })
 Write-Host "Log-Datei                : $logFile" -ForegroundColor Cyan
 Write-Host "Vorgang abgeschlossen." -ForegroundColor Cyan

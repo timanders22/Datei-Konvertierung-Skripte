@@ -36,6 +36,38 @@ function Test-PowerShellSyntax {
     $tokens = $null
     $errors = $null
 
+    # Kodierung vor dem Parsen pruefen. Windows PowerShell 5.1 liest eine
+    # Datei OHNE BOM als ANSI (Codepage 1252), PowerShell 7 dagegen als
+    # UTF-8. ParseFile unter pwsh 7 meldete deshalb gruen fuer Dateien, die
+    # 5.1 - die Zielumgebung dieser Sammlung - zerlegt: nachgestellt mit
+    # 'Write-Host "a – b"' als UTF-8 ohne BOM, pwsh 7 ohne Fehler, 5.1 mit
+    # Parserfehler (das Byte 0x93 des Gedankenstrichs ist in 1252 ein
+    # typografisches Anfuehrungszeichen und beendet den String). Hausregel:
+    # UTF-8 mit BOM (Kopf von 8_verschieben_auf_Google_Drive.ps1). Reines
+    # ASCII ist in beiden Lesarten gleich und bleibt ohne BOM zulaessig.
+    $kodierFehler = $null
+    try {
+        $bytes  = [System.IO.File]::ReadAllBytes($FilePath)
+        $hatBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) -or
+                  ($bytes.Length -ge 2 -and (($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) -or
+                                             ($bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF)))
+        if (-not $hatBom) {
+            $zeile = 1
+            for ($i = 0; $i -lt $bytes.Length; $i++) {
+                if ($bytes[$i] -eq 10) { $zeile++; continue }
+                if ($bytes[$i] -ge 0x80) {
+                    $kodierFehler = [pscustomobject]@{
+                        Line    = $zeile
+                        Column  = 0
+                        Message = "Nicht-ASCII-Zeichen ohne BOM - Windows PowerShell 5.1 liest die Datei als ANSI. Als 'UTF-8 mit BOM' speichern."
+                        Text    = ''
+                    }
+                    break
+                }
+            }
+        }
+    } catch { }
+
     try {
         $null = [System.Management.Automation.Language.Parser]::ParseFile(
                     $FilePath, [ref]$tokens, [ref]$errors)
@@ -53,6 +85,7 @@ function Test-PowerShellSyntax {
     }
 
     $list = @()
+    if ($kodierFehler) { $list += $kodierFehler }
     foreach ($e in @($errors)) {
         $list += [pscustomobject]@{
             Line    = $e.Extent.StartLineNumber

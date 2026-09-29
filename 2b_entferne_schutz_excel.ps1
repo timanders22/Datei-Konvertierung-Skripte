@@ -297,6 +297,8 @@ $script:SkipPreScan         = $false
 $script:TotalFiles          = 0
 $script:ProcessedCount      = 0
 $script:TrackedExcelPids    = [System.Collections.Generic.List[int]]::new()
+# Startzeit je verfolgter PID (PID -> StartTime), siehe Add-TrackedExcelPid.
+$script:TrackedExcelStart   = @{}
 $script:LogWriter           = $null
 $script:DetailedLogWriter   = $null
 $script:CsvLogWriter        = $null
@@ -332,13 +334,24 @@ function Test-IsOwnExcelProcess {
         gehoert. Windows vergibt PIDs wieder; ohne Startzeit-Vergleich koennte
         Stop-AllTrackedExcel eine zwischenzeitlich vom Nutzer geoeffnete
         Excel-Sitzung abschiessen, die dieselbe PID bekommen hat.
+
+        Verglichen wird EXAKT mit der Startzeit, die Add-TrackedExcelPid beim
+        Aufnehmen der PID gemerkt hat (wie Stop-TrackedOfficeProcess
+        -StartTime in _gemeinsam.psm1). Vorher genuegte 'StartTime nach
+        Skriptstart', und die Liste wurde nie ausgeduennt: nach jedem
+        COM-Job kam die PID der laengst beendeten Excel-Instanz dazu. Eine
+        Excel-Sitzung, die der Anwender waehrend des Laufs oeffnet und die
+        eine dieser PIDs erbt, bestand die Pruefung und wurde beim naechsten
+        Timeout bzw. am Laufende per Stop-Process -Force beendet (samt
+        ungespeicherter Mappen). Nicht gemerkte PIDs gelten nie als eigene.
     #>
     param([int]$ProcessId)
+    if (-not $script:TrackedExcelStart.ContainsKey($ProcessId)) { return $false }
     try {
         $proc = Get-Process -Id $ProcessId -ErrorAction Stop
         if ($proc.Name -ne 'EXCEL') { return $false }
         try {
-            if ($proc.StartTime -lt $ScriptStartTime) { return $false }
+            if ($proc.StartTime -ne $script:TrackedExcelStart[$ProcessId]) { return $false }
         } catch {
             return $false
         }
@@ -346,6 +359,34 @@ function Test-IsOwnExcelProcess {
     } catch {
         return $false
     }
+}
+
+function Add-TrackedExcelPid {
+    <#
+        Nimmt eine PID in die Aufraeumliste auf und merkt sich ihre Startzeit.
+        Aufgenommen wird nur ein laufender EXCEL-Prozess, der nach dem
+        Skriptstart gestartet wurde; eine bereits beendete PID kommt gar nicht
+        erst auf die Liste. Dabei werden Eintraege toter PIDs entfernt, damit
+        die Liste nicht ueber den ganzen Lauf anwaechst.
+    #>
+    param([int]$ProcessId)
+    foreach ($id in @($script:TrackedExcelPids)) {
+        if (-not (Test-IsOwnExcelProcess -ProcessId $id)) {
+            [void]$script:TrackedExcelPids.Remove($id)
+            $script:TrackedExcelStart.Remove($id)
+        }
+    }
+    if ($ProcessId -le 0) { return }
+    try {
+        $proc = Get-Process -Id $ProcessId -ErrorAction Stop
+        if ($proc.Name -ne 'EXCEL') { return }
+        $start = $proc.StartTime
+        if ($start -lt $ScriptStartTime) { return }
+    } catch {
+        return
+    }
+    $script:TrackedExcelStart[$ProcessId] = $start
+    if (-not $script:TrackedExcelPids.Contains($ProcessId)) { $script:TrackedExcelPids.Add($ProcessId) }
 }
 
 # ==================================================================
@@ -841,10 +882,20 @@ function Test-FileIsLocked {
     $lp = Add-LongPathPrefix $FilePath
     try {
         if (-not [System.IO.File]::Exists($lp)) { return 'Free' }
+        # Das ReadOnly-Attribut ist keine Sperre. Ein Oeffnen mit ReadWrite
+        # scheitert daran mit UnauthorizedAccessException, und die Datei
+        # wurde als 'Zugriff verweigert' uebersprungen - unter -WhatIf immer
+        # (dort wird das Attribut nicht entfernt), statt 'Wuerde aendern' zu
+        # melden (nachgestellt). Fuer schreibgeschuetzte Dateien daher nur
+        # lesend oeffnen; FileShare.None erkennt fremde Handles weiterhin.
+        $zugriff = [System.IO.FileAccess]::ReadWrite
+        if (([System.IO.File]::GetAttributes($lp) -band [System.IO.FileAttributes]::ReadOnly) -ne 0) {
+            $zugriff = [System.IO.FileAccess]::Read
+        }
         $stream = [System.IO.File]::Open(
             $lp,
             [System.IO.FileMode]::Open,
-            [System.IO.FileAccess]::ReadWrite,
+            $zugriff,
             [System.IO.FileShare]::None
         )
         $stream.Close()
@@ -864,6 +915,7 @@ function Stop-AllTrackedExcel {
     }
     [System.GC]::Collect()
     $script:TrackedExcelPids.Clear()
+    $script:TrackedExcelStart.Clear()
 }
 
 function Update-Progress {
@@ -1308,7 +1360,7 @@ function Test-ExcelTrustCenter {
                     # (siehe Z. 1169 im Trust-Center-Fail-Pfad und Z. 1744
                     # im Endlauf), wo Get-Process -Name "EXCEL" + PID-Filter
                     # den Process-Name vorbildlich validiert.
-                    $script:TrackedExcelPids.Add($savedPid)
+                    Add-TrackedExcelPid -ProcessId $savedPid
                 }
             } catch {}
             try { [System.IO.File]::Delete($pidFile) } catch {}
@@ -1321,7 +1373,7 @@ function Test-ExcelTrustCenter {
     Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false
     if ([System.IO.File]::Exists($pidFile)) { try { [System.IO.File]::Delete($pidFile) } catch {} }
     try { [System.IO.File]::Delete($testXlsx) } catch {}
-    if ($result -and $result.ExcelPid) { $script:TrackedExcelPids.Add([int]$result.ExcelPid) }
+    if ($result -and $result.ExcelPid) { Add-TrackedExcelPid -ProcessId ([int]$result.ExcelPid) }
 
     if ($result -and $result.Ok) {
         return @{ Ok = $true }
@@ -1480,7 +1532,7 @@ function Convert-ExcelViaCom {
                     # PID nur tracken, NICHT direkt killen - PID-Recycling-
                     # Schutz. Cleanup via Stop-AllTrackedExcel im catch
                     # der File-Schleife (Timeout-Pfad triggert das zwingend).
-                    $script:TrackedExcelPids.Add($savedPid)
+                    Add-TrackedExcelPid -ProcessId $savedPid
                 }
             } catch {}
             try { [System.IO.File]::Delete($pidFile) } catch {}
@@ -1492,7 +1544,7 @@ function Convert-ExcelViaCom {
     Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false
 
     if ([System.IO.File]::Exists($pidFile)) { try { [System.IO.File]::Delete($pidFile) } catch {} }
-    if ($result -and $result.ExcelPid) { $script:TrackedExcelPids.Add([int]$result.ExcelPid) }
+    if ($result -and $result.ExcelPid) { Add-TrackedExcelPid -ProcessId ([int]$result.ExcelPid) }
 
     if ($result -and $result.Status -eq "OK") {
         return @{ Path = $result.Path; UsedPassword = $result.UsedPassword; UsedRepair = $result.UsedRepair; UsedExtract = $result.UsedExtract }
@@ -1555,8 +1607,15 @@ function Remove-OpenPassword {
         }
 
         try {
-            $wb.Password         = ""
-            $wb.WriteResPassword = ""
+            # 'WriteResPassword' ist nur ein PARAMETER von SaveAs/Open, keine
+            # Eigenschaft der Arbeitsmappe - die Eigenschaft heisst
+            # WritePassword. Die Zuweisung warf "Eigenschaft nicht gefunden",
+            # der Job meldete ERROR, und das Oeffnen-Passwort wurde bei KEINER
+            # Datei entfernt (nachgestellt mit Excel 2024: Datei danach
+            # weiterhin CFB-verschluesselt). Das Schreibkennwort ist optional,
+            # daher eigener try.
+            $wb.Password = ""
+            try { $wb.WritePassword = "" } catch {}
             $wb.Save()
             $wb.Close($false)
             return @{ Status = "OK"; ExcelPid = $myExcelPid; UsedPassword = $successfulPw }
@@ -1576,20 +1635,29 @@ function Remove-OpenPassword {
                 $savedPid = [int][System.IO.File]::ReadAllText($pidFile).Trim()
                 if ($savedPid -gt 0) {
                     # PID nur tracken, NICHT direkt killen - PID-Recycling-
-                    # Schutz. Cleanup via Stop-AllTrackedExcel im catch
-                    # der File-Schleife (Timeout-Pfad triggert das zwingend).
-                    $script:TrackedExcelPids.Add($savedPid)
+                    # Schutz. Beendet wird unten ueber Stop-AllTrackedExcel.
+                    Add-TrackedExcelPid -ProcessId $savedPid
                 }
             } catch {}
             try { [System.IO.File]::Delete($pidFile) } catch {}
         }
+        # Haengende Instanz sofort abraeumen. Hier stand, der Cleanup laufe
+        # 'im catch der File-Schleife (Timeout-Pfad triggert das zwingend)' -
+        # das traf nicht zu: diese Funktion wirft nicht, der Aufrufer bucht
+        # Success=$false als 'SKIP (Passwort)' und ruft Stop-AllTrackedExcel
+        # NICHT auf. Stop-Job beendet nur den Job-Prozess, nicht das per DCOM
+        # gestartete EXCEL. Die Instanz (ggf. mit sichtbarem Kennwortdialog)
+        # lief so bis zum Laufende weiter, hielt die Temp-Kopie offen, und
+        # jeder weitere Timeout kam eine dazu. Es laeuft immer nur ein Job
+        # zugleich; die Liste enthaelt hier also keine noch gebrauchte Instanz.
+        Stop-AllTrackedExcel
         return @{ Success = $false; UsedPassword = $null }
     }
 
     $result = Receive-Job $job
     Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false
     if ([System.IO.File]::Exists($pidFile)) { try { [System.IO.File]::Delete($pidFile) } catch {} }
-    if ($result -and $result.ExcelPid) { $script:TrackedExcelPids.Add([int]$result.ExcelPid) }
+    if ($result -and $result.ExcelPid) { Add-TrackedExcelPid -ProcessId ([int]$result.ExcelPid) }
 
     if ($result -and $result.Status -eq "OK") {
         return @{ Success = $true; UsedPassword = $result.UsedPassword }
@@ -1791,19 +1859,19 @@ function Remove-ExcelProtection {
 # ==================================================================
 # ABBRUCH-HANDLER UND TRAP (nach Funktionsdefinitionen)
 # ==================================================================
-try {
-    if ($Host.Name -eq 'ConsoleHost') {
-        [Console]::TreatControlCAsInput = $false
-        [Console]::add_CancelKeyPress([System.ConsoleCancelEventHandler]{
-            param($sender, $e)
-            $e.Cancel = $true
-            Write-Host "`nABBRUCH angefordert - laufende Datei wird noch fertiggestellt..." -ForegroundColor Yellow
-            $script:ShouldStop = $true
-        })
-    }
-} catch {}
+# Hier stand ein [Console]::add_CancelKeyPress-Handler als ScriptBlock. Der
+# Handler laeuft auf einem Threadpool-Thread ohne PowerShell-Runspace: Strg+C
+# setzte nicht $script:ShouldStop, sondern warf dort eine
+# PSInvalidOperationException (ScriptBlock.GetContextFromTLS) und riss
+# powershell.exe hart herunter - mitten in einer Datei-Ersetzung
+# (nachgestellt per GenerateConsoleCtrlEvent, WER-Bericht). Jetzt wie in 7/9:
+# Strg+C als Eingabe behandeln und zusammen mit ESC in der Hauptschleife
+# abfragen. Eingeschaltet wird das erst unmittelbar vor der Hauptschleife,
+# damit Strg+C in den Eingabeaufforderungen davor wie gewohnt abbricht.
+$script:CtrlCAsInput = $false
 
 trap {
+    try { if ($script:CtrlCAsInput) { [Console]::TreatControlCAsInput = $false } } catch {}
     Write-Warning "Unerwarteter Fehler: $_"
     Start-Sleep -Milliseconds 200
     if (Test-Path -LiteralPath $TempPath) {
@@ -1811,7 +1879,7 @@ trap {
             ForEach-Object {
                 try {
                     $p = [int][System.IO.File]::ReadAllText($_.FullName).Trim()
-                    if ($p -gt 0) { $script:TrackedExcelPids.Add($p) }
+                    if ($p -gt 0) { Add-TrackedExcelPid -ProcessId $p }
                 } catch {}
             }
     }
@@ -1982,9 +2050,16 @@ Enable-RestorePrivileges
 # ------------------------------------------------------------------
 # Persistente Log-Writer oeffnen (mit Null-Schutz im Anschluss)
 # ------------------------------------------------------------------
+# Detail-Log ANHAENGEN ($true): Enable-RestorePrivileges oben schreibt
+# seine Zeile zum Privilegstatus bereits ueber den Rueckfallweg von
+# Write-DetailedLog in diese Datei. Mit $false wurde sie hier sofort wieder
+# abgeschnitten - im Detail-Log stand nie, ob die Owner-Wiederherstellung
+# verfuegbar war (nachgestellt). Die Datei traegt den Laufzeitstempel im
+# Namen; angehaengt wird also nur an Zeilen dieses Laufs. Eine vorhandene
+# Datei bekommt dabei keine zweite BOM (StreamWriter prueft Position > 0).
 try {
     $script:LogWriter         = [System.IO.StreamWriter]::new($LogFilePath,     $false, $Utf8Bom)
-    $script:DetailedLogWriter = [System.IO.StreamWriter]::new($DetailedLogPath, $false, $Utf8Bom)
+    $script:DetailedLogWriter = [System.IO.StreamWriter]::new($DetailedLogPath, $true,  $Utf8Bom)
     $script:CsvLogWriter      = [System.IO.StreamWriter]::new($CsvLogPath,      $false, $Utf8Bom)
 } catch {
     Write-Warning "Log-Dateien konnten nicht geoeffnet werden: $_"
@@ -2120,9 +2195,35 @@ $stats = @{
 # ==================================================================
 Write-Host "Starte Verarbeitung..." -ForegroundColor Cyan
 
+# Strg+C als Eingabe behandeln (Begruendung beim Trap oben); nur interaktiv
+# an der Konsole - im Modus -NoInteractive fragt niemand die Tasten ab.
+try {
+    if (-not $NoInteractive -and $Host.Name -eq 'ConsoleHost') {
+        [Console]::TreatControlCAsInput = $true
+        $script:CtrlCAsInput = $true
+        Write-Host "Abbruch mit ESC oder Strg+C (nach der laufenden Datei)." -ForegroundColor DarkGray
+    }
+} catch {}
+
 try {
 Get-ExcelFilesRobust (Add-LongPathPrefix $TargetPath) $allExcelExt |
     ForEach-Object {
+
+    # ESC / Strg+C abfragen (wie 7): wirkt vor der naechsten Datei, die
+    # laufende wird nie mittendrin verlassen.
+    if ($script:CtrlCAsInput) {
+        try {
+            while ([Console]::KeyAvailable) {
+                $key = [Console]::ReadKey($true)
+                if ($key.Key -eq 'Escape' -or
+                    ($key.Key -eq [ConsoleKey]::C -and
+                     (($key.Modifiers -band [ConsoleModifiers]::Control) -ne 0))) {
+                    $script:ShouldStop = $true
+                    break
+                }
+            }
+        } catch {}
+    }
 
     if ($script:ShouldStop) { throw [System.OperationCanceledException]::new() }
 
@@ -2197,12 +2298,21 @@ Get-ExcelFilesRobust (Add-LongPathPrefix $TargetPath) $allExcelExt |
 
     # Nur das ReadOnly-Bit loeschen. Vorher wurde pauschal auf 'Normal' gesetzt
     # und damit auch Hidden, System, Archive und NotContentIndexed entfernt.
+    # $roEntfernt/$zurueckgeschrieben: Das Attribut wird hier entfernt, bevor
+    # feststeht, ob die Datei ueberhaupt geaendert wird. Endete die Datei
+    # danach als 'Kein Schutz', SKIP oder Fehler, blieb sie ohne
+    # Schreibschutz zurueck, obwohl die CSV 'NO_CHANGE' meldete. Deshalb wird
+    # das Attribut wiederhergestellt, wenn nicht erfolgreich zurueckgeschrieben
+    # wurde (Lock-Pruefung unten und finally).
+    $roEntfernt         = $false
+    $zurueckgeschrieben = $false
     if ($file.IsReadOnly) {
         if (Confirm-Write $file.FullName 'Schreibschutz-Attribut entfernen') {
             try {
                 $srcAttrs = [System.IO.File]::GetAttributes($srcLong)
                 [System.IO.File]::SetAttributes(
                     $srcLong, $srcAttrs -band (-bnot [System.IO.FileAttributes]::ReadOnly))
+                $roEntfernt = $true
                 Write-DetailedLog "Dateiattribut ReadOnly entfernt: $($file.FullName)" "DEBUG"
             } catch {
                 Write-DetailedLog "Attribut-Reset fehlgeschlagen: $($file.FullName) - $_" "WARN"
@@ -2215,6 +2325,9 @@ Get-ExcelFilesRobust (Add-LongPathPrefix $TargetPath) $allExcelExt |
     # ------------------------------------------------------------------
     $lockResult = Test-FileIsLocked -FilePath $file.FullName
     if ($lockResult -ne 'Free') {
+        if ($roEntfernt) {
+            try { [System.IO.File]::SetAttributes($srcLong, [System.IO.File]::GetAttributes($srcLong) -bor [System.IO.FileAttributes]::ReadOnly) } catch {}
+        }
         $stats.Locked++
         $stats.Skipped++
         if ($lockResult -eq 'AccessDenied') {
@@ -2258,6 +2371,19 @@ Get-ExcelFilesRobust (Add-LongPathPrefix $TargetPath) $allExcelExt |
         # ------------------------------------------------------------------
         Invoke-WithRetry -OperationName "Copy src->temp ($($file.Name))" -ScriptBlock {
             [System.IO.File]::Copy($srcLong, $tempFile, $true)
+        }
+        # ReadOnly auf der Temp-Kopie entfernen (wie 2a): File.Copy uebertraegt
+        # die Attribute der Quelle. Seit die Sperrpruefung schreibgeschuetzte
+        # Originale durchlaesst, ist die Quelle unter -WhatIf noch ReadOnly,
+        # und ZipFile.Open(Update) auf der Kopie scheiterte mit 'Zugriff
+        # verweigert' (nachgestellt am herausgeloesten Schleifenrumpf).
+        try {
+            $tempAttrs = [System.IO.File]::GetAttributes($tempFile)
+            if ($tempAttrs -band [System.IO.FileAttributes]::ReadOnly) {
+                [System.IO.File]::SetAttributes($tempFile, $tempAttrs -band (-bnot [System.IO.FileAttributes]::ReadOnly))
+            }
+        } catch {
+            Write-DetailedLog "ReadOnly-Reset auf Temp-Kopie fehlgeschlagen: $tempFile - $_" "WARN"
         }
         Unblock-File -LiteralPath $tempFile -ErrorAction SilentlyContinue -WhatIf:$false
 
@@ -2348,6 +2474,8 @@ Get-ExcelFilesRobust (Add-LongPathPrefix $TargetPath) $allExcelExt |
         # ------------------------------------------------------------------
         # OOXML-Validitaet pruefen, ggf. Oeffnen-Passwort entfernen
         # ------------------------------------------------------------------
+        # $pwRemoved geht unten in die Rueckschreib-Bedingung ein (wie in 2a).
+        $pwRemoved = $false
         if (-not (Test-IsValidZip -FilePath $workFile)) {
             if ($script:Passwords.Count -gt 0) {
                 if (-not $script:UseProgress) { Write-Host -NoNewline "[PW] " -ForegroundColor Cyan }
@@ -2362,6 +2490,7 @@ Get-ExcelFilesRobust (Add-LongPathPrefix $TargetPath) $allExcelExt |
                     return
                 }
                 if ($pwResult.UsedPassword) { Move-PasswordToFront $pwResult.UsedPassword }
+                $pwRemoved = $true
 
                 if (-not (Wait-FileAvailable -Path $workFile -TimeoutSec $WaitFileReadyTimeoutSec)) {
                     Write-DetailedLog "Wait-FileAvailable nach Passwort-Entfernung ausgelaufen: $workFile" "WARN"
@@ -2393,12 +2522,19 @@ Get-ExcelFilesRobust (Add-LongPathPrefix $TargetPath) $allExcelExt |
         $actionsLog = $actions -join ' | '
         Write-DetailedLog "Aktionen ($($file.FullName)): $actionsLog" "DEBUG"
 
-        if (@($actions).Count -gt 0 -or $wasConverted) {
+        # $pwRemoved MUSS mit in die Bedingung (Gegenstueck zu 2a):
+        # Remove-OpenPassword entschluesselt nur die Temp-Kopie. Eine .xlsx, die
+        # nur ein Oeffnen-Passwort und keinen Blatt-/Mappenschutz hat, liefert
+        # hier leere $actions, und $wasConverted ist fuer .xlsx/.xlsm $false.
+        # Ohne $pwRemoved lief der else-Zweig: die entschluesselte Temp-Kopie
+        # wurde im finally verworfen, das Original blieb verschluesselt, und
+        # die CSV meldete 'NO_CHANGE / Kein Schutz'.
+        if (@($actions).Count -gt 0 -or $wasConverted -or $pwRemoved) {
 
-            $actionStrPre = @($actions) -join ' | '
-            if ($wasConverted) {
-                $actionStrPre = (@('Konvertierung') + @($actions)) -join ' | '
-            }
+            $vorspann = @()
+            if ($wasConverted) { $vorspann += 'Konvertierung' }
+            if ($pwRemoved)    { $vorspann += 'Oeffnen-Passwort' }
+            $actionStrPre = (@($vorspann) + @($actions)) -join ' | '
 
             # Zentrale Freigabe: ab hier wird das Original angefasst. Bei -WhatIf
             # endet die Verarbeitung hier; die Temp-Kopie raeumt der finally-Block.
@@ -2491,8 +2627,12 @@ Get-ExcelFilesRobust (Add-LongPathPrefix $TargetPath) $allExcelExt |
                 # (Admin-Kontext: vollstaendig; Nutzer-Kontext: DACL)
                 Set-FileSecuritySnapshot -Path $finalDest -Snapshot $origSecurity
 
+                $zurueckgeschrieben = $true
                 $stats.Unlocked++
                 $actionStr = $actions -join ' | '
+                # Oeffnen-Passwort sichtbar machen; ohne das hiesse eine nur
+                # entschluesselte Datei hier 'Nur Format konvertiert'.
+                if ($pwRemoved) { $actionStr = (@('Oeffnen-Passwort entfernt') + @($actions)) -join ' | ' }
                 if ([string]::IsNullOrWhiteSpace($actionStr)) { $actionStr = "Nur Format konvertiert" }
                 if (-not $script:UseProgress) {
                     Write-Host "-> OK ($actionStr)" -ForegroundColor Green
@@ -2554,6 +2694,16 @@ Get-ExcelFilesRobust (Add-LongPathPrefix $TargetPath) $allExcelExt |
         if (-not [string]::IsNullOrWhiteSpace($workFile)) {
             Remove-Item -LiteralPath $workFile -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
         }
+        # Oben entferntes ReadOnly-Attribut zuruecksetzen, wenn die Datei
+        # nicht ersetzt wurde (Kein Schutz, SKIP, WHATIF, Fehler/Rollback).
+        if ($roEntfernt -and -not $zurueckgeschrieben -and [System.IO.File]::Exists($srcLong)) {
+            try {
+                [System.IO.File]::SetAttributes($srcLong, [System.IO.File]::GetAttributes($srcLong) -bor [System.IO.FileAttributes]::ReadOnly)
+                Write-DetailedLog "Dateiattribut ReadOnly wiederhergestellt, Datei unveraendert: $($file.FullName)" "DEBUG"
+            } catch {
+                Write-DetailedLog "ReadOnly-Attribut nicht wiederherstellbar: $($file.FullName) - $_" "WARN"
+            }
+        }
         # Reservierten Platzhalter nur entfernen, wenn er leer geblieben ist.
         if ($reservedPlaceholder) {
             try {
@@ -2571,6 +2721,8 @@ Get-ExcelFilesRobust (Add-LongPathPrefix $TargetPath) $allExcelExt |
     Write-Host "`nVerarbeitung durch Nutzer abgebrochen." -ForegroundColor Yellow
     Write-Log "Verarbeitung durch Nutzer abgebrochen." "WARN"
 }
+
+try { if ($script:CtrlCAsInput) { [Console]::TreatControlCAsInput = $false; $script:CtrlCAsInput = $false } } catch {}
 
 # ==================================================================
 # AUFRAEUMEN & STATISTIK

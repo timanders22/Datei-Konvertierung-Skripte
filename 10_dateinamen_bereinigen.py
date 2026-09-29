@@ -844,6 +844,61 @@ def _try_heal(fragment: str) -> str | None:
 # 'Schimmel+Asbest+Öle' (in denen '+' für "und" steht) unverändert.
 _LEGIT_GERMAN_UMLAUTS = set("äöüÄÖÜß")
 
+# Typografische Zeichen, die in Dateinamen massenhaft LEGITIM neben einem
+# '+' stehen. Vorher zaehlte jedes Nicht-ASCII-Zeichen ausser den Umlauten
+# als Mojibake-Nachbar; '+§' wurde ueber das Token '├§' zu 'ä', '+£' ueber
+# cp437 zu 'Ü', '+½' zu 'ë', '+«' zu 'î', '+©' ueber cp850 zu 'ø'.
+# Nachgestellt (29.09.): 'Antrag+§34 SGB.pdf' -> 'Antragä34 SGB.pdf',
+# 'Preis+£5.pdf' -> 'PreisÜ5.pdf', 'Wohnung 2+½ Zimmer.pdf' -> 'Wohnung 2ë
+# Zimmer.pdf', 'Buch+«Roman».pdf' -> 'BuchîRoman».pdf'. Dieselben Zeichen
+# sind aber auch echte cp437-Folgebytes ('+£bersicht' = 'Übersicht'). Neben
+# ihnen gilt das '+' deshalb nur dann als Mojibake, wenn das Paar mitten in
+# einem Wort steht (siehe _plus_paar_im_wort).
+# '®' fehlt absichtlich: in cp850 ist es das Folgebyte von 'é' und steht
+# dann oft am Wortende ('Caf+®' = 'Café', 'Andr+®'); mit '®' in der Menge
+# gingen im systematischen Korpus vier echte Heilungen verloren.
+_LEGIT_PLUS_SYMBOLE = frozenset("§£¥¢¤€½¼¾«»‹›©™°±²³¹µ¶·ºª¿¡¬")
+
+# Belastbare Mojibake-Belege fuer Phase B ('++' -> 'ü'). _MOJIBAKE_RESULT_HINT_RE
+# umfasst auch ©, °, § und akzentuierte Buchstaben (é, à) - damit wurde
+# 'C++Kurs ©.pdf' zu 'CüKurs ©.pdf' und 'Energieeffizienz A++B 20°C.pdf' zu
+# 'Energieeffizienz AüB 20°C.pdf'. Hier nur Zeichen, die in Dateinamen
+# praktisch nur als Mojibake vorkommen: C1-Steuerbereich, Â/Ã (UTF-8-
+# Leitbyte in cp1252), ƒ, griechische Grossbuchstaben (Γ aus cp437), ‰,
+# Pfeile, Box-Drawing/Block - darunter das '├', das Phase A setzt.
+_MOJIBAKE_BELEG_RE = re.compile(
+    r"[\u0080-\u009f"
+    r"ÂÃ"
+    r"ƒ"
+    r"Α-Ω"
+    r"‰"
+    r"←-⇿"
+    r"─-▟]"
+)
+
+
+def _plus_paar_im_wort(chars: list[str], i: int) -> bool:
+    """Steht das Paar '+X' (X = chars[i+1]) mitten in einem Wort?
+
+    Ein echtes '+X' ersetzt genau EINEN Buchstaben (├£ = Ü, ├§ = ä) und steht
+    damit im Wort: danach folgt ein Kleinbuchstabe ('+£bersicht',
+    'Ger+§t'), oder das ganze Wort ist in Grossbuchstaben ('+£BERSICHT',
+    'GR+£NDE'). Ziffer, Leerzeichen, Satzzeichen oder Wortende danach
+    ('+§34', '+£5', '+½ ') sowie ein Wechsel klein -> GROSS ('Buch+«Roman',
+    'Foto+©Mueller') sprechen fuer ein legitimes Zeichen.
+    """
+    n = len(chars)
+    danach = chars[i+2] if i + 2 < n else None
+    if danach is None or not danach.isalpha():
+        return False
+    if danach.islower():
+        return True
+    davor = chars[i-1] if i > 0 else None
+    if davor is not None and davor.isalpha() and not davor.isupper():
+        return False
+    weiter = chars[i+3] if i + 3 < n else None
+    return weiter is None or not weiter.isalpha() or weiter.isupper()
+
 
 def _pre_substitute_plus(text: str) -> str:
     """Substitut für '+' als Box-Drawing-Substitut (Drittsoftware-Mutation).
@@ -876,10 +931,12 @@ def _pre_substitute_plus(text: str) -> str:
 
     def _is_mojibake_neighbor(ch: str | None) -> bool:
         # Nachbar ist nur dann ein Mojibake-Indikator, wenn er
-        # nicht-ASCII ist UND kein legitimer deutscher Umlaut ist.
+        # nicht-ASCII ist UND kein legitimer deutscher Umlaut ist UND kein
+        # typografisches Zeichen aus _LEGIT_PLUS_SYMBOLE (die zaehlen nur
+        # im Wort, siehe unten).
         if ch is None or ord(ch) < 0x80:
             return False
-        return ch not in _LEGIT_GERMAN_UMLAUTS
+        return ch not in _LEGIT_GERMAN_UMLAUTS and ch not in _LEGIT_PLUS_SYMBOLE
 
     for i, c in enumerate(chars):
         if c != "+":
@@ -889,7 +946,9 @@ def _pre_substitute_plus(text: str) -> str:
             continue
         left  = chars[i-1] if i > 0 else None
         right = chars[i+1] if i < n-1 else None
-        if _is_mojibake_neighbor(left) or _is_mojibake_neighbor(right):
+        if (_is_mojibake_neighbor(left) or _is_mojibake_neighbor(right)
+                or (right in _LEGIT_PLUS_SYMBOLE
+                    and _plus_paar_im_wort(chars, i))):
             chars[i] = "\u251C"  # ├
     text2 = "".join(chars)
 
@@ -904,9 +963,15 @@ def _pre_substitute_plus(text: str) -> str:
     # und 'Oel++Wasser.txt' wurden beide veraendert, nur weil anderswo im
     # Namen ein Umlaut stand. _MOJIBAKE_RESULT_HINT_RE nimmt die legitimen
     # Umlaute ausdruecklich aus und verlangt damit einen echten Beleg.
-    if _MOJIBAKE_RESULT_HINT_RE.search(text2):
+    # Auch das reichte nicht: ©, ° und § zaehlen dort als Verdacht
+    # ('C++Kurs ©.pdf' -> 'CüKurs ©.pdf'). Jetzt nur _MOJIBAKE_BELEG_RE.
+    # Ausserdem muss nach dem '++' ein KLEINbuchstabe folgen: '++' steht
+    # fuer '├╝'/'├╢' = ü/ö, also immer fuer einen Kleinbuchstaben im Wort
+    # ('Fl++gel'); 'C++Kurs' und 'A++B' bleiben so auch in einem Namen
+    # mit echtem Mojibake stehen.
+    if _MOJIBAKE_BELEG_RE.search(text2):
         text2 = re.sub(
-            r"(?<=[A-Za-z])\+\+(?=[A-Za-z])",
+            r"(?<=[A-Za-z])\+\+(?=[a-z])",
             "\u251C\u255D",  # ├╝
             text2,
         )
@@ -1136,6 +1201,11 @@ def _rename_with_retry(src: str, dst: str) -> None:
 # ==================================================================
 # Sanitize-Eintrag
 # ==================================================================
+# Nur Probelauf: im aktuellen Ordner vorgemerkte Ziel- und frei werdende
+# Altnamen (normcase), siehe sanitize_entry_on_disk.
+_probelauf_namen: dict = {"ordner": None, "belegt": set(), "frei": set()}
+
+
 def sanitize_entry_on_disk(
     entry_path: str,
     pbar: tqdm,
@@ -1177,8 +1247,30 @@ def sanitize_entry_on_disk(
             f"({len(_display_path(new_path))}): {_display_path(new_path)}"
         )
 
+    # Im Probelauf ist die Platte nicht der ganze Zustand: ein Geschwister,
+    # das denselben Zielnamen bekommt, liegt dort noch unter altem Namen.
+    # Nachgestellt (29.09.): 'x  y.txt', 'x y .txt', 'x   y.txt' zeigte der
+    # Probelauf dreimal als '→ x y.txt', der Echtlauf vergab x y.txt,
+    # x y_2.txt, x y_3.txt. Deshalb im Probelauf die vorgemerkten Ziel-
+    # namen (belegt) und die weggebenannten Altnamen (frei) je Ordner
+    # mitfuehren. Der Walk liefert alle Eintraege eines Ordners am Stueck,
+    # es reicht also der aktuelle Ordner - nur im Speicher, nichts auf Platte.
+    if dry_run and _probelauf_namen["ordner"] != os.path.normcase(directory):
+        _probelauf_namen["ordner"] = os.path.normcase(directory)
+        _probelauf_namen["belegt"] = set()
+        _probelauf_namen["frei"] = set()
+
+    def _belegt(pfad: str) -> bool:
+        if dry_run:
+            schluessel = os.path.normcase(os.path.basename(pfad))
+            if schluessel in _probelauf_namen["belegt"]:
+                return True
+            if schluessel in _probelauf_namen["frei"]:
+                return False
+        return safe_exists(pfad)
+
     # Kollisionsauflösung
-    if safe_exists(new_path) and new_path.lower() != entry_path.lower():
+    if _belegt(new_path) and new_path.lower() != entry_path.lower():
         resolved = False
         if is_dir:
             base_for_collision = new_name
@@ -1191,7 +1283,7 @@ def sanitize_entry_on_disk(
             if truncate_long:
                 candidate_name = truncate_name(candidate_name, is_dir)
             candidate = os.path.join(directory, candidate_name)
-            if not safe_exists(candidate):
+            if not _belegt(candidate):
                 new_path = candidate
                 new_name = os.path.basename(candidate)
                 resolved = True
@@ -1204,7 +1296,7 @@ def sanitize_entry_on_disk(
             if truncate_long:
                 fallback_name = truncate_name(fallback_name, is_dir)
             candidate = os.path.join(directory, fallback_name)
-            if not safe_exists(candidate):
+            if not _belegt(candidate):
                 new_path = candidate
                 new_name = fallback_name
                 resolved = True
@@ -1222,6 +1314,12 @@ def sanitize_entry_on_disk(
             f"PROBELAUF: {_display_path(entry_path)} → {_display_path(new_path)}"
         )
         log_rename("WUERDE_UMBENENNEN", is_dir, directory, basename, new_name)
+        alt_schluessel = os.path.normcase(basename)
+        neu_schluessel = os.path.normcase(new_name)
+        _probelauf_namen["belegt"].discard(alt_schluessel)
+        _probelauf_namen["frei"].add(alt_schluessel)
+        _probelauf_namen["frei"].discard(neu_schluessel)
+        _probelauf_namen["belegt"].add(neu_schluessel)
         return RenameStatus.WOULD_RENAME
 
     # Umbenennung und Protokollierung strikt trennen: frueher standen
@@ -1296,6 +1394,80 @@ def sanitize_entry_on_disk(
 # ==================================================================
 # Eintrags-Generator (Bottom-Up)
 # ==================================================================
+# os.walk(followlinks=False) haelt nur bei SYMLINKS an; eine NTFS-Junction
+# (mklink /J) gilt dort nicht als Link und wurde betreten. Im Bottom-Up-
+# Modus laesst sich das auch nicht per 'dirs[:] = ...' abschneiden - der
+# Abstieg ist dann schon geschehen. Nachgestellt (29.09., Python 3.14) mit
+# einer Junction nach aussen und einer auf den eigenen Wurzelordner:
+# entry_generator lieferte 571 Eintraege, 441 davon ueber die Junctions,
+# also Umbenennungen ausserhalb des gewaehlten Baums; die Schleife lief bis
+# an die Pfadlaengengrenze. Deshalb ein eigener Bottom-Up-Walk (gleiche
+# Reihenfolge wie os.walk, iterativ statt rekursiv), der Namens-
+# Umleitungen (Junction, Symlink: Bit 0x20000000 im Reparse-Tag) nicht
+# betritt. Die Umleitung selbst wird weiter als Ordner-Eintrag geliefert
+# (Umbenennen aendert nur den Link, nie sein Ziel). Cloud-Platzhalter
+# (OneDrive u. a.) tragen auch ein Reparse-Attribut, sind aber echte
+# Ordner und werden betreten.
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_IO_REPARSE_TAG_NAME_SURROGATE = 0x20000000
+_gemeldete_umleitungen: set = set()
+
+
+def _ist_umleitung(entry) -> bool:
+    # DirEntry.stat(follow_symlinks=False) kommt unter Windows aus den
+    # Verzeichnisdaten - kein zusaetzlicher Zugriff je Ordner.
+    try:
+        if entry.is_symlink():
+            return True
+        st = entry.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    if not getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT:
+        return False
+    tag = getattr(st, "st_reparse_tag", 0)
+    # Tag unbekannt: im Zweifel nicht betreten.
+    return not tag or bool(tag & _IO_REPARSE_TAG_NAME_SURROGATE)
+
+
+def _walk_bottom_up(top: str, onerror):
+    stapel: list = [top]
+    while stapel:
+        oben = stapel.pop()
+        if isinstance(oben, tuple):
+            yield oben
+            continue
+        try:
+            with os.scandir(oben) as it:
+                eintraege = list(it)
+        except OSError as e:
+            onerror(e)
+            continue
+        dirs: list[str] = []
+        files: list[str] = []
+        abstieg: list[str] = []
+        for e in eintraege:
+            try:
+                ist_ordner = e.is_dir()
+            except OSError:
+                ist_ordner = False
+            if not ist_ordner:
+                files.append(e.name)
+                continue
+            dirs.append(e.name)
+            if _ist_umleitung(e):
+                voll = os.path.join(oben, e.name)
+                # count_entries laeuft denselben Baum vorab - nur einmal melden.
+                if voll not in _gemeldete_umleitungen:
+                    _gemeldete_umleitungen.add(voll)
+                    logger.warning(
+                        f"Junction/Verknüpfung nicht betreten: {_display_path(voll)}"
+                    )
+            else:
+                abstieg.append(os.path.join(oben, e.name))
+        stapel.append((oben, dirs, files))
+        stapel.extend(reversed(abstieg))
+
+
 def entry_generator(directory: str):
     def _walk_error(err: OSError) -> None:
         logger.warning(
@@ -1305,7 +1477,7 @@ def entry_generator(directory: str):
 
     lp_directory = prepare_long_path(directory)
 
-    for root, dirs, files in os.walk(lp_directory, topdown=False, onerror=_walk_error):
+    for root, dirs, files in _walk_bottom_up(lp_directory, _walk_error):
         for f in files:
             nl = f.lower()
             if nl in SKIP_FILES or nl.startswith(SKIP_FILE_PREFIXES):
