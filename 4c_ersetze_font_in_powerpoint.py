@@ -573,8 +573,83 @@ def pruefe_powerpoint_geschlossen(auto_mode: bool = False) -> None:
             sys.exit(0)
 
 
+# ==================================================================
+# Dateien des Anwenders in der PowerPoint-Instanz des Skripts
+# ==================================================================
+# PowerPoint ist Einzelinstanz: oeffnet der Anwender waehrend des Laufs eine
+# Datei, landet sie in der Instanz des Skripts. Zwischen zwei Dateien prueft
+# der Lauf das per COM (Presentations.Count); haengt aber gerade ein Aufruf,
+# ist COM blockiert, und der Waechter haette die Instanz samt Anwenderdatei
+# beendet. Deshalb der Blick auf die Fenster (gemessen am 29.09.2026):
+#   - Skript-Instanz: ein Rahmenfenster "PPTFrameClass" mit dem Titel
+#     "PowerPoint" - die eigenen Praesentationen sind fensterlos
+#     (WithWindow=False);
+#   - oeffnet der Anwender "x.pptx", heisst der Rahmen "x.pptx - PowerPoint";
+#   - haengt das Skript in einem modalen Dialog (Kennwortabfrage), oeffnet
+#     PowerPoint die Anwenderdatei gar nicht, sondern zeigt eine Meldung.
+
+def _anwender_praesentationen(pid) -> list:
+    """Titel der PowerPoint-Rahmenfenster mit einer Datei darin (Prozess pid)."""
+    titel = []
+    if not pid:
+        return titel
+    try:
+        import win32gui
+    except ImportError:
+        return titel
+
+    def _sammeln(hwnd, _):
+        try:
+            if (win32gui.GetClassName(hwnd) == "PPTFrameClass"
+                    and win32process.GetWindowThreadProcessId(hwnd)[1] == pid):
+                t = (win32gui.GetWindowText(hwnd) or "").strip()
+                if t and t.lower() not in ("powerpoint", "microsoft powerpoint"):
+                    titel.append(t)
+        except Exception:
+            pass
+        return True
+    try:
+        win32gui.EnumWindows(_sammeln, None)
+    except Exception as _e:
+        detail_logger.debug(f"_anwender_praesentationen: {_e!r}")
+    return titel
+
+
+def _warten_bis_anwender_fertig(pid, fertig=None) -> None:
+    """Vor einem Waechter-Kill: warten, solange eine Anwenderdatei offen ist.
+
+    fertig: threading.Event des ueberwachten Aufrufs - kehrt der Aufruf
+    waehrend des Wartens doch noch zurueck (etwa weil der Anwender einen
+    Dialog geschlossen hat), endet das Warten sofort.
+    """
+    gemeldet = False
+    while True:
+        if fertig is not None and fertig.is_set():
+            return
+        titel = _anwender_praesentationen(pid)
+        if not titel:
+            return
+        try:
+            if not psutil.pid_exists(pid):
+                return
+        except Exception:
+            return
+        if not gemeldet:
+            meldung = (f"PowerPoint reagiert nicht, darin ist aber eine Datei des "
+                       f"Anwenders offen ({', '.join(titel)}). PowerPoint wird erst "
+                       f"beendet, wenn sie gespeichert und geschlossen ist.")
+            detail_logger.warning(meldung)
+            try:
+                tqdm.write(f"  ⚠  {meldung}")
+            except Exception:
+                print(f"  ⚠  {meldung}")
+            gemeldet = True
+        time.sleep(5)
+
+
 def _kill_powerpoint_by_pid(pid: Optional[int],
-                            create_time: Optional[float] = None) -> None:
+                            create_time: Optional[float] = None,
+                            warten: bool = False) -> None:
     if pid is None:
         return
     # Kill NUR mit bekannter Erstellungszeit: Ohne sie laesst sich die
@@ -600,6 +675,16 @@ def _kill_powerpoint_by_pid(pid: Optional[int],
                 return
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return
+        # Datei des Anwenders in der Instanz: der Waechter wartet, bis sie
+        # geschlossen ist (warten=True); jeder andere Aufrufer beendet nicht.
+        if _anwender_praesentationen(pid):
+            if not warten:
+                detail_logger.warning(
+                    f"PPT-Prozess PID {pid}: Datei des Anwenders offen – kein Kill")
+                return
+            _warten_bis_anwender_fertig(pid)
+            if not proc.is_running():
+                return
         proc.kill()
         try:
             proc.wait(timeout=5)
@@ -1521,8 +1606,11 @@ def _ppt_call_with_watchdog(call_label: str, timeout: float, ppt_pid,
 
     def _watchdog():
         if not done_event.wait(timeout):
+            # Erst auf den Anwender warten, DANN entscheiden: kehrt der
+            # Aufruf waehrenddessen zurueck, bleibt die Instanz am Leben.
+            _warten_bis_anwender_fertig(ppt_pid, done_event)
             with state_lock:
-                if completed[0]:
+                if completed[0] or done_event.is_set():
                     return          # Aufruf war bereits fertig
                 timeout_flag[0] = True
             if ppt_pid:
@@ -1534,7 +1622,7 @@ def _ppt_call_with_watchdog(call_label: str, timeout: float, ppt_pid,
                 # schnell an einen anderen Prozess vergeben - auch an
                 # eine NEUE PowerPoint-Sitzung des Benutzers, die der
                 # Namens-Check allein nicht erkennen wuerde.
-                _kill_powerpoint_by_pid(ppt_pid, ppt_create_time)
+                _kill_powerpoint_by_pid(ppt_pid, ppt_create_time, warten=True)
 
     wd_thread = threading.Thread(target=_watchdog, daemon=True)
     wd_thread.start()
@@ -1945,6 +2033,9 @@ def ask_metadata_detail() -> dict:
 # ==================================================================
 
 
+PPT_STANDARDKENNWORT = "/01Hannes Ruescher/01"
+
+
 def _ppt_kennwort_grund(path: str) -> str:
     """'' wenn PowerPoint die Datei ohne Kennwortabfrage oeffnet, sonst den Grund.
 
@@ -1953,7 +2044,11 @@ def _ppt_kennwort_grund(path: str) -> str:
     Aenderungskennwort bis zum Waechter (180 s plus Neustart).
     - Verschluesselt: OOXML-Datei im CFB-Container statt ZIP; .ppt ueber
       msoffcrypto (falls installiert).
-    - Aenderungskennwort: <p:modifyVerifier> in ppt/presentation.xml.
+    - Aenderungskennwort: <p:modifyVerifier> in ppt/presentation.xml bzw.
+      bei .ppt die Verschluesselung mit dem Standardkennwort.
+    4c ueberspringt beides: eine Praesentation mit Aenderungskennwort laesst
+    sich zwar schreibgeschuetzt oeffnen, aber nicht speichern (gemessen;
+    "Presentation cannot be modified"). Das Kennwort entfernt 2c bzw. 3c.
     """
     import re
     import zipfile
@@ -1967,11 +2062,25 @@ def _ppt_kennwort_grund(path: str) -> str:
             if not ist_cfb:
                 return ""
             try:
+                import io
                 import msoffcrypto
             except ImportError:
                 return ""
             with open(lp, "rb") as f:
-                return "verschluesselt" if msoffcrypto.OfficeFile(f).is_encrypted() else ""
+                datei = msoffcrypto.OfficeFile(f)
+                if not datei.is_encrypted():
+                    return ""
+                # PowerPoint 97-2003 speichert ein Aenderungskennwort als
+                # Verschluesselung mit einem festen Standardkennwort (gemessen
+                # am 29.09.2026: WritePassword gesetzt, als .ppt gespeichert ->
+                # verschluesselt, mit diesem Kennwort entschluesselbar). Nur
+                # ein echtes Oeffnungskennwort scheitert hier.
+                try:
+                    datei.load_key(password=PPT_STANDARDKENNWORT)
+                    datei.decrypt(io.BytesIO())
+                    return "schreibkennwort"
+                except Exception:
+                    return "verschluesselt"
         if ist_cfb:
             return "verschluesselt"
         if not kopf.startswith(b"PK"):
@@ -2465,7 +2574,8 @@ def replace_fonts_in_presentation(
 
     _grund = _ppt_kennwort_grund(original_path)
     if _grund:
-        _text = "verschlüsselt" if _grund == "verschluesselt" else "Änderungskennwort"
+        _text = ("verschlüsselt" if _grund == "verschluesselt"
+                 else "Änderungskennwort – vorher 2c oder 3c ausführen")
         pbar.write(f"  ->  ÜBERSPRUNGEN ({_text}): "
                    f"{os.path.basename(original_path)}")
         detail_logger.info(f"Übersprungen ({_text}): {original_path}")

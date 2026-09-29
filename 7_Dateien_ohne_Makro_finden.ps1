@@ -1166,10 +1166,11 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
             switch ($Ext) {
                 ".docm" {
                     $doc = $app.Documents.Add()
-                    $doc.SaveAs2($TestPath, $MacroFormat)
+                    # AddToRecentFiles = $false (5. Argument): siehe Hauptlauf.
+                    $doc.SaveAs2($TestPath, $MacroFormat, $false, "", $false)
                     $doc.Close($false)
                     Start-Sleep -Milliseconds 200
-                    $doc = $app.Documents.Open($TestPath, $false, $false)
+                    $doc = $app.Documents.Open($TestPath, $false, $false, $false)
                 }
                 ".xlsm" {
                     $doc = $app.Workbooks.Add()
@@ -1486,6 +1487,13 @@ Enable-RestorePrivileges
 
 Write-Log "Initialisiere Office-Komponenten..."
 
+# Zuletzt verwendet: Ausgangszustand merken; am Ende verschwinden nur die
+# Verknuepfungen, die Office fuer eigene Arbeitskopien bzw. das bearbeitete
+# Verzeichnis angelegt hat (_gemeinsam.psm1; gemessen 29.09.2026: 13 je Lauf).
+if ($script:GemeinsamGeladen) {
+    try { Start-RecentMomentaufnahme; Add-RecentWurzel $RootPath } catch { }
+}
+
 # ==============================================================================
 # Office-Initialisierung
 # ==============================================================================
@@ -1786,7 +1794,10 @@ foreach ($type in $fileTypes) {
             Set-DateiWaechter $dateiWaechter -ProcessId $officePids[$type.App] `
                 -StartTime $officeStartTimes[$type.App] -TimeoutSec $script:DateiTimeoutSec
             switch ($type.Ext) {
-                ".docm" { $obj = $word.Documents.Open($localCopy, $false, $false) }
+                # 4. Argument AddToRecentFiles = $false. Ohne es trug Word jede
+                # Arbeitskopie in seine Liste "Zuletzt verwendet" ein - am
+                # 29.09.2026 standen 21 solche Eintraege aus 7 in der Registry.
+                ".docm" { $obj = $word.Documents.Open($localCopy, $false, $false, $false) }
                 ".xlsm" { $obj = $excel.Workbooks.Open($localCopy, 0, $false) }
                 ".pptm" { $obj = $pptx.Presentations.Open($localCopy, 0, 0, -1) }
             }
@@ -1915,7 +1926,7 @@ foreach ($type in $fileTypes) {
                     $localTarget = [string](Join-Path $guidDir "work$($type.Target)")
 
                     switch ($type.Ext) {
-                        ".docm" { $obj.SaveAs2($localTarget, $type.Format) }
+                        ".docm" { $obj.SaveAs2($localTarget, $type.Format, $false, "", $false) }
                         ".xlsm" { $obj.SaveAs($localTarget, $type.Format) }
                         ".pptm" { $obj.SaveAs($localTarget, $type.Format) }
                     }
@@ -2277,6 +2288,9 @@ Write-Log "  $logFile"
 Write-Log "  $skipLog"
 Write-Log "--- SKRIPT BEENDET ---"
 
+if ($script:GemeinsamGeladen) {
+    try { [void](Remove-EigeneRecentEintraege) } catch { }
+}
 Invoke-WindowsTempCleanup
 
 try { if ($script:CtrlCAsInput) { [Console]::TreatControlCAsInput = $false } } catch {}

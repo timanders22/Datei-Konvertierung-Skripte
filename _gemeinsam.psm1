@@ -424,6 +424,97 @@ function Write-Laufprotokoll {
     }
 }
 
+# ==================================================================
+# Zuletzt verwendet: nur die eigenen Eintraege entfernen
+# ==================================================================
+# Gegenstueck zu _gemeinsam.py (recent_*). Office legt fuer jede geoeffnete
+# Arbeitskopie eine Verknuepfung in %APPDATA%\Microsoft\Windows\Recent an;
+# 2a/2b/2c liessen sie bis 29.09.2026 liegen (gemessen: 3-4 je Lauf, alle
+# auf inzwischen geloeschte Arbeitskopien). Entfernt wird nur, was nach der
+# Momentaufnahme entstanden ist UND auf eine eigene Wurzel zeigt: das
+# bearbeitete Verzeichnis, den Arbeitsordner oder %TEMP%. Ohne Momentaufnahme
+# wird nichts geloescht.
+
+$script:RecentVorher  = $null
+$script:RecentWurzeln = New-Object System.Collections.Generic.List[string]
+
+function ConvertTo-RecentVergleichspfad {
+    param([string]$Pfad)
+    if ([string]::IsNullOrWhiteSpace($Pfad)) { return '' }
+    $p = Remove-LongPathPrefix $Pfad
+    try { $p = [System.IO.Path]::GetFullPath($p) } catch { }
+    # %TEMP% steht oft in 8.3-Form (ABCDEF~1), Verknuepfungsziele in
+    # Langform - ohne Angleichen passt nichts zusammen.
+    if ($p.Contains('~')) {
+        try {
+            if (-not ('GemeinsamLangpfad' -as [type])) {
+                Add-Type -Namespace '' -Name 'GemeinsamLangpfad' -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern uint GetLongPathName(string kurz, System.Text.StringBuilder lang, uint groesse);
+'@
+            }
+            $sb = New-Object System.Text.StringBuilder 32768
+            if ([GemeinsamLangpfad]::GetLongPathName($p, $sb, 32768) -gt 0) { $p = $sb.ToString() }
+        } catch { }
+    }
+    return $p.TrimEnd('\').ToLowerInvariant()
+}
+
+function Start-RecentMomentaufnahme {
+    if ($null -ne $script:RecentVorher) { return }
+    $ordner = Join-Path $env:APPDATA 'Microsoft\Windows\Recent'
+    try {
+        $script:RecentVorher = @{}
+        foreach ($n in [System.IO.Directory]::EnumerateFiles($ordner, '*.lnk')) {
+            $script:RecentVorher[[System.IO.Path]::GetFileName($n).ToLowerInvariant()] = $true
+        }
+    } catch {
+        # Unbekannter Ausgangszustand: lieber gar nichts loeschen.
+        $script:RecentVorher = $null
+    }
+}
+
+function Add-RecentWurzel {
+    param([string]$Pfad)
+    $w = ConvertTo-RecentVergleichspfad $Pfad
+    if ($w -and -not $script:RecentWurzeln.Contains($w)) { [void]$script:RecentWurzeln.Add($w) }
+}
+
+function Test-RecentEigen {
+    param([string]$Pfad)
+    $p = ConvertTo-RecentVergleichspfad $Pfad
+    if (-not $p) { return $false }
+    $wurzeln = @($script:RecentWurzeln)
+    if ($env:LOCALAPPDATA) { $wurzeln += ConvertTo-RecentVergleichspfad (Join-Path $env:LOCALAPPDATA 'Dateimigration-Arbeitskopien') }
+    if ($env:TEMP)         { $wurzeln += ConvertTo-RecentVergleichspfad $env:TEMP }
+    foreach ($w in $wurzeln) {
+        if ($w -and ($p -eq $w -or $p.StartsWith($w + '\'))) { return $true }
+    }
+    return $false
+}
+
+function Remove-EigeneRecentEintraege {
+    <# Rueckgabe: Zahl der entfernten Verknuepfungen. #>
+    if ($null -eq $script:RecentVorher) { return 0 }
+    $ordner = Join-Path $env:APPDATA 'Microsoft\Windows\Recent'
+    $entfernt = 0
+    try { $shell = New-Object -ComObject WScript.Shell } catch { return 0 }
+    try {
+        foreach ($lnk in [System.IO.Directory]::EnumerateFiles($ordner, '*.lnk')) {
+            $name = [System.IO.Path]::GetFileName($lnk).ToLowerInvariant()
+            if ($script:RecentVorher.ContainsKey($name)) { continue }
+            try {
+                $ziel = $shell.CreateShortcut($lnk).TargetPath
+                if (Test-RecentEigen $ziel) {
+                    [System.IO.File]::Delete($lnk)
+                    $entfernt++
+                }
+            } catch { }
+        }
+    } catch { }
+    return $entfernt
+}
+
 Export-ModuleMember -Function `
     Resolve-ScriptDirectory, Resolve-WritableDirectory,
     Add-LongPathPrefix, Remove-LongPathPrefix, Test-PathExistsLong,
@@ -431,4 +522,5 @@ Export-ModuleMember -Function `
     Wait-FileAvailable, Invoke-WithRetry,
     Get-FileTimestamps, Restore-FileTimestamps,
     ConvertTo-CsvField, Import-Konfiguration, Import-Presetliste,
-    Write-Laufprotokoll
+    Write-Laufprotokoll,
+    Start-RecentMomentaufnahme, Add-RecentWurzel, Test-RecentEigen, Remove-EigeneRecentEintraege

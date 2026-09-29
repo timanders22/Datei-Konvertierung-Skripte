@@ -1692,6 +1692,40 @@ def _xls_hat_schreibkennwort(lp: str) -> bool:
     return False
 
 
+def _xlsb_hat_schreibkennwort(wb_bin: bytes) -> bool:
+    """BIFF12 (xl/workbook.bin): Schreibreservierung mit Kennwort?
+
+    Gemessen am 29.09.2026 mit Excel 2024: mit Kennwort schreibt Excel den
+    Satz BrtFileSharingIso (0x2A4, neuer Hash) und daneben BrtFileSharing
+    (0x224) ohne Hash; bei "schreibgeschuetzt empfohlen" ohne Kennwort steht
+    nur 0x224 mit leerem Hash. Aeltere Dateien tragen den Hash (wResPass) in
+    0x224 selbst.
+    """
+    pos = 0
+    n = len(wb_bin)
+    while pos < n:
+        b0 = wb_bin[pos]; pos += 1
+        typ = b0 & 0x7F
+        if b0 & 0x80 and pos < n:
+            typ |= (wb_bin[pos] & 0x7F) << 7; pos += 1
+        laenge = 0
+        for i in range(4):
+            if pos >= n:
+                return False
+            b = wb_bin[pos]; pos += 1
+            laenge |= (b & 0x7F) << (7 * i)
+            if not b & 0x80:
+                break
+        if typ == 0x2A4:
+            return True
+        if typ == 0x224 and laenge >= 4:
+            return int.from_bytes(wb_bin[pos + 2:pos + 4], "little") != 0
+        if typ == 0x08F:               # BrtBeginBundleShs: Kopfteil vorbei
+            return False
+        pos += laenge
+    return False
+
+
 def _excel_kennwort_grund(path: str) -> str:
     """'' wenn Excel die Mappe ohne Kennwortabfrage oeffnet, sonst den Grund.
 
@@ -1723,7 +1757,11 @@ def _excel_kennwort_grund(path: str) -> str:
             try:
                 wb = z.read("xl/workbook.xml").decode("utf-8", errors="ignore")
             except KeyError:
-                return ""                    # .xlsb: binaer, keine Erkennung
+                try:
+                    wb_bin = z.read("xl/workbook.bin")          # .xlsb
+                except KeyError:
+                    return ""
+                return "schreibkennwort" if _xlsb_hat_schreibkennwort(wb_bin) else ""
         m = re.search(r"<(?:\w+:)?fileSharing\b[^>]*>", wb)
         if m and re.search(r"\b(reservationPassword|hashValue|algorithmName)=", m.group(0)):
             return "schreibkennwort"

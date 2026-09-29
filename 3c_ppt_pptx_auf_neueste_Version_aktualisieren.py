@@ -965,6 +965,10 @@ def _kill_eigene_powerpoint() -> None:
             if is_foreign_powerpoint_pid(pid, ct):
                 _EIGENE_POWERPOINT_PROZESSE.pop(pid, None)
                 continue
+            if _anwender_praesentationen(pid):
+                detail_logger.warning(
+                    f"PPT-Prozess PID {pid}: Datei des Anwenders offen – kein Kill")
+                continue
             proc.kill()
             proc.wait(timeout=3)
             _EIGENE_POWERPOINT_PROZESSE.pop(pid, None)
@@ -1163,6 +1167,80 @@ def _configure_ppt_instance(ppt_app) -> None:
         detail_logger.debug(f"_configure_ppt_instance: Exception verworfen: {_e!r}")
 
 
+# ==================================================================
+# Dateien des Anwenders in der PowerPoint-Instanz des Skripts
+# ==================================================================
+# PowerPoint ist Einzelinstanz: oeffnet der Anwender waehrend des Laufs eine
+# Datei, landet sie in der Instanz des Skripts. Zwischen zwei Dateien prueft
+# der Lauf das per COM (Presentations.Count); haengt aber gerade ein Aufruf,
+# ist COM blockiert, und der Waechter haette die Instanz samt Anwenderdatei
+# beendet. Deshalb der Blick auf die Fenster (gemessen am 29.09.2026):
+#   - Skript-Instanz: ein Rahmenfenster "PPTFrameClass" mit dem Titel
+#     "PowerPoint" - die eigenen Praesentationen sind fensterlos
+#     (WithWindow=False);
+#   - oeffnet der Anwender "x.pptx", heisst der Rahmen "x.pptx - PowerPoint";
+#   - haengt das Skript in einem modalen Dialog (Kennwortabfrage), oeffnet
+#     PowerPoint die Anwenderdatei gar nicht, sondern zeigt eine Meldung.
+
+def _anwender_praesentationen(pid) -> list:
+    """Titel der PowerPoint-Rahmenfenster mit einer Datei darin (Prozess pid)."""
+    titel = []
+    if not pid:
+        return titel
+    try:
+        import win32gui
+    except ImportError:
+        return titel
+
+    def _sammeln(hwnd, _):
+        try:
+            if (win32gui.GetClassName(hwnd) == "PPTFrameClass"
+                    and win32process.GetWindowThreadProcessId(hwnd)[1] == pid):
+                t = (win32gui.GetWindowText(hwnd) or "").strip()
+                if t and t.lower() not in ("powerpoint", "microsoft powerpoint"):
+                    titel.append(t)
+        except Exception:
+            pass
+        return True
+    try:
+        win32gui.EnumWindows(_sammeln, None)
+    except Exception as _e:
+        detail_logger.debug(f"_anwender_praesentationen: {_e!r}")
+    return titel
+
+
+def _warten_bis_anwender_fertig(pid, fertig=None) -> None:
+    """Vor einem Waechter-Kill: warten, solange eine Anwenderdatei offen ist.
+
+    fertig: threading.Event des ueberwachten Aufrufs - kehrt der Aufruf
+    waehrend des Wartens doch noch zurueck (etwa weil der Anwender einen
+    Dialog geschlossen hat), endet das Warten sofort.
+    """
+    gemeldet = False
+    while True:
+        if fertig is not None and fertig.is_set():
+            return
+        titel = _anwender_praesentationen(pid)
+        if not titel:
+            return
+        try:
+            if not psutil.pid_exists(pid):
+                return
+        except Exception:
+            return
+        if not gemeldet:
+            meldung = (f"PowerPoint reagiert nicht, darin ist aber eine Datei des "
+                       f"Anwenders offen ({', '.join(titel)}). PowerPoint wird erst "
+                       f"beendet, wenn sie gespeichert und geschlossen ist.")
+            detail_logger.warning(meldung)
+            try:
+                tqdm.write(f"  ⚠  {meldung}")
+            except Exception:
+                print(f"  ⚠  {meldung}")
+            gemeldet = True
+        time.sleep(5)
+
+
 def _ppt_call_with_watchdog(call_label: str, timeout: float, ppt_pid,
                              call_fn, restore_fn=None):
     done_event   = threading.Event()
@@ -1198,8 +1276,11 @@ def _ppt_call_with_watchdog(call_label: str, timeout: float, ppt_pid,
 
     def _watchdog():
         if not done_event.wait(timeout):
+            # Erst auf den Anwender warten, DANN entscheiden: kehrt der
+            # Aufruf waehrenddessen zurueck, bleibt die Instanz am Leben.
+            _warten_bis_anwender_fertig(ppt_pid, done_event)
             with state_lock:
-                if completed[0]:
+                if completed[0] or done_event.is_set():
                     return          # Aufruf war bereits fertig
                 timeout_flag[0] = True
             if ppt_pid:
@@ -2450,6 +2531,89 @@ def _resolve_unique_path(target_path: str) -> str:
 # Kern-Logik: Konvertierung / Aktualisierung
 # ==================================================================
 
+PPT_STANDARDKENNWORT = "/01Hannes Ruescher/01"
+
+
+def _kopie_ohne_aenderungskennwort(quelle: str, ziel: str) -> None:
+    """Kopie einer .pptx/.pptm/.ppsx/.potx ohne <p:modifyVerifier>."""
+    muster_leer = re.compile(rb"<(?:\w+:)?modifyVerifier\b[^>]*/>")
+    muster_paar = re.compile(rb"<(?:\w+:)?modifyVerifier\b[^>]*>.*?</(?:\w+:)?modifyVerifier>", re.S)
+    with zipfile.ZipFile(prepare_long_path(quelle)) as zi, \
+            zipfile.ZipFile(ziel, "w", zipfile.ZIP_DEFLATED) as zo:
+        for info in zi.infolist():
+            daten = zi.read(info.filename)
+            if info.filename == "ppt/presentation.xml":
+                daten = muster_paar.sub(b"", muster_leer.sub(b"", daten))
+            zo.writestr(info, daten)
+
+
+def _ppt_kennwort_grund(path: str) -> str:
+    """'' wenn PowerPoint die Datei ohne Kennwortabfrage oeffnet, sonst den Grund.
+
+    Die COM-Schnittstelle kennt keinen Kennwort-Parameter: gemessen am
+    29.09.2026 mit PowerPoint 2024 hing eine Praesentation mit
+    Aenderungskennwort bis zum Waechter (180 s plus Neustart).
+    - Verschluesselt: OOXML-Datei im CFB-Container statt ZIP; .ppt ueber
+      msoffcrypto (falls installiert).
+    - Aenderungskennwort: <p:modifyVerifier> in ppt/presentation.xml bzw.
+      bei .ppt die Verschluesselung mit dem Standardkennwort.
+    3c (seit 29.09.2026): Oeffnungskennwort -> ueberspringen, statt es
+    dreimal zu versuchen. Aenderungskennwort: PowerPoint kann eine solche
+    Praesentation ohne das Kennwort nicht speichern - gemessen scheiterten
+    SaveAs dreimal ("Presentation cannot be modified"), ebenso mit
+    Untitled=True und SaveCopyAs. Deshalb bei .pptx & Co. eine Arbeitskopie
+    ohne <p:modifyVerifier> (wie 2c; das Kennwort entfaellt, wie bei 3b
+    gewollt). Bei .ppt ist das Kennwort eine Verschluesselung; die mit
+    msoffcrypto entschluesselte Datei lehnte PowerPoint als beschaedigt ab
+    - solche Dateien werden uebersprungen.
+    """
+    import re
+    import zipfile
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        lp = prepare_long_path(path)
+        with open(lp, "rb") as f:
+            kopf = f.read(8)
+        ist_cfb = kopf.startswith(b"\xD0\xCF\x11\xE0")
+        if ext in (".ppt", ".pps", ".pot"):
+            if not ist_cfb:
+                return ""
+            try:
+                import io
+                import msoffcrypto
+            except ImportError:
+                return ""
+            with open(lp, "rb") as f:
+                datei = msoffcrypto.OfficeFile(f)
+                if not datei.is_encrypted():
+                    return ""
+                # PowerPoint 97-2003 speichert ein Aenderungskennwort als
+                # Verschluesselung mit einem festen Standardkennwort (gemessen
+                # am 29.09.2026: WritePassword gesetzt, als .ppt gespeichert ->
+                # verschluesselt, mit diesem Kennwort entschluesselbar). Nur
+                # ein echtes Oeffnungskennwort scheitert hier.
+                try:
+                    datei.load_key(password=PPT_STANDARDKENNWORT)
+                    datei.decrypt(io.BytesIO())
+                    return "schreibkennwort"
+                except Exception:
+                    return "verschluesselt"
+        if ist_cfb:
+            return "verschluesselt"
+        if not kopf.startswith(b"PK"):
+            return ""
+        with zipfile.ZipFile(lp) as z:
+            try:
+                xml = z.read("ppt/presentation.xml").decode("utf-8", errors="ignore")
+            except KeyError:
+                return ""
+        if re.search(r"<(?:\w+:)?modifyVerifier\b", xml):
+            return "schreibkennwort"
+    except Exception as _e:
+        detail_logger.debug(f"_ppt_kennwort_grund: {_e!r}")
+    return ""
+
+
 def convert_ppt_file(
     file_path: str,
     ppt_app: win32com.client.CDispatch,
@@ -2501,6 +2665,21 @@ def convert_ppt_file(
 
     mru_paths_to_clean = []
 
+    # --- Kennwoerter vorab erkennen (siehe _ppt_kennwort_grund) ---
+    ppt_kennwort = _ppt_kennwort_grund(original_path)
+    if ppt_kennwort == "verschluesselt":
+        if skip_password:
+            pbar.write("  → ÜBERSPRUNGEN: Kennwortgeschützt (Öffnungskennwort).")
+            detail_logger.warning(f"Übersprungen (Öffnungskennwort): {display_path(original_path)}")
+            return "SKIPPED"
+        log_error(original_path, Exception("Öffnungskennwort – kein Zugriff"))
+        return "ERROR"
+    if ppt_kennwort == "schreibkennwort" and ext in (".ppt", ".pps", ".pot"):
+        pbar.write("  → ÜBERSPRUNGEN: Änderungskennwort in Altformat – ohne das Kennwort "
+                   "nicht entfernbar (in PowerPoint öffnen und ohne Kennwort speichern).")
+        detail_logger.warning(f"Übersprungen (Änderungskennwort, {ext}): {display_path(original_path)}")
+        return "SKIPPED"
+
     # --- Long-Path-Behandlung ---
     if len(file_path) > MAX_PATH_LEN:
         is_temp_copy = True
@@ -2516,6 +2695,22 @@ def convert_ppt_file(
             detail_logger.debug(f"Temp-Kopie: {display_path(temp_path)}")
         except Exception as e:
             log_error(original_path, Exception(f"Long-Path-Kopie fehlgeschlagen: {e}"))
+            return "ERROR"
+
+    # --- Aenderungskennwort: Arbeitskopie ohne Kennwort ---
+    if ppt_kennwort == "schreibkennwort":
+        try:
+            os.makedirs(TEMP_PROCESS_PATH, exist_ok=True)
+            ohne = os.path.join(TEMP_PROCESS_PATH, f"ohne_kennwort_{uuid.uuid4().hex}{ext}")
+            _kopie_ohne_aenderungskennwort(file_path, ohne)
+            if is_temp_copy:
+                safe_remove(file_path)
+            file_path    = ohne
+            is_temp_copy = True
+            pbar.write("  → Änderungskennwort wird entfernt.")
+            detail_logger.info(f"Änderungskennwort entfernt (Arbeitskopie): {display_path(original_path)}")
+        except Exception as e:
+            log_error(original_path, Exception(f"Kopie ohne Änderungskennwort fehlgeschlagen: {e}"))
             return "ERROR"
 
     orig_times = None

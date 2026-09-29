@@ -764,7 +764,26 @@ function Test-IsOleEncrypted {
     }
 
     $content = [System.Text.Encoding]::ASCII.GetString($bytes) -replace '\x00',''
-    return ($content -match "EncryptedPackage" -or $content -match "EncryptionInfo")
+    if ($content -match "EncryptedPackage" -or $content -match "EncryptionInfo") { return $true }
+
+    # PowerPoint 97-2003 mit Oeffnungskennwort traegt keine dieser Marken.
+    # Erkennbar am CurrentUserAtom (Satztyp 0x0FF6, Groesse 0x14): sein
+    # headerToken ist 0xF3D1C4DF bei verschluesselter Datei, sonst 0xE391C05F
+    # (gemessen 29.09.2026 an .ppt mit/ohne Kennwort). Ohne diese Pruefung
+    # lief eine solche Datei bis zum Waechter (180 s).
+    if ($FilePath -match '\.p(pt|ot|ps)$') {
+        try {
+            $alle  = [System.IO.File]::ReadAllBytes($FilePath)
+            $text  = [System.Text.Encoding]::GetEncoding(28591).GetString($alle)
+            $treff = [regex]::Match($text, '\x00\x00\xF6\x0F[\s\S]{4}\x14\x00\x00\x00([\s\S]{4})')
+            if ($treff.Success -and $treff.Groups[1].Value -eq ([string][char]0xDF + [char]0xC4 + [char]0xD1 + [char]0xF3)) {
+                return $true
+            }
+        } catch {
+            Write-DetailedLog "PPT-Kennwortpruefung fehlgeschlagen: $FilePath - $_" "WARN"
+        }
+    }
+    return $false
 }
 
 function Test-FileIsLocked {
@@ -993,8 +1012,99 @@ function Test-IsOwnPptProcess {
     }
 }
 
+# ==================================================================
+# Dateien des Anwenders in der PowerPoint-Instanz des Skripts
+# ==================================================================
+# PowerPoint ist Einzelinstanz: oeffnet der Anwender waehrend des Laufs eine
+# Datei, landet sie in der Instanz des Skripts. Haengt gerade ein Aufruf,
+# ist COM blockiert - bis 29.09.2026 beendete der Waechter die Instanz dann
+# samt Anwenderdatei. Erkennung ueber die Fenster (gemessen 29.09.2026):
+# die Skript-Instanz hat nur den Rahmen "PPTFrameClass" mit dem Titel
+# "PowerPoint" (eigene Praesentationen sind fensterlos); oeffnet der
+# Anwender "x.pptx", heisst er "x.pptx - PowerPoint".
+function Get-PptAnwenderFenster {
+    param([int]$ProcessId)
+    if (-not ('PptAnwenderFenster' -as [type])) {
+        try {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class PptAnwenderFenster {
+    delegate bool EnumProc(IntPtr h, IntPtr p);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc f, IntPtr p);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+    public static List<string> Titel(uint ziel) {
+        var liste = new List<string>();
+        EnumWindows(delegate(IntPtr h, IntPtr p) {
+            uint pid;
+            GetWindowThreadProcessId(h, out pid);
+            if (pid == ziel) {
+                var c = new StringBuilder(64);
+                GetClassName(h, c, 64);
+                if (c.ToString() == "PPTFrameClass") {
+                    var t = new StringBuilder(512);
+                    GetWindowText(h, t, 512);
+                    var s = t.ToString().Trim();
+                    if (s.Length > 0
+                        && !s.Equals("PowerPoint", StringComparison.OrdinalIgnoreCase)
+                        && !s.Equals("Microsoft PowerPoint", StringComparison.OrdinalIgnoreCase)) {
+                        liste.Add(s);
+                    }
+                }
+            }
+            return true;
+        }, IntPtr.Zero);
+        return liste;
+    }
+}
+'@
+        } catch { return @() }
+    }
+    try { return @([PptAnwenderFenster]::Titel([uint32]$ProcessId)) } catch { return @() }
+}
+
+function Wait-PptAnwenderFertig {
+    # Vor einem Waechter-Kill: warten, solange eine Anwenderdatei offen ist.
+    # Endet der Job waehrenddessen doch noch, ist nichts mehr zu beenden.
+    param([int]$ProcessId, $Job)
+    $gemeldet = $false
+    while ($true) {
+        if ($Job -and $Job.State -ne 'Running') { return }
+        $titel = @(Get-PptAnwenderFenster -ProcessId $ProcessId)
+        if ($titel.Count -eq 0) { return }
+        if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { return }
+        if (-not $gemeldet) {
+            $m = "PowerPoint reagiert nicht, darin ist aber eine Datei des Anwenders offen " +
+                 "($($titel -join ', ')). PowerPoint wird erst beendet, wenn sie gespeichert und geschlossen ist."
+            Write-Host "  !  $m" -ForegroundColor Yellow
+            Write-DetailedLog $m "WARN"
+            $gemeldet = $true
+        }
+        Start-Sleep -Seconds 5
+    }
+}
+
+function Get-PptPidAusDatei {
+    param([string]$Datei)
+    try {
+        if ([System.IO.File]::Exists($Datei)) {
+            $t = [System.IO.File]::ReadAllText($Datei).Trim()
+            if ($t -match '^\d+$') { return [int]$t }
+        }
+    } catch { }
+    return 0
+}
+
 function Clear-TrackedPowerPointInstances {
     foreach ($id in @($script:TrackedPptPids | Select-Object -Unique)) {
+        if (@(Get-PptAnwenderFenster -ProcessId $id).Count -gt 0) {
+            Write-DetailedLog "POWERPNT.EXE PID ${id}: Datei des Anwenders offen - nicht beendet" "WARN"
+            continue
+        }
         if (Test-IsOwnPptProcess -ProcessId $id) {
             try { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
         }
@@ -1361,9 +1471,12 @@ function Convert-PptToPptx {
             $final = "$destBase$ext"
             # Beim SaveAs etwaige Open-/Modify-Passwoerter mitabraeumen, damit
             # sie nicht in die Zieldatei uebernommen werden. PowerPoint COM
-            # akzeptiert beim Open keinen Passwort-Parameter; das ReadOnly-Open
-            # umgeht ein gesetztes WritePassword und der Reset auf "" entfernt
-            # es endgueltig beim SaveAs.
+            # akzeptiert beim Open keinen Passwort-Parameter. Gemessen am
+            # 29.09.2026: eine .ppt MIT Aenderungskennwort oeffnet ReadOnly
+            # zwar ohne Abfrage, aber weder der Reset noch SaveAs/SaveCopyAs
+            # gelingen ("Presentation cannot be modified", auch mit
+            # Untitled) - sie endet hier als Fehler; entfernen laesst sich
+            # das Kennwort nur in PowerPoint mit dem Kennwort selbst.
             try { $pres.Password      = "" } catch {}
             try { $pres.WritePassword = "" } catch {}
             $pres.SaveAs($final, $format)
@@ -1413,7 +1526,15 @@ function Convert-PptToPptx {
         return $res
     } -ArgumentList $SourcePath, $DestPathBase, $OriginalExt, $script:PptConstants, $pidFile, $script:PptInstanzCode, ($script:TempPath.TrimEnd('\') + '\')
 
-    if (-not (Wait-Job $job -Timeout $script:FileOpenTimeoutSeconds)) {
+    $jobFertig = [bool](Wait-Job $job -Timeout $script:FileOpenTimeoutSeconds)
+    if (-not $jobFertig) {
+        $wartePid = Get-PptPidAusDatei $pidFile
+        if ($wartePid -gt 0 -and (Test-IsOwnPptProcess -ProcessId $wartePid)) {
+            Wait-PptAnwenderFertig -ProcessId $wartePid -Job $job
+        }
+        $jobFertig = ($job.State -ne 'Running')
+    }
+    if (-not $jobFertig) {
         Stop-Job  $job -WhatIf:$false
         Remove-Job $job -WhatIf:$false
         if ([System.IO.File]::Exists($pidFile)) {
@@ -1808,6 +1929,13 @@ function Test-PowerPointTrustCenter {
     } -ArgumentList $testPath, $pidFile, $script:PptConstants, $script:PptInstanzCode, ($TempDir.TrimEnd('\') + '\')
 
     $completed = Wait-Job $job -Timeout $TimeoutSec
+    if (-not $completed) {
+        $wartePid = Get-PptPidAusDatei $pidFile
+        if ($wartePid -gt 0 -and (Test-IsOwnPptProcess -ProcessId $wartePid)) {
+            Wait-PptAnwenderFertig -ProcessId $wartePid -Job $job
+        }
+        if ($job.State -ne 'Running') { $completed = $job }
+    }
 
     if (-not $completed) {
         try { Stop-Job   $job -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
@@ -1978,6 +2106,13 @@ try {
 }
 
 Remove-StaleTempFolders
+
+# Zuletzt verwendet: Ausgangszustand merken; am Ende verschwinden nur die
+# Verknuepfungen, die Office fuer eigene Arbeitskopien bzw. das bearbeitete
+# Verzeichnis angelegt hat (_gemeinsam.psm1). Ohne Modul bleibt alles stehen.
+if ($script:GemeinsamGeladen) {
+    try { Start-RecentMomentaufnahme; Add-RecentWurzel $TargetPath } catch { }
+}
 
 if (Test-Path -LiteralPath $script:TempPath) {
     Remove-Item -LiteralPath $script:TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
@@ -2804,6 +2939,12 @@ if ($script:LogWriter) {
 }
 
 Invoke-WindowsTempCleanup
+if ($script:GemeinsamGeladen) {
+    try {
+        $recentWeg = Remove-EigeneRecentEintraege
+        if ($recentWeg) { Write-DetailedLog "Zuletzt verwendet: $recentWeg eigene Verknuepfung(en) entfernt" "DEBUG" }
+    } catch { }
+}
 Close-Loggers
 
 if ($script:FremdePptAbbruch) {

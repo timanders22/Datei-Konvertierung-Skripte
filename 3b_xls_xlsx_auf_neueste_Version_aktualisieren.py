@@ -3052,12 +3052,8 @@ def convert_excel_file(
                 except Exception as e_ole:
                     detail_logger.debug(f"OLE-Header-Check fehlgeschlagen: {e_ole}")
             if not is_encrypted and _xls_hat_schreibkennwort(file_path):
-                pbar.write("  → ÜBERSPRUNGEN: Schreibkennwort (vorher 2b ausführen).")
-                detail_logger.warning(f"Übersprungen (Schreibkennwort): {original_path}")
-                file_logger.warning(
-                    f"Datei: {original_path}\n  -> Übersprungen (Schreibkennwort; "
-                    f"die Umwandlung haette es entfernt)\n")
-                return "SKIPPED"
+                pbar.write("  → Schreibkennwort wird bei der Umwandlung entfernt.")
+                detail_logger.info(f"Schreibkennwort wird entfernt: {original_path}")
 
         if not is_encrypted and not needs_password_check:
             passwords_to_try = [""]
@@ -3801,10 +3797,10 @@ def _xls_hat_schreibkennwort(pfad: str) -> bool:
     """BIFF8: FILESHARING-Satz (0x005B) mit Kennwort-Hash im Globals-Teil.
 
     Gemessen am 29.09.2026 mit Excel 2024: eine .xls mit
-    Schreibreservierungs-Kennwort wurde umgewandelt, und die neue .xlsx
-    trug KEIN Kennwort mehr - der Schutz verschwand stillschweigend (3a
-    erhaelt seinen Bearbeitungsschutz, 2b entfernt Schutz nur auf
-    ausdruecklichen Auftrag). Solche Dateien werden jetzt uebersprungen.
+    Schreibreservierungs-Kennwort wird schreibgeschuetzt geoeffnet und
+    umgewandelt; die neue .xlsx traegt KEIN Kennwort mehr. Das ist so
+    gewollt (Entscheidung des Anwenders vom 29.09.2026) - es wird nur
+    protokolliert, damit der Wegfall nachvollziehbar bleibt.
     """
     import struct
     try:

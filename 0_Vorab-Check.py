@@ -3039,10 +3039,10 @@ def stage2_install_pending(manifest):
 
 
 # Erwartete Herausgeber (Teilstring des Zertifikat-Betreffs) der Installer,
-# die Stage 2 mit Adminrechten startet. Tesseract (UB Mannheim) und veraPDF
-# stehen nicht darin: ihre Installer tragen, soweit bekannt, keine
-# Signatur - dann entscheidet der Administrator (siehe
-# stage2_signatur_pruefen).
+# die Stage 2 mit Adminrechten startet. Installer dieser Werkzeuge MUESSEN
+# gueltig von einem dieser Herausgeber signiert sein.
+# Tesseract (UB Mannheim) und veraPDF erscheinen unsigniert; fuer sie
+# genuegt die Pruefsumme (siehe stage2_signatur_pruefen).
 ERWARTETE_HERAUSGEBER = {
     "ghostscript": ("Artifex Software",),
     "java":        ("Eclipse.org Foundation", "Microsoft Corporation",
@@ -3079,11 +3079,13 @@ def stage2_signatur_pruefen(tool, entry):
     nur gegen Versehen. Die Authenticode-Signatur dagegen kann ein
     Standardbenutzer nicht faelschen.
 
-    - gueltig signiert von einem erwarteten Herausgeber: ausfuehren
+    Ohne Rueckfrage (Entscheidung des Anwenders vom 29.09.2026):
     - Signatur vorhanden, aber ungueltig (veraendert, widerrufen ...): Abbruch
-    - unsigniert oder fremder Herausgeber: nur nach ausdruecklicher
-      Bestaetigung im Admin-Fenster (mit Pruefsumme); ohne Konsole Abbruch,
-      mit --yes gilt die Bestaetigung als erteilt.
+    - Werkzeug mit erwartetem Herausgeber (Ghostscript, Java): nur gueltig
+      von diesem signiert; unsigniert oder fremd signiert -> Abbruch (diese
+      Installer sind ab Werk signiert, eine Abweichung ist ein Austausch)
+    - uebrige Werkzeuge (Tesseract, veraPDF): unsigniert oder gueltig
+      signiert -> ausfuehren; Herausgeber und SHA-256 stehen im Protokoll
     Geprueft werden die Installer, die Stage 2 selbst startet (.exe/.msi);
     kopierte Einzelprogramme und pywin32 bleiben aussen vor.
     """
@@ -3095,22 +3097,26 @@ def stage2_signatur_pruefen(tool, entry):
     name = os.path.basename(pfad)
     status, betreff = _authenticode(pfad) if tool != "verapdf" else ("NotSigned", "")
     erwartet = ERWARTETE_HERAUSGEBER.get(tool, ())
-    if status == "Valid" and any(h.lower() in betreff.lower() for h in erwartet):
-        log_info(f"   🔏 Signatur gültig: {name} ({betreff.split(',')[0]})")
-        return True
+    herausgeber = betreff.split(",")[0]
     if status not in ("Valid", "NotSigned"):
         log_err(f"   ❌ Signatur von {name} ungültig ({status or 'nicht prüfbar'}) – "
                 f"Ausführung abgebrochen.")
         return False
-    grund = (f"gültig signiert, aber von unerwartetem Herausgeber: {betreff.split(',')[0]}"
-             if status == "Valid" else "nicht signiert")
-    log_warn(f"   ⚠️ {name}: {grund}.")
-    log_warn(f"      SHA-256: {sha256_of(pfad)}")
-    if ask(f"   {name} trotzdem mit Adminrechten ausführen? (j/N): ", default=False):
-        log_info("   → vom Administrator bestätigt.")
-        return True
-    log_err(f"   ❌ {name} nicht ausgeführt (keine Bestätigung).")
-    return False
+    if erwartet:
+        if status == "Valid" and any(h.lower() in betreff.lower() for h in erwartet):
+            log_info(f"   🔏 Signatur gültig: {name} ({herausgeber})")
+            return True
+        grund = (f"von unerwartetem Herausgeber signiert ({herausgeber})"
+                 if status == "Valid" else "nicht signiert")
+        log_err(f"   ❌ {name} ist {grund}; erwartet: {', '.join(erwartet)} – "
+                f"Ausführung abgebrochen.")
+        return False
+    if status == "Valid":
+        log_info(f"   🔏 Signatur gültig: {name} ({herausgeber})")
+    else:
+        log_info(f"   ℹ️ {name} ist nicht signiert (für {tool} üblich) – "
+                 f"geprüft über SHA-256 {sha256_of(pfad)}")
+    return True
 
 
 def _stage2_eintrag_ausfuehren(tool, entry):

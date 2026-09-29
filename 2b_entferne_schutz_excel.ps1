@@ -2027,6 +2027,13 @@ if (-not (Show-OfficeRunningWarning -Silent:$NoInteractive)) { exit 0 }
 
 Remove-StaleTempFolders
 
+# Zuletzt verwendet: Ausgangszustand merken; am Ende verschwinden nur die
+# Verknuepfungen, die Office fuer eigene Arbeitskopien bzw. das bearbeitete
+# Verzeichnis angelegt hat (_gemeinsam.psm1). Ohne Modul bleibt alles stehen.
+if ($script:GemeinsamGeladen) {
+    try { Start-RecentMomentaufnahme; Add-RecentWurzel $TargetPath } catch { }
+}
+
 if (Test-Path -LiteralPath $TempPath) {
     Remove-Item -LiteralPath $TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
 }
@@ -2804,6 +2811,12 @@ if ($script:LogWriter) {
     }
 }
 Sync-LogWriters
+if ($script:GemeinsamGeladen) {
+    try {
+        $recentWeg = Remove-EigeneRecentEintraege
+        if ($recentWeg) { Write-DetailedLog "Zuletzt verwendet: $recentWeg eigene Verknuepfung(en) entfernt" "DEBUG" }
+    } catch { }
+}
 Invoke-WindowsTempCleanup
 Close-LogWriters
 

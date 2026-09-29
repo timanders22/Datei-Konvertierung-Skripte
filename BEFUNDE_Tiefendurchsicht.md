@@ -77,7 +77,8 @@ Excel-COM war verfuegbar und wurde benutzt (Kennwortverhalten von `SaveAs`,
 > Am Abend folgte eine Durchsicht mit neun kritischen Pruefagenten
 > (rund 95 Meldungen, nachgeprueft, behoben, alle Office-Skripte erneut am
 > echten Office getestet) - siehe Abschnitt 11. In der Nacht wurden die
-> dort offenen Punkte umgesetzt und gemessen - siehe Abschnitt 12.
+> dort offenen Punkte umgesetzt und gemessen - siehe Abschnitt 12, die
+> Rueckmeldung des Anwenders dazu in Abschnitt 13.
 
 **Empfehlung:** Erster Lauf je Skript mit `-WhatIf` bzw. `--dry-run` auf
 einem Testbestand, nicht auf Q:/R:. Die Probelauf-Pfade wurden in dieser
@@ -766,6 +767,46 @@ startet. Beim Anwender tritt die Falle nicht auf.
   ihre (geloeschten) Arbeitskopien.
 - 0 Stage 2 mit `--yes`: die Bestaetigung fuer unsignierte Installer gilt
   als erteilt (Tesseract und veraPDF sind unsigniert).
+
+Diese Punkte und die Entscheidung zu 3b sind in Abschnitt 13 nachgearbeitet.
+
+---
+
+### 13. Nachtrag 30.09.2026: Rueckmeldung des Anwenders zu Abschnitt 12
+
+**Entscheidungen:**
+
+- **Schreibkennwoerter werden entfernt.** 3b entfernt das Schreib-
+  reservierungs-Kennwort einer .xls beim Umwandeln (so war es schon; das
+  Ueberspringen aus Abschnitt 12 ist zurueckgenommen, der Wegfall steht jetzt
+  im Protokoll). 3c entfernt Aenderungskennwoerter in .pptx & Co. ueber eine
+  Arbeitskopie ohne `<p:modifyVerifier>` (wie 2c).
+- **Stage 2 ohne Rueckfrage.** Ghostscript und Java muessen gueltig vom
+  erwarteten Herausgeber signiert sein (sonst Abbruch - diese Installer sind
+  ab Werk signiert); Tesseract und veraPDF laufen unsigniert, die Pruefsumme
+  steht im Protokoll; eine gebrochene Signatur bricht immer ab. 8/8 Faelle.
+- **Word "Zuletzt verwendet" wieder auf 50** gesetzt (per Word selbst; die
+  Liste war vollstaendig erhalten). Die 28 Eintraege, die meine Testlaeufe am
+  29.09. dort hinterlassen hatten (Arbeitskopien von 7, 4a, 3a), sind
+  entfernt; nichts anderes.
+
+**Behoben:**
+
+| Punkt | Umsetzung | Beleg |
+|---|---|---|
+| PowerPoint-Waechter traefe eine Anwenderdatei | 2c/3c/4c pruefen vor dem Beenden die Fenster der Instanz: die Skript-Instanz hat nur den Rahmen "PowerPoint" (eigene Praesentationen fensterlos), eine Anwenderdatei macht daraus "x.pptx - PowerPoint". Dann wartet der Waechter mit Hinweis, bis die Datei geschlossen ist; kehrt der Aufruf vorher zurueck, entfaellt das Beenden ganz. Aufraeum-Kills am Laufende entfallen in dem Fall. | Echtes PowerPoint mit offener Anwenderdatei und kuenstlich haengendem Aufruf: 3c/4c 4/4, 2c 2/2. Gemessen dazu: waehrend eines modalen Dialogs (Kennwortabfrage) oeffnet PowerPoint gar keine Anwenderdatei. |
+| 2a/2b/2c hinterliessen Recent-Eintraege | `_gemeinsam.psm1`: Momentaufnahme beim Start, am Ende nur neue Verknuepfungen auf eigene Pfade entfernen (auch 8.3-Kurzform von %TEMP%). Ebenso in **7** (13 je Lauf). | Regression: 2a/2b/2c/7 hinterlassen 0; Einzeltest 5/5. |
+| 7 fuellte Words Liste | `Documents.Open`/`SaveAs2` ohne `AddToRecentFiles=False` (21 Eintraege gefunden). | Nach einem 7-Lauf 28 -> 28. |
+| .ppt / .xlsb: Kennwoerter nicht vorab erkannt | .xlsb: Satz BrtFileSharingIso (0x2A4) bzw. 0x224 mit Hash in `xl/workbook.bin`; verschluesselt = CFB. .ppt: Oeffnungskennwort -> msoffcrypto; Aenderungskennwort ist in .ppt eine Verschluesselung mit festem Standardkennwort (entschluesselbar, daran erkannt). 2c (PowerShell) erkennt das Oeffnungskennwort am headerToken des CurrentUserAtom (0xF3D1C4DF). | 4b: .xlsb 4/4 richtig; 3c/4c: .ppt 4/4; 2c: pw.ppt sofort statt nach 180 s. |
+| 3c: aendpw.pptx | Vorher kein Waechter, sondern dreimal "SaveAs : Failed". Jetzt Arbeitskopie ohne Kennwort -> umgewandelt, Kennwort weg. Oeffnungskennwort -> sofort uebersprungen. | tp2: aendpw.pptx ohne modifyVerifier, pw.ppt unveraendert. |
+
+**Gemessen und nicht behebbar:** Eine **.ppt mit Aenderungskennwort** kann
+PowerPoint ohne das Kennwort nicht speichern - schreibgeschuetzt oeffnen geht,
+aber SaveAs, SaveCopyAs und das Leeren von WritePassword scheitern ("Presentation
+cannot be modified"), auch mit `Untitled`. Die mit msoffcrypto entschluesselte
+Datei lehnt PowerPoint als beschaedigt ab. 3c und 4c ueberspringen sie sofort
+mit Hinweis, 2c meldet einen Fehler (ohne Wartezeit). Der gegenteilige
+Kommentar in 2c ist berichtigt.
 
 ---
 
