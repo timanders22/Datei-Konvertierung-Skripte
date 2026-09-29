@@ -3038,10 +3038,91 @@ def stage2_install_pending(manifest):
     print("")
 
 
+# Erwartete Herausgeber (Teilstring des Zertifikat-Betreffs) der Installer,
+# die Stage 2 mit Adminrechten startet. Tesseract (UB Mannheim) und veraPDF
+# stehen nicht darin: ihre Installer tragen, soweit bekannt, keine
+# Signatur - dann entscheidet der Administrator (siehe
+# stage2_signatur_pruefen).
+ERWARTETE_HERAUSGEBER = {
+    "ghostscript": ("Artifex Software",),
+    "java":        ("Eclipse.org Foundation", "Microsoft Corporation",
+                    "Oracle America", "Azul Systems", "Amazon.com Services",
+                    "BellSoft"),
+}
+
+
+def _authenticode(pfad):
+    """(Status, Herausgeber) laut Get-AuthenticodeSignature, oder (None, '')."""
+    env = dict(os.environ)
+    # Pfad ueber die Umgebung, nicht in den Befehlstext: kein Quoting-Risiko.
+    env["OCR_SIGNATUR_PFAD"] = pfad
+    befehl = ("$s = Get-AuthenticodeSignature -LiteralPath $env:OCR_SIGNATUR_PFAD; "
+              "\"$($s.Status)|$($s.SignerCertificate.Subject)\"")
+    try:
+        r = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", befehl],
+            capture_output=True, timeout=60, env=env, startupinfo=get_startupinfo())
+        zeile = r.stdout.decode("utf-8", errors="replace").strip().splitlines()
+        if r.returncode != 0 or not zeile:
+            return None, ""
+        status, _, betreff = zeile[-1].partition("|")
+        return status.strip(), betreff.strip()
+    except Exception as e:
+        logging.debug(f"_authenticode: {e!r}")
+        return None, ""
+
+
+def stage2_signatur_pruefen(tool, entry):
+    """Schliesst die Luecke "Installer und Pruefsumme stammen aus dem
+    Benutzerkontext" (Befund 29.09.2026): die Pruefsumme im Manifest
+    schreibt dasselbe Konto, das auch den Installer ablegt - sie schuetzt
+    nur gegen Versehen. Die Authenticode-Signatur dagegen kann ein
+    Standardbenutzer nicht faelschen.
+
+    - gueltig signiert von einem erwarteten Herausgeber: ausfuehren
+    - Signatur vorhanden, aber ungueltig (veraendert, widerrufen ...): Abbruch
+    - unsigniert oder fremder Herausgeber: nur nach ausdruecklicher
+      Bestaetigung im Admin-Fenster (mit Pruefsumme); ohne Konsole Abbruch,
+      mit --yes gilt die Bestaetigung als erteilt.
+    Geprueft werden die Installer, die Stage 2 selbst startet (.exe/.msi);
+    kopierte Einzelprogramme und pywin32 bleiben aussen vor.
+    """
+    if tool in ("ocr_binary", "pywin32_post"):
+        return True
+    pfad = entry.get("installer") or ""
+    if tool != "verapdf" and not pfad.lower().endswith((".exe", ".msi")):
+        return True
+    name = os.path.basename(pfad)
+    status, betreff = _authenticode(pfad) if tool != "verapdf" else ("NotSigned", "")
+    erwartet = ERWARTETE_HERAUSGEBER.get(tool, ())
+    if status == "Valid" and any(h.lower() in betreff.lower() for h in erwartet):
+        log_info(f"   🔏 Signatur gültig: {name} ({betreff.split(',')[0]})")
+        return True
+    if status not in ("Valid", "NotSigned"):
+        log_err(f"   ❌ Signatur von {name} ungültig ({status or 'nicht prüfbar'}) – "
+                f"Ausführung abgebrochen.")
+        return False
+    grund = (f"gültig signiert, aber von unerwartetem Herausgeber: {betreff.split(',')[0]}"
+             if status == "Valid" else "nicht signiert")
+    log_warn(f"   ⚠️ {name}: {grund}.")
+    log_warn(f"      SHA-256: {sha256_of(pfad)}")
+    if ask(f"   {name} trotzdem mit Adminrechten ausführen? (j/N): ", default=False):
+        log_info("   → vom Administrator bestätigt.")
+        return True
+    log_err(f"   ❌ {name} nicht ausgeführt (keine Bestätigung).")
+    return False
+
+
 def _stage2_eintrag_ausfuehren(tool, entry):
     if not verify_staged_entry(entry):
         STATE["manual_actions"].append(
             f"'{tool}' wurde NICHT installiert (Prüfsumme/Datei ungültig) – Stage 1 erneut ausführen."
+        )
+        return
+    if not stage2_signatur_pruefen(tool, entry):
+        STATE["manual_actions"].append(
+            f"'{tool}' wurde NICHT installiert (Signatur ungültig oder nicht bestätigt) "
+            f"– Installer prüfen und Stage 1 erneut ausführen."
         )
         return
     if tool == "verapdf":

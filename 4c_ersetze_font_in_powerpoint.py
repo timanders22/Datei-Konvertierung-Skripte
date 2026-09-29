@@ -27,7 +27,7 @@
 # 3. VERTRAUENSWÜRDIGE SPEICHERORTE:
 #    ☑ Vertrauenswürdige Speicherorte im Netzwerk zulassen
 #    Folgende Speicherorte hinzufügen:
-#    • C:\Users\<Benutzername>\Documents (temporärer Arbeitsordner des Skripts)
+#    • %LOCALAPPDATA%\Dateimigration-Arbeitskopien (temporärer Arbeitsordner des Skripts)
 #    • Q:\ oder \\server\dfs (Quelldateien)
 #    Jeweils: ☑ Unterordner ... sind ebenfalls vertrauenswürdig
 #
@@ -119,6 +119,35 @@ try:
 except Exception:
     gem = None
 
+# Zuletzt verwendet: Ausgangszustand merken, damit spaeter nur die
+# eigenen Eintraege verschwinden (siehe _cleanup_user_recent).
+if gem is not None and hasattr(gem, "recent_momentaufnahme"):
+    gem.recent_momentaufnahme()
+
+# Symbolschriften (Wingdings, Symbol ...) werden nie ersetzt: dort steht
+# hinter jedem Zeichencode ein Bild, und aus einem Haekchen wuerde in Arial
+# ein Buchstabe. Erkennung in _gemeinsam.py (feste Liste plus alle
+# installierten Schriften mit Symbolzeichensatz); fehlt es, gilt diese Liste.
+_SYMBOLSCHRIFTEN_RUECKFALL = (
+    "Symbol", "Wingdings", "Wingdings 2", "Wingdings 3", "Webdings",
+    "Marlett", "MT Extra", "Bookshelf Symbol 7", "MS Reference Specialty",
+    "MS Outlook", "ZapfDingbats", "Zapf Dingbats", "Segoe MDL2 Assets",
+    "Segoe Fluent Icons",
+)
+
+
+def _symbolschrift_namen() -> list:
+    if gem is not None and hasattr(gem, "symbolschrift_namen"):
+        return gem.symbolschrift_namen()
+    return list(_SYMBOLSCHRIFTEN_RUECKFALL)
+
+
+def _ist_symbolschrift(name) -> bool:
+    if gem is not None and hasattr(gem, "ist_symbolschrift"):
+        return gem.ist_symbolschrift(name)
+    return bool(name) and str(name).strip().lower() in {
+        n.lower() for n in _SYMBOLSCHRIFTEN_RUECKFALL}
+
 import pythoncom
 import win32com.client
 import win32file
@@ -137,6 +166,7 @@ COM_TRUE  = -1
 COM_FALSE =  0
 
 MSO_TYPE_GROUP = 6
+MSO_TYPE_TEXT_EFFECT = 15      # klassisches WordArt
 
 PP_FORMAT_PPTX = 24
 PP_FORMAT_PPTM = 25
@@ -308,9 +338,14 @@ def resolve_downloads_folder() -> str:
 # ==================================================================
 # Abgeleitete Pfade (zur Importzeit aufgelöst)
 # ==================================================================
-TEMP_BASE_PATH = os.path.join(
-    resolve_documents_folder(), "4c_ersetze_font_in_powerpoint"
-)
+# Gemeinsamer Arbeitsordner der Office-Skripte. Bis 29.09.2026 lag er in
+# "Dokumente"; bei OneDrive-Ordnersicherung wanderte so jede Arbeitskopie
+# in die Cloud. %LOCALAPPDATA% wird nie umgeleitet.
+ARBEITS_BASIS = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP")
+    or resolve_documents_folder(),
+    "Dateimigration-Arbeitskopien")
+TEMP_BASE_PATH = os.path.join(ARBEITS_BASIS, "4c_ersetze_font_in_powerpoint")
 # Run-spezifischer Unterordner (UUID) erlaubt parallele Laeufe. Als
 # vertrauenswuerdiger Speicherort wird der stabile TEMP_BASE_PATH
 # eingetragen (mit Unterordnern).
@@ -1203,72 +1238,24 @@ def _cleanup_ppt_inetcache() -> None:
 
 
 def _cleanup_user_recent() -> None:
-    """Raeumt den Windows-Recent-Ordner (%USERPROFILE%\\Recent) auf.
-
-    Hier liegen .lnk-Verknuepfungen aller kuerzlich geoeffneten Dateien
-    (nicht nur PowerPoint). Nur .lnk-Dateien werden geloescht.
-
-    BEWUSSTE DESIGN-ENTSCHEIDUNG: Verknuepfungen sind systemweit, nicht
-    nur PowerPoint. Akzeptabel im Kontext eines Massen-Verarbeitungs-Skripts.
-    """
-    # Seit Windows Vista liegt der Recent-Ordner unter
-    # %APPDATA%\Microsoft\Windows\Recent. %USERPROFILE%\Recent ist nur
-    # noch eine Kompatibilitaets-Junction mit Deny-List-ACL (Auflisten
-    # wirft PermissionError) und dient hier lediglich als Fallback.
-    candidates = []
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        candidates.append(
-            os.path.join(appdata, "Microsoft", "Windows", "Recent"))
-    user_profile = os.environ.get("USERPROFILE")
-    if user_profile:
-        candidates.append(os.path.join(user_profile, "Recent"))
-
-    recent_dir = None
-    for cand in candidates:
-        if cand.lower().endswith(os.sep + "recent") and os.path.isdir(cand):
-            recent_dir = cand
-            break
-    if recent_dir is None:
+    # Bis 29.09.2026 loeschte diese Funktion JEDE Verknuepfung im
+    # Windows-Ordner "Zuletzt verwendet" - auch die des Anwenders. Jetzt
+    # entfernt sie nur Verknuepfungen, die seit dem Skriptstart entstanden
+    # sind und auf das bearbeitete Verzeichnis oder den Arbeitsordner
+    # zeigen (_gemeinsam.recent_eigene_entfernen). Ohne _gemeinsam.py
+    # bleibt der Ordner unangetastet.
+    entfernen = getattr(gem, "recent_eigene_entfernen", None)
+    if entfernen is None:
         return
-
-    files_deleted = 0
-    files_skipped = 0
-    bytes_freed   = 0
-
     try:
-        for entry in os.listdir(recent_dir):
-            if not entry.lower().endswith(".lnk"):
-                continue
-            fpath = os.path.join(recent_dir, entry)
-            if not os.path.isfile(fpath):
-                continue
-            try:
-                fsize = os.path.getsize(fpath)
-            except OSError:
-                fsize = 0
-            try:
-                try:
-                    os.chmod(fpath, stat.S_IWRITE)
-                except Exception as _e:
-                    detail_logger.debug(f"_cleanup_user_recent: Exception verworfen: {_e!r}")
-                os.remove(fpath)
-                files_deleted += 1
-                bytes_freed   += fsize
-            except (OSError, PermissionError) as e:
-                files_skipped += 1
-                detail_logger.debug(
-                    f"Recent: .lnk gesperrt, uebersprungen: {fpath} ({e})")
+        geloescht, gesperrt = entfernen()
     except Exception as e:
         detail_logger.debug(f"Recent-Cleanup unerwarteter Fehler: {e}")
         return
-
-    if files_deleted > 0 or files_skipped > 0:
-        kb = bytes_freed / 1024
+    if geloescht or gesperrt:
         detail_logger.info(
-            f"Windows-Recent aufgeraeumt: "
-            f"{files_deleted} .lnk-Dateien geloescht ({kb:.1f} KB), "
-            f"{files_skipped} gesperrt/uebersprungen")
+            f"Windows-Recent: {geloescht} eigene Verknuepfung(en) entfernt, "
+            f"{gesperrt} gesperrt/uebersprungen")
 
 
 # Whitelist fuer den Windows-Temp-Cleanup: NUR Eintraege mit diesen
@@ -1958,6 +1945,49 @@ def ask_metadata_detail() -> dict:
 # ==================================================================
 
 
+def _ppt_kennwort_grund(path: str) -> str:
+    """'' wenn PowerPoint die Datei ohne Kennwortabfrage oeffnet, sonst den Grund.
+
+    Die COM-Schnittstelle kennt keinen Kennwort-Parameter: gemessen am
+    29.09.2026 mit PowerPoint 2024 hing eine Praesentation mit
+    Aenderungskennwort bis zum Waechter (180 s plus Neustart).
+    - Verschluesselt: OOXML-Datei im CFB-Container statt ZIP; .ppt ueber
+      msoffcrypto (falls installiert).
+    - Aenderungskennwort: <p:modifyVerifier> in ppt/presentation.xml.
+    """
+    import re
+    import zipfile
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        lp = _long_path(path)
+        with open(lp, "rb") as f:
+            kopf = f.read(8)
+        ist_cfb = kopf.startswith(b"\xD0\xCF\x11\xE0")
+        if ext in (".ppt", ".pps", ".pot"):
+            if not ist_cfb:
+                return ""
+            try:
+                import msoffcrypto
+            except ImportError:
+                return ""
+            with open(lp, "rb") as f:
+                return "verschluesselt" if msoffcrypto.OfficeFile(f).is_encrypted() else ""
+        if ist_cfb:
+            return "verschluesselt"
+        if not kopf.startswith(b"PK"):
+            return ""
+        with zipfile.ZipFile(lp) as z:
+            try:
+                xml = z.read("ppt/presentation.xml").decode("utf-8", errors="ignore")
+            except KeyError:
+                return ""
+        if re.search(r"<(?:\w+:)?modifyVerifier\b", xml):
+            return "schreibkennwort"
+    except Exception as _e:
+        detail_logger.debug(f"_ppt_kennwort_grund: {_e!r}")
+    return ""
+
+
 def dry_run_directory(directory: str) -> dict:
     """Listet auf, was der Echtlauf tun WUERDE - insbesondere welche
     .ppt/.pps/.pot konvertiert (und deren Originale ersetzt) wuerden.
@@ -1965,10 +1995,10 @@ def dry_run_directory(directory: str) -> dict:
     nicht gestartet. Identisch aufgebaut zu 4a/4b.
 
     PowerPoint-Besonderheit: Die COM-Schnittstelle kennt keinen
-    Password-Parameter, verschluesselte Dateien laufen im Echtlauf in
-    einen Timeout. Ein zuverlaessiger Vorab-Check dafuer existiert hier
-    nicht, daher entfaellt die Kategorie VERSCHLUESSELT."""
-    stats = {"VERARBEITEN": 0, "KONVERTIEREN": 0, "GESPERRT": 0}
+    Password-Parameter; Dateien mit Kennwort erkennt _ppt_kennwort_grund
+    vorab (seit 29.09.2026), der Echtlauf ueberspringt sie."""
+    stats = {"VERARBEITEN": 0, "KONVERTIEREN": 0, "GESPERRT": 0,
+             "KENNWORT": 0}
     print("\nPROBELAUF – es wird nichts geändert.\n")
     print("-" * 66)
     for file_path in file_generator(directory):
@@ -1976,6 +2006,9 @@ def dry_run_directory(directory: str) -> dict:
         if _is_locked_by_other_user(file_path):
             stats["GESPERRT"] += 1
             tag = "GESPERRT     "
+        elif _ppt_kennwort_grund(file_path):
+            stats["KENNWORT"] += 1
+            tag = "KENNWORT     "
         elif ext in (".ppt", ".pps", ".pot"):
             stats["KONVERTIEREN"] += 1
             tag = "KONVERTIEREN "
@@ -1990,6 +2023,7 @@ def dry_run_directory(directory: str) -> dict:
     print( "    Würden konvertiert (.ppt/.pps/.pot → neu,")
     print(f"                        Original ersetzt!):  {stats['KONVERTIEREN']}")
     print(f"    Gesperrt (würden übersprungen):          {stats['GESPERRT']}")
+    print(f"    Kennwortgeschützt (würden übersprungen): {stats['KENNWORT']}")
     print(f"    GESAMT:                                  {sum(stats.values())}")
     return stats
 
@@ -2069,10 +2103,76 @@ def file_generator(directory: str, skip_paths: Optional[set] = None):
 # Shape-Schriftart setzen (rekursiv, mit Tiefenlimit)
 # ==================================================================
 
+# Bis 29.09.2026 setzte 4c die Zielschrift pauschal auf jeden Textrahmen -
+# auch ueber Text in Wingdings/Symbol; aus einem Haekchen wurde ein "ü".
+# Jetzt werden Textrahmen abschnittsweise (Runs) bearbeitet und Abschnitte
+# in Symbolschrift bleiben stehen.
+
+def _com_eigenschaft(obj, name: str, *args):
+    """Eigenschaft MIT Argumenten (Runs, Characters) in spaeter Bindung.
+
+    Gemessen am 29.09.2026 (Excel, gleiche Office-Typbibliothek):
+    TextRange2.Runs(1) wirft "Auflistung nicht unterstuetzt"; die Get-Form
+    reicht die Argumente richtig durch.
+    """
+    try:
+        methode = getattr(obj, "Get" + name)
+    except AttributeError:
+        methode = getattr(obj, name)
+    return methode(*args)
+
+
+def _font_name_setzen(font, font_name: str) -> None:
+    """Setzt font.Name, ausser die bisherige Schrift ist eine Symbolschrift."""
+    try:
+        if _ist_symbolschrift(font.Name):
+            return
+    except Exception as _e:
+        detail_logger.debug(f"_font_name_setzen: Exception verworfen: {_e!r}")
+    font.Name = font_name
+
+
+def _textrange_setzen(tr, font_name: str) -> None:
+    """PowerPoint-TextRange: Abschnitte in Symbolschrift bleiben stehen."""
+    try:
+        name = tr.Font.Name
+    except Exception:
+        name = ""
+    if name:
+        if not _ist_symbolschrift(name):
+            tr.Font.Name = font_name
+        return
+    if tr.Length == 0:
+        tr.Font.Name = font_name
+        return
+    for run in tr.Runs():
+        try:
+            if not _ist_symbolschrift(run.Font.Name):
+                run.Font.Name = font_name
+        except Exception as _e:
+            detail_logger.debug(f"_textrange_setzen: Exception verworfen: {_e!r}")
+
+
+def _textrange2_setzen(tr, font_name: str) -> None:
+    """TextRange2 (SmartArt): wie _textrange_setzen, Runs ueber GetRuns."""
+    name = tr.Font.Name
+    if name:
+        if not _ist_symbolschrift(name):
+            tr.Font.Name = font_name
+        return
+    for i in range(1, tr.Runs.Count + 1):
+        try:
+            run = _com_eigenschaft(tr, "Runs", i, 1)
+            if not _ist_symbolschrift(run.Font.Name):
+                run.Font.Name = font_name
+        except Exception as _e:
+            detail_logger.debug(f"_textrange2_setzen: Exception verworfen: {_e!r}")
+
+
 def _set_chart_fonts(chart, font_name: str) -> None:
     try:
         if chart.HasTitle:
-            chart.ChartTitle.Characters().Font.Name = font_name
+            _font_name_setzen(chart.ChartTitle.Characters().Font, font_name)
     except Exception as _e:
         detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
@@ -2082,11 +2182,11 @@ def _set_chart_fonts(chart, font_name: str) -> None:
                 ax = chart.Axes(axis_type, axis_group)
                 try:
                     if ax.HasTitle:
-                        ax.AxisTitle.Characters().Font.Name = font_name
+                        _font_name_setzen(ax.AxisTitle.Characters().Font, font_name)
                 except Exception as _e:
                     detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
                 try:
-                    ax.TickLabels.Font.Name = font_name
+                    _font_name_setzen(ax.TickLabels.Font, font_name)
                 except Exception as _e:
                     detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
             except Exception as _e:
@@ -2094,7 +2194,7 @@ def _set_chart_fonts(chart, font_name: str) -> None:
 
     try:
         if chart.HasLegend:
-            chart.Legend.Font.Name = font_name
+            _font_name_setzen(chart.Legend.Font, font_name)
     except Exception as _e:
         detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
@@ -2102,14 +2202,14 @@ def _set_chart_fonts(chart, font_name: str) -> None:
         for series in chart.SeriesCollection():
             try:
                 if series.HasDataLabels:
-                    series.DataLabels().Font.Name = font_name
+                    _font_name_setzen(series.DataLabels().Font, font_name)
             except Exception as _e:
                 detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
             try:
                 for trendline in series.Trendlines():
                     try:
                         if trendline.HasLabel:
-                            trendline.DataLabel.Font.Name = font_name
+                            _font_name_setzen(trendline.DataLabel.Font, font_name)
                     except Exception as _e:
                         detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
             except Exception as _e:
@@ -2118,15 +2218,24 @@ def _set_chart_fonts(chart, font_name: str) -> None:
         detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     try:
-        chart.ChartArea.Font.Name = font_name
+        _font_name_setzen(chart.ChartArea.Font, font_name)
     except Exception as _e:
         detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
 
 def _set_wordart_font(shape, font_name: str) -> bool:
+    # Nur klassisches WordArt. TextEffect gibt es bei JEDER Form mit Text;
+    # TextEffect.FontName stellte bis 29.09.2026 den ganzen Rahmen auf einmal
+    # um - samt Abschnitten in Symbolschrift, die _textrange_setzen danach
+    # nicht mehr retten konnte. Textrahmen bearbeitet _process_shape_font.
+    try:
+        if shape.Type != MSO_TYPE_TEXT_EFFECT:
+            return False
+    except Exception:
+        return False
     try:
         tef = shape.TextEffect
-        if tef is not None:
+        if tef is not None and not _ist_symbolschrift(tef.FontName):
             tef.FontName = font_name
             detail_logger.debug("WordArt-Font gesetzt")
             return True
@@ -2150,18 +2259,8 @@ def _process_shape_font(shape, font_name: str, depth: int = 0) -> None:
 
         # --- Textrahmen ---
         if shape.HasTextFrame:
-            tr = shape.TextFrame.TextRange
             try:
-                tr.Font.Name = font_name
-            except Exception as _e:
-                detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
-            try:
-                if tr.Length > 0:
-                    for run in tr.Runs():
-                        try:
-                            run.Font.Name = font_name
-                        except Exception as _e:
-                            detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
+                _textrange_setzen(shape.TextFrame.TextRange, font_name)
             except Exception as _e:
                 detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
 
@@ -2174,18 +2273,8 @@ def _process_shape_font(shape, font_name: str, depth: int = 0) -> None:
                         try:
                             cell = tbl.Cell(row, col)
                             if cell.Shape.HasTextFrame:
-                                tr = cell.Shape.TextFrame.TextRange
                                 try:
-                                    tr.Font.Name = font_name
-                                except Exception as _e:
-                                    detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
-                                try:
-                                    if tr.Length > 0:
-                                        for run in tr.Runs():
-                                            try:
-                                                run.Font.Name = font_name
-                                            except Exception as _e:
-                                                detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
+                                    _textrange_setzen(cell.Shape.TextFrame.TextRange, font_name)
                                 except Exception as _e:
                                     detail_logger.debug(f"_process_shape_font: Exception verworfen: {_e!r}")
                         except Exception as _e:
@@ -2215,7 +2304,7 @@ def _process_shape_font(shape, font_name: str, depth: int = 0) -> None:
                     try:
                         tf2 = node.TextFrame2
                         if tf2 is not None:
-                            tf2.TextRange.Font.Name = font_name
+                            _textrange2_setzen(tf2.TextRange, font_name)
                             font_set = True
                     except Exception as _e:
                         detail_logger.debug(f"_process_smartart_node: Exception verworfen: {_e!r}")
@@ -2223,7 +2312,7 @@ def _process_shape_font(shape, font_name: str, depth: int = 0) -> None:
                         try:
                             tf = node.TextFrame
                             if tf is not None:
-                                tf.TextRange.Font.Name = font_name
+                                _textrange_setzen(tf.TextRange, font_name)
                                 font_set = True
                         except Exception as _e:
                             detail_logger.debug(f"_process_smartart_node: Exception verworfen: {_e!r}")
@@ -2372,6 +2461,14 @@ def replace_fonts_in_presentation(
                    f"{os.path.basename(original_path)}")
         detail_logger.info(
             f"Übersprungen (Sperrdatei anderes Nutzers): {original_path}")
+        return "SKIPPED"
+
+    _grund = _ppt_kennwort_grund(original_path)
+    if _grund:
+        _text = "verschlüsselt" if _grund == "verschluesselt" else "Änderungskennwort"
+        pbar.write(f"  ->  ÜBERSPRUNGEN ({_text}): "
+                   f"{os.path.basename(original_path)}")
+        detail_logger.info(f"Übersprungen ({_text}): {original_path}")
         return "SKIPPED"
 
     orig_atime, orig_mtime, orig_ctime = get_file_timestamps(original_path)
@@ -3091,6 +3188,26 @@ def process_directory(
         with tqdm(total=total, desc="Verarbeite", unit="Datei",
                   bar_format=bar_fmt, disable=not show_progress) as pbar:
             for file_path in iterable:
+                # Einzelinstanz: oeffnet der Anwender waehrend des Laufs eine
+                # Praesentation, landet sie in der Instanz des Skripts (dort
+                # sind Warnhinweise abgeschaltet, und der Waechter wuerde sie
+                # bei einer Zeitueberschreitung mit beenden). Zwischen zwei
+                # Dateien ist keine eigene Praesentation offen - alles, was
+                # jetzt offen ist, gehoert dem Anwender. Bis 29.09.2026
+                # arbeitete 4c dann weiter (nur der Neustart entfiel); jetzt
+                # endet der Lauf wie in 3c, und das finally unten laesst die
+                # Instanz offen (_quit_ppt_instance beendet nichts, solange
+                # etwas offen ist).
+                if ppt is not None:
+                    _offen = _offene_praesentationen(ppt)
+                    if _offen:
+                        meldung = (f"{_offen} Praesentation(en) des Anwenders in der "
+                                   f"PowerPoint-Instanz des Skripts geoeffnet - Lauf wird "
+                                   f"beendet, PowerPoint bleibt offen.")
+                        pbar.write(f"  ⚠  {meldung}")
+                        detail_logger.warning(meldung)
+                        _abbruch_fremde_sitzung = True
+                        break
                 try:
                     # --- Geplanter Restart ---
                     # Nur wenn _quit_ppt_instance wirklich beendet hat: sind
@@ -3575,6 +3692,8 @@ if __name__ == "__main__":
     stats_result = None
 
     try:
+        if gem is not None and hasattr(gem, "recent_wurzel_hinzufuegen"):
+            gem.recent_wurzel_hinzufuegen(start_dir)
         stats_result = process_directory(
             start_dir, font_name, metadata_selected, count_first, done_set,
             show_progress=show_progress)

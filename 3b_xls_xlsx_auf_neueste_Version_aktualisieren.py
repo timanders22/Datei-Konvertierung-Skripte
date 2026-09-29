@@ -41,7 +41,7 @@
 # 3. VERTRAUENSWÜRDIGE SPEICHERORTE:
 #    ☑ Vertrauenswürdige Speicherorte im Netzwerk zulassen
 #    Folgende Speicherorte hinzufügen:
-#    • C:\Users\<Benutzername>\Documents (temporärer Arbeitsordner des Skripts)
+#    • %LOCALAPPDATA%\Dateimigration-Arbeitskopien (temporärer Arbeitsordner des Skripts)
 #    • Q:\ oder \\server\dfs (Quelldateien)
 #    Jeweils: ☑ Unterordner ... sind ebenfalls vertrauenswürdig
 #
@@ -135,6 +135,11 @@ try:
 except Exception:
     gem = None
 
+# Zuletzt verwendet: Ausgangszustand merken, damit spaeter nur die
+# eigenen Eintraege verschwinden (siehe _cleanup_user_recent).
+if gem is not None and hasattr(gem, "recent_momentaufnahme"):
+    gem.recent_momentaufnahme()
+
 
 # ==================================================================
 # COM-Konstanten
@@ -213,7 +218,22 @@ def _resolve_documents_dir() -> str:
 
 _docs_base = _resolve_documents_dir()
 
-TEMP_PROCESS_PATH = os.path.join(_docs_base, f"3b_xls_xlsx_auf_neueste_Version_aktualisieren_{os.getpid()}")
+# Gemeinsamer Arbeitsordner der Office-Skripte (Arbeitskopien, Lock-Datei).
+# Bis 29.09.2026 lag beides in "Dokumente"; bei OneDrive-Ordnersicherung
+# wanderte so jede Arbeitskopie in die Cloud. %LOCALAPPDATA% wird nie
+# umgeleitet. _docs_base bleibt nur Kandidat fuer das Protokollverzeichnis.
+def _resolve_arbeits_basis() -> str:
+    wurzel = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    try:
+        if os.path.isdir(wurzel):
+            wurzel = win32api.GetLongPathName(wurzel)
+    except Exception as _e:
+        detail_logger.debug(f"_resolve_arbeits_basis: Exception verworfen: {_e!r}")
+    return os.path.join(wurzel, "Dateimigration-Arbeitskopien")
+
+_arbeits_basis = _resolve_arbeits_basis()
+
+TEMP_PROCESS_PATH = os.path.join(_arbeits_basis, f"3b_xls_xlsx_auf_neueste_Version_aktualisieren_{os.getpid()}")
 # Kleinbuchstaben-Präfix der eigenen Temp-Ordner, für das gezielte
 # Whitelisting-Cleanup in _cleanup_user_temp().
 TEMP_PROCESS_PREFIX_LOWER = "3b_xls_xlsx_auf_neueste_version_aktualisieren_"
@@ -635,7 +655,11 @@ def _kill_orphaned_excel() -> None:
 # ==================================================================
 def _lock_file_path(target_dir: str) -> str:
     digest = hashlib.sha1(target_dir.encode("utf-8")).hexdigest()[:16]
-    return os.path.join(_docs_base, f"excel_updater_{digest}.lock")
+    try:
+        os.makedirs(_arbeits_basis, exist_ok=True)
+    except OSError:
+        pass
+    return os.path.join(_arbeits_basis, f"excel_updater_{digest}.lock")
 
 def _own_process_create_time() -> str:
     """Startzeit des eigenen Prozesses als stabile Kennung."""
@@ -3027,6 +3051,13 @@ def convert_excel_file(
                                 needs_password_check = False
                 except Exception as e_ole:
                     detail_logger.debug(f"OLE-Header-Check fehlgeschlagen: {e_ole}")
+            if not is_encrypted and _xls_hat_schreibkennwort(file_path):
+                pbar.write("  → ÜBERSPRUNGEN: Schreibkennwort (vorher 2b ausführen).")
+                detail_logger.warning(f"Übersprungen (Schreibkennwort): {original_path}")
+                file_logger.warning(
+                    f"Datei: {original_path}\n  -> Übersprungen (Schreibkennwort; "
+                    f"die Umwandlung haette es entfernt)\n")
+                return "SKIPPED"
 
         if not is_encrypted and not needs_password_check:
             passwords_to_try = [""]
@@ -3764,6 +3795,43 @@ def convert_excel_file(
             _dateiattribute_zurueck(ergebnis_pfad or original_path, orig_attribute)
 
 # ==================================================================
+# Schreibreservierungs-Kennwort in .xls
+# ==================================================================
+def _xls_hat_schreibkennwort(pfad: str) -> bool:
+    """BIFF8: FILESHARING-Satz (0x005B) mit Kennwort-Hash im Globals-Teil.
+
+    Gemessen am 29.09.2026 mit Excel 2024: eine .xls mit
+    Schreibreservierungs-Kennwort wurde umgewandelt, und die neue .xlsx
+    trug KEIN Kennwort mehr - der Schutz verschwand stillschweigend (3a
+    erhaelt seinen Bearbeitungsschutz, 2b entfernt Schutz nur auf
+    ausdruecklichen Auftrag). Solche Dateien werden jetzt uebersprungen.
+    """
+    import struct
+    try:
+        import olefile   # kommt mit msoffcrypto
+    except ImportError:
+        return False
+    try:
+        with olefile.OleFileIO(prepare_long_path(pfad)) as ole:
+            name = "Workbook" if ole.exists("Workbook") else "Book"
+            if not ole.exists(name):
+                return False
+            daten = ole.openstream(name).read()
+    except Exception as _e:
+        detail_logger.debug(f"_xls_hat_schreibkennwort: {_e!r}")
+        return False
+    pos = 0
+    while pos + 4 <= len(daten):
+        typ, laenge = struct.unpack_from("<HH", daten, pos)
+        if typ == 0x005B and laenge >= 4:
+            return struct.unpack_from("<H", daten, pos + 6)[0] != 0
+        if typ == 0x000A:                    # EOF des Globals-Teils
+            return False
+        pos += 4 + laenge
+    return False
+
+
+# ==================================================================
 # Dateiattribute zurueckschreiben
 # ==================================================================
 # Nur diese Bits laesst SetFileAttributes setzen; alles andere (Verzeichnis,
@@ -4108,64 +4176,24 @@ def _cleanup_excel_inetcache() -> None:
 
 
 def _cleanup_user_recent() -> None:
-    # Seit Windows Vista liegt der Recent-Ordner unter
-    # %APPDATA%\Microsoft\Windows\Recent. %USERPROFILE%\Recent ist nur
-    # noch eine Kompatibilitaets-Junction mit Deny-List-ACL (Auflisten
-    # wirft PermissionError) und dient hier lediglich als Fallback.
-    candidates = []
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        candidates.append(
-            os.path.join(appdata, "Microsoft", "Windows", "Recent"))
-    user_profile = os.environ.get("USERPROFILE")
-    if user_profile:
-        candidates.append(os.path.join(user_profile, "Recent"))
-
-    recent_dir = None
-    for cand in candidates:
-        if cand.lower().endswith(os.sep + "recent") and os.path.isdir(cand):
-            recent_dir = cand
-            break
-    if recent_dir is None:
+    # Bis 29.09.2026 loeschte diese Funktion JEDE Verknuepfung im
+    # Windows-Ordner "Zuletzt verwendet" - auch die des Anwenders. Jetzt
+    # entfernt sie nur Verknuepfungen, die seit dem Skriptstart entstanden
+    # sind und auf das bearbeitete Verzeichnis oder den Arbeitsordner
+    # zeigen (_gemeinsam.recent_eigene_entfernen). Ohne _gemeinsam.py
+    # bleibt der Ordner unangetastet.
+    entfernen = getattr(gem, "recent_eigene_entfernen", None)
+    if entfernen is None:
         return
-
-    files_deleted = 0
-    files_skipped = 0
-    bytes_freed   = 0
-
     try:
-        for entry in os.listdir(recent_dir):
-            if not entry.lower().endswith(".lnk"):
-                continue
-            fpath = os.path.join(recent_dir, entry)
-            if not os.path.isfile(fpath):
-                continue
-            try:
-                fsize = os.path.getsize(fpath)
-            except OSError:
-                fsize = 0
-            try:
-                try:
-                    os.chmod(fpath, 0o666)
-                except Exception as _e:
-                    detail_logger.debug(f"_cleanup_user_recent: Exception verworfen: {_e!r}")
-                os.remove(fpath)
-                files_deleted += 1
-                bytes_freed   += fsize
-            except (OSError, PermissionError) as e:
-                files_skipped += 1
-                detail_logger.debug(
-                    f"Recent: .lnk gesperrt, uebersprungen: {fpath} ({e})")
+        geloescht, gesperrt = entfernen()
     except Exception as e:
         detail_logger.debug(f"Recent-Cleanup unerwarteter Fehler: {e}")
         return
-
-    if files_deleted > 0 or files_skipped > 0:
-        kb = bytes_freed / 1024
+    if geloescht or gesperrt:
         detail_logger.info(
-            f"Windows-Recent aufgeraeumt: "
-            f"{files_deleted} .lnk-Dateien geloescht ({kb:.1f} KB), "
-            f"{files_skipped} gesperrt/uebersprungen")
+            f"Windows-Recent: {geloescht} eigene Verknuepfung(en) entfernt, "
+            f"{gesperrt} gesperrt/uebersprungen")
 
 
 # ==================================================================
@@ -4428,7 +4456,7 @@ if __name__ == "__main__":
         print("  3. VERTRAUENSWÜRDIGE SPEICHERORTE:")
         print("     ☑ Vertrauenswürdige Speicherorte im Netzwerk zulassen")
         print("     Folgende Speicherorte hinzufügen:")
-        print(f"     • {_docs_base} (temporärer Arbeitsordner des Skripts)")
+        print(f"     • {_arbeits_basis} (temporärer Arbeitsordner des Skripts)")
         print(r"     • Q:\ oder \\server\dfs (Quelldateien)")
         print("     Jeweils: ☑ Unterordner ... sind ebenfalls vertrauenswürdig")
         print("!" * 66)
@@ -4631,7 +4659,8 @@ if __name__ == "__main__":
             print(f"  Grund: {smoke_msg}")
             print()
             print("  Mögliche Ursachen:")
-            print("    • Dokumentenordner nicht als vertrauenswürdiger Speicherort eingetragen")
+            print(f"    • Arbeitsordner {_arbeits_basis}")
+            print("      nicht als vertrauenswürdiger Speicherort eingetragen")
             print("    • Geschützte Ansicht für unsichere Speicherorte noch aktiv")
             print("    • Excel/Office-Profil beschädigt oder fehlende Desktop-Ordner")
             print("      (siehe Trust-Center-Hinweis im Skript-Header)")
@@ -4665,6 +4694,8 @@ if __name__ == "__main__":
             print(f"\nVerarbeite: '{start_dir}'")
         print("-" * 66)
 
+        if gem is not None and hasattr(gem, "recent_wurzel_hinzufuegen"):
+            gem.recent_wurzel_hinzufuegen(start_dir)
         stats_result, excel_app, run_completed = process_directory(
             start_dir, excel_app,
             passwords, force_upd, break_links, count_first,
@@ -4790,7 +4821,7 @@ if __name__ == "__main__":
         print("     ⦿ Deaktivieren von VBA-Makros mit Benachrichtigung")
         print("     ☐ Zugriff auf das VBA-Projektobjektmodell wieder DEAKTIVIEREN")
         print("  3. VERTRAUENSWÜRDIGE SPEICHERORTE:")
-        print(f"     → {_docs_base}")
+        print(f"     → {_arbeits_basis}")
         print("       kann aus der Liste entfernt werden")
         print("     → 'Vertrauenswürdige Speicherorte im Netzwerk zulassen'")
         print("       ggf. wieder DEAKTIVIEREN")

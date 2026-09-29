@@ -17,13 +17,15 @@
       startet, was die COM-Automatisierung zum Einfrieren bringt.
 
     Temporärer Ordner:
-      Das Skript nutzt den Dokumente-Ordner des Benutzers als temporären
-      Arbeitsbereich (nicht %TEMP%, da Word diesen Pfad nicht als
-      "Vertrauenswürdigen Speicherort" akzeptiert). Der Ordner muss in
-      Word unter Datei > Optionen > Trust Center > Vertrauenswürdige
-      Speicherorte eingetragen sein (inkl. Unterordner). Bei Netzwerk-
-      umgeleiteten Dokumente-Ordnern zusätzlich die Option
-      "Vertrauenswürdige Speicherorte im Netzwerk zulassen" aktivieren.
+      Das Skript arbeitet in %LOCALAPPDATA%\Dateimigration-Arbeitskopien
+      (gemeinsam mit den anderen Office-Skripten der Sammlung). Bis
+      29.09.2026 war es der Dokumente-Ordner - der wird auf vielen
+      Rechnern per OneDrive-Ordnersicherung synchronisiert, jede
+      Arbeitskopie wanderte dann in die Cloud. %LOCALAPPDATA% wird nie
+      umgeleitet. Nicht %TEMP%, da Word diesen Pfad nicht als
+      "Vertrauenswürdigen Speicherort" akzeptiert. Den Ordner in Word
+      unter Datei > Optionen > Trust Center > Vertrauenswürdige
+      Speicherorte eintragen (inkl. Unterordner), wie vorher "Dokumente".
       Das Skript führt vor dem Hauptlauf einen Trust-Center-Smoke-Test durch
       und bricht bei Fehlschlag ab (bzw. fragt interaktiv nach), um stunden-
       lange Timeouts pro Datei zu vermeiden.
@@ -195,7 +197,10 @@ function Resolve-LogDirectory {
 }
 
 $LogDir                 = Resolve-LogDirectory -Preferred $scriptDir
-$TempPath               = Join-Path ([Environment]::GetFolderPath('MyDocuments')) "2a_entferne_schutz_word_$PID"
+# Gemeinsamer Arbeitsordner der Office-Skripte, NICHT "Dokumente" (siehe
+# Kopf: OneDrive-Ordnersicherung laedt dort jede Arbeitskopie hoch).
+$ArbeitsBasis           = Join-Path $(if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $env:TEMP }) 'Dateimigration-Arbeitskopien'
+$TempPath               = Join-Path $ArbeitsBasis "2a_entferne_schutz_word_$PID"
 $RunTimestamp           = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
 $LogFilePath            = Join-Path $LogDir "2a_entferne_schutz_word_$RunTimestamp.log"
 $DetailedLogPath        = Join-Path $LogDir "2a_entferne_schutz_word_detailed_$RunTimestamp.log"
@@ -999,7 +1004,16 @@ function Update-Progress {
 # ==================================================================
 
 function Remove-StaleTempFolders {
-    $parent = [Environment]::GetFolderPath('MyDocuments')
+    # Heutiger Arbeitsordner UND "Dokumente" (Reste von Laeufen vor dem
+    # Umzug des Arbeitsordners am 29.09.2026).
+    foreach ($parent in @($ArbeitsBasis, [Environment]::GetFolderPath('MyDocuments'))) {
+        Remove-StaleTempFoldersIn -Parent $parent
+    }
+}
+
+function Remove-StaleTempFoldersIn {
+    param([string]$Parent)
+    $parent = $Parent
     if ([string]::IsNullOrWhiteSpace($parent)) { return }
     if (-not [System.IO.Directory]::Exists($parent)) { return }
     # Get-ChildItem mit -ErrorAction SilentlyContinue ist robuster als
@@ -1762,17 +1776,14 @@ if (-not $NoInteractive) {
     # Vor dem ersten COM-Zugriff auf laufende Office-Sitzungen hinweisen.
     if (-not (Show-OfficeRunningWarning -Silent:$NoInteractive)) { exit 0 }
     Write-Host ""
-    Write-Host "HINWEIS: Das Skript verwendet den Ordner 'Dokumente' als temporären" -ForegroundColor DarkYellow
-    Write-Host "Arbeitsordner für die COM-Verarbeitung (Word öffnet Dateien daraus)." -ForegroundColor DarkYellow
+    Write-Host "HINWEIS: Das Skript verwendet diesen Arbeitsordner für die COM-Verarbeitung" -ForegroundColor DarkYellow
+    Write-Host "(Word öffnet Dateien daraus; nicht synchronisiert, anders als 'Dokumente'):" -ForegroundColor DarkYellow
+    Write-Host "       $ArbeitsBasis" -ForegroundColor White
     Write-Host "" -ForegroundColor DarkYellow
     Write-Host "Bitte in Word sicherstellen:" -ForegroundColor DarkYellow
     Write-Host "  Datei > Optionen > Trust Center > Einstellungen für das Trust Center" -ForegroundColor Gray
-    Write-Host "  > Vertrauenswürdige Speicherorte:" -ForegroundColor Gray
-    Write-Host "    1. Den Dokumente-Ordner hinzufügen (falls nicht vorhanden):" -ForegroundColor Gray
-    Write-Host "       $([Environment]::GetFolderPath('MyDocuments'))" -ForegroundColor White
+    Write-Host "  > Vertrauenswürdige Speicherorte: diesen Ordner hinzufügen" -ForegroundColor Gray
     Write-Host "       [x] Unterordner dieser Speicherorte sind ebenfalls vertrauenswürdig" -ForegroundColor Gray
-    Write-Host "    2. [x] Vertrauenswürdige Speicherorte im Netzwerk zulassen" -ForegroundColor Gray
-    Write-Host "       (erforderlich, wenn Dokumente-Ordner auf Netzlaufwerk umgeleitet)" -ForegroundColor Gray
     Write-Host ""
 
     if ([string]::IsNullOrWhiteSpace($TargetPath)) {
@@ -1927,7 +1938,7 @@ if (-not $smokeTest.Ok) {
     Write-Host "   Grund: $($smokeTest.Msg)"      -ForegroundColor Yellow
     Write-Host ""
     Write-Host "   Mögliche Ursachen:" -ForegroundColor Gray
-    Write-Host "     - Dokumentenordner nicht als vertrauenswürdiger Speicherort eingetragen" -ForegroundColor Gray
+    Write-Host "     - Arbeitsordner (siehe Hinweis beim Start) nicht als vertrauenswürdiger Speicherort eingetragen" -ForegroundColor Gray
     Write-Host "     - Word nicht installiert oder Office-Profil beschädigt" -ForegroundColor Gray
     Write-Host "     - Fehlender Desktop-Ordner für Dienstkonto (siehe Skript-Header)" -ForegroundColor Gray
     Write-Host ""

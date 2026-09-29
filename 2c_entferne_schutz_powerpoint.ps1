@@ -8,15 +8,17 @@
     und Stabilitaets-Polling der Temp-Kopie.
 
     Voraussetzung Vertrauenswuerdige Speicherorte:
-      Das Skript verwendet den Ordner "Dokumente\2c_entferne_schutz_powerpoint_<PID>" als
-      temporaeren Arbeitsordner fuer die COM-Automatisierung. Damit PowerPoint
-      Dateien dort ohne Geschuetzte Ansicht oeffnet, muss der Dokumentenordner
-      des ausfuehrenden Benutzers als vertrauenswuerdiger Speicherort
-      eingetragen sein:
+      Das Skript verwendet den Ordner
+      "%LOCALAPPDATA%\Dateimigration-Arbeitskopien\2c_entferne_schutz_powerpoint_<PID>"
+      als temporaeren Arbeitsordner fuer die COM-Automatisierung (bis
+      29.09.2026 "Dokumente" - der wird per OneDrive-Ordnersicherung oft
+      synchronisiert, jede Arbeitskopie ging dann in die Cloud). Damit
+      PowerPoint Dateien dort ohne Geschuetzte Ansicht oeffnet, diesen
+      Ordner als vertrauenswuerdigen Speicherort eintragen:
         PowerPoint -> Datei -> Optionen -> Trust Center -> Einstellungen...
           -> Vertrauenswuerdige Speicherorte
           -> "Neuen Speicherort hinzufuegen..."
-          -> Pfad: C:\Users\<Benutzername>\Documents
+          -> Pfad: C:\Users\<Benutzername>\AppData\Local\Dateimigration-Arbeitskopien
           -> Haken: "Unterordner dieses Speicherorts sind ebenfalls vertrauenswuerdig"
       Bei Netzlaufwerken als Zielpfad zusaetzlich:
           -> "Vertrauenswuerdige Speicherorte im Netzwerk zulassen"
@@ -189,7 +191,10 @@ function Resolve-LogDirectory {
 }
 $script:LogDir                 = Resolve-LogDirectory -Preferred $script:scriptDir
 
-$script:TempPath               = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "2c_entferne_schutz_powerpoint_$PID"
+# Gemeinsamer Arbeitsordner der Office-Skripte, NICHT "Dokumente" (siehe
+# Kopf: OneDrive-Ordnersicherung laedt dort jede Arbeitskopie hoch).
+$script:ArbeitsBasis           = Join-Path $(if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $env:TEMP }) 'Dateimigration-Arbeitskopien'
+$script:TempPath               = Join-Path $script:ArbeitsBasis "2c_entferne_schutz_powerpoint_$PID"
 $script:RunTimestamp           = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
 $script:LogFilePath            = Join-Path $script:LogDir "2c_entferne_schutz_powerpoint_$($script:RunTimestamp).log"
 $script:DetailedLogPath        = Join-Path $script:LogDir "2c_entferne_schutz_powerpoint_detailed_$($script:RunTimestamp).log"
@@ -334,9 +339,18 @@ function Invoke-WindowsTempCleanup {
 }
 
 function Remove-StaleTempFolders {
+    # Heutiger Arbeitsordner UND "Dokumente" (Reste von Laeufen vor dem
+    # Umzug des Arbeitsordners am 29.09.2026).
+    foreach ($p in @($script:ArbeitsBasis, [Environment]::GetFolderPath('MyDocuments'))) {
+        Remove-StaleTempFoldersIn -Parent $p
+    }
+}
+
+function Remove-StaleTempFoldersIn {
     # Verwaiste Arbeitsordner abgebrochener Laeufe entfernen - nur eigene
     # 2c_entferne_schutz_powerpoint_<PID>-Ordner, deren PID nicht mehr lebt.
-    $parent = [Environment]::GetFolderPath('MyDocuments')
+    param([string]$Parent)
+    $parent = $Parent
     if ([string]::IsNullOrWhiteSpace($parent)) { return }
     if (-not (Test-Path -LiteralPath $parent)) { return }
     $candidates = @()
@@ -1853,17 +1867,14 @@ if (-not $NoInteractive.IsPresent) {
     # Laufendes PowerPoint wird unmittelbar vor dem ersten COM-Zugriff
     # geprueft (Confirm-PowerPointGeschlossen, vor dem Smoke-Test).
     Write-Host ""
-    Write-Host "HINWEIS: Das Skript verwendet den Ordner 'Dokumente' als temporären" -ForegroundColor DarkYellow
-    Write-Host "Arbeitsordner für die COM-Verarbeitung (PowerPoint öffnet Dateien daraus)." -ForegroundColor DarkYellow
+    Write-Host "HINWEIS: Das Skript verwendet diesen Arbeitsordner für die COM-Verarbeitung" -ForegroundColor DarkYellow
+    Write-Host "(PowerPoint öffnet Dateien daraus; nicht synchronisiert, anders als 'Dokumente'):" -ForegroundColor DarkYellow
+    Write-Host "       $($script:ArbeitsBasis)" -ForegroundColor White
     Write-Host "" -ForegroundColor DarkYellow
     Write-Host "Bitte in PowerPoint sicherstellen:" -ForegroundColor DarkYellow
     Write-Host "  Datei > Optionen > Trust Center > Einstellungen für das Trust Center" -ForegroundColor Gray
-    Write-Host "  > Vertrauenswürdige Speicherorte:" -ForegroundColor Gray
-    Write-Host "    1. Den Dokumente-Ordner hinzufügen (falls nicht vorhanden):" -ForegroundColor Gray
-    Write-Host "       $([Environment]::GetFolderPath('MyDocuments'))" -ForegroundColor White
+    Write-Host "  > Vertrauenswürdige Speicherorte: diesen Ordner hinzufügen" -ForegroundColor Gray
     Write-Host "       [x] Unterordner dieser Speicherorte sind ebenfalls vertrauenswürdig" -ForegroundColor Gray
-    Write-Host "    2. [x] Vertrauenswürdige Speicherorte im Netzwerk zulassen" -ForegroundColor Gray
-    Write-Host "       (erforderlich, wenn Dokumente-Ordner auf Netzlaufwerk umgeleitet)" -ForegroundColor Gray
     Write-Host ""
 
     if ([string]::IsNullOrWhiteSpace($TargetPath)) {
@@ -2026,7 +2037,7 @@ if (-not $smokeTest.Ok) {
     Write-Host "   Grund: $($smokeTest.Msg)"          -ForegroundColor Yellow
     Write-Host ""
     Write-Host "   Mögliche Ursachen:" -ForegroundColor Gray
-    Write-Host "     - Dokumentenordner nicht als vertrauenswürdiger Speicherort eingetragen" -ForegroundColor Gray
+    Write-Host "     - Arbeitsordner (siehe Hinweis beim Start) nicht als vertrauenswürdiger Speicherort eingetragen" -ForegroundColor Gray
     Write-Host "     - PowerPoint nicht installiert oder Office-Profil beschädigt" -ForegroundColor Gray
     Write-Host "     - Fehlender Desktop-Ordner für Dienstkonto" -ForegroundColor Gray
     Write-Host ""

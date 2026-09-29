@@ -20,14 +20,17 @@
       - VBA-Projekt-Passwort in .xlsm/.xlam (binäre vbaProject.bin)
 
     Voraussetzung Vertrauenswürdige Speicherorte:
-      Das Skript verwendet den Ordner "Dokumente\2b_entferne_schutz_excel_<PID>" als
-      temporären Arbeitsordner für die COM-Automatisierung. Damit Excel Dateien
-      dort ohne Geschützte Ansicht öffnet, muss der Dokumentenordner des
-      ausführenden Benutzers als vertrauenswürdiger Speicherort eingetragen sein:
+      Das Skript verwendet den Ordner
+      "%LOCALAPPDATA%\Dateimigration-Arbeitskopien\2b_entferne_schutz_excel_<PID>"
+      als temporären Arbeitsordner für die COM-Automatisierung (bis 29.09.2026
+      "Dokumente" - der wird per OneDrive-Ordnersicherung oft synchronisiert,
+      jede Arbeitskopie ging dann in die Cloud). Damit Excel Dateien dort ohne
+      Geschützte Ansicht öffnet, diesen Ordner als vertrauenswürdigen
+      Speicherort eintragen:
         Excel -> Datei -> Optionen -> Trust Center -> Einstellungen...
           -> Vertrauenswürdige Speicherorte
           -> "Neuen Speicherort hinzufügen..."
-          -> Pfad: C:\Users\<Benutzername>\Documents
+          -> Pfad: C:\Users\<Benutzername>\AppData\Local\Dateimigration-Arbeitskopien
           -> Haken: "Unterordner dieses Speicherorts sind ebenfalls vertrauenswürdig"
       Bei Netzlaufwerken als Zielpfad zusätzlich den Haken setzen bei:
           -> "Vertrauenswürdige Speicherorte im Netzwerk zulassen"
@@ -220,10 +223,13 @@ function Resolve-LogDirectory {
 }
 $LogDir = Resolve-LogDirectory -Preferred $scriptDir
 
-$docRoot = [Environment]::GetFolderPath("MyDocuments")
-if ([string]::IsNullOrWhiteSpace($docRoot) -or -not (Test-Path -LiteralPath $docRoot)) {
-    $docRoot = $env:TEMP
-    if ([string]::IsNullOrWhiteSpace($docRoot)) { $docRoot = "C:\Windows\Temp" }
+# Gemeinsamer Arbeitsordner der Office-Skripte unter %LOCALAPPDATA%, NICHT
+# "Dokumente" (OneDrive-Ordnersicherung laedt dort jede Arbeitskopie hoch;
+# %LOCALAPPDATA% wird nie umgeleitet). Der Name $docRoot bleibt, weil der
+# Hinweistext beim Start ihn anzeigt.
+$docRoot = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'Dateimigration-Arbeitskopien' } else { $null }
+if ([string]::IsNullOrWhiteSpace($docRoot)) {
+    $docRoot = if ($env:TEMP) { Join-Path $env:TEMP 'Dateimigration-Arbeitskopien' } else { "C:\Windows\Temp\Dateimigration-Arbeitskopien" }
 }
 $TempPath               = Join-Path $docRoot "2b_entferne_schutz_excel_$PID"
 
@@ -845,9 +851,18 @@ function Invoke-WindowsTempCleanup {
 }
 
 function Remove-StaleTempFolders {
+    # Heutiger Arbeitsordner UND "Dokumente" (Reste von Laeufen vor dem
+    # Umzug des Arbeitsordners am 29.09.2026).
+    foreach ($p in @($docRoot, [Environment]::GetFolderPath('MyDocuments'))) {
+        Remove-StaleTempFoldersIn -Parent $p
+    }
+}
+
+function Remove-StaleTempFoldersIn {
     # Verwaiste Arbeitsordner abgebrochener Laeufe entfernen - nur eigene
     # 2b_entferne_schutz_excel_<PID>-Ordner, deren PID nicht mehr lebt.
-    $parent = [Environment]::GetFolderPath('MyDocuments')
+    param([string]$Parent)
+    $parent = $Parent
     if ([string]::IsNullOrWhiteSpace($parent)) { return }
     if (-not (Test-Path -LiteralPath $parent)) { return }
     $candidates = @()
@@ -1902,7 +1917,7 @@ if (-not $NoInteractive) {
     Write-Host ""
     Write-Host "VORAUSSETZUNG: Vertrauenswuerdiger Speicherort" -ForegroundColor Yellow
     Write-Host "  Damit die COM-Automatisierung nicht in der Geschuetzten Ansicht" -ForegroundColor Gray
-    Write-Host "  einfriert, muss der Dokumentenordner als vertrauenswuerdig" -ForegroundColor Gray
+    Write-Host "  einfriert, muss dieser Arbeitsordner als vertrauenswuerdig" -ForegroundColor Gray
     Write-Host "  eingetragen sein:" -ForegroundColor Gray
     Write-Host "    Excel -> Datei -> Optionen -> Trust Center -> Einstellungen..." -ForegroundColor White
     Write-Host "      -> Vertrauenswuerdige Speicherorte -> Neuen Speicherort hinzufuegen..." -ForegroundColor White
@@ -2093,7 +2108,7 @@ if (-not $smokeTest.Ok) {
     Write-Host "   Grund: $($smokeTest.Msg)"     -ForegroundColor Yellow
     Write-Host ""
     Write-Host "   Moegliche Ursachen:" -ForegroundColor Gray
-    Write-Host "     - Dokumentenordner nicht als vertrauenswuerdiger Speicherort eingetragen" -ForegroundColor Gray
+    Write-Host "     - Arbeitsordner (siehe Hinweis beim Start) nicht als vertrauenswuerdiger Speicherort eingetragen" -ForegroundColor Gray
     Write-Host "     - Excel nicht installiert oder Office-Profil beschaedigt" -ForegroundColor Gray
     Write-Host "     - Fehlender Desktop-Ordner fuer Dienstkonto (siehe Skript-Header)" -ForegroundColor Gray
     Write-Host ""

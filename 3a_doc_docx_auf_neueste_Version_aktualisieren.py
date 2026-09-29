@@ -27,7 +27,7 @@
 # 3. VERTRAUENSWÜRDIGE SPEICHERORTE:
 #    ☑ Vertrauenswürdige Speicherorte im Netzwerk zulassen
 #    Folgende Speicherorte hinzufügen:
-#    • C:\Users\<Benutzername>\Documents (temporärer Arbeitsordner des Skripts)
+#    • %LOCALAPPDATA%\Dateimigration-Arbeitskopien (temporärer Arbeitsordner des Skripts)
 #    • Q:\ oder \\server\dfs (Quelldateien)
 #    Jeweils: ☑ Unterordner ... sind ebenfalls vertrauenswürdig
 #
@@ -140,6 +140,11 @@ try:
 except Exception:
     gem = None
 
+# Zuletzt verwendet: Ausgangszustand merken, damit spaeter nur die
+# eigenen Eintraege verschwinden (siehe _cleanup_user_recent).
+if gem is not None and hasattr(gem, "recent_momentaufnahme"):
+    gem.recent_momentaufnahme()
+
 
 # ==================================================================
 # COM- und Format-Konstanten
@@ -171,7 +176,15 @@ ERROR_SHARING_VIOLATION = 32
 # ==================================================================
 # Konfiguration
 # ==================================================================
-TEMP_PROCESS_PARENT = os.path.join(os.path.expanduser("~"), "Documents")
+# Gemeinsamer Arbeitsordner der Office-Skripte. Bis 29.09.2026 lag er in
+# "Dokumente"; bei OneDrive-Ordnersicherung wanderte so jede Arbeitskopie
+# in die Cloud. %LOCALAPPDATA% wird nie umgeleitet. Alte Reste unter
+# "Dokumente" raeumt cleanup_orphaned_temp_dirs() weiterhin ab.
+TEMP_PROCESS_PARENT = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or os.path.expanduser("~"),
+    "Dateimigration-Arbeitskopien",
+)
+_TEMP_PROCESS_PARENT_ALT = os.path.join(os.path.expanduser("~"), "Documents")
 TEMP_PROCESS_PREFIX = "3a_doc_docx_auf_neueste_Version_aktualisieren_"
 TEMP_PROCESS_PATH   = os.path.join(
     TEMP_PROCESS_PARENT, f"{TEMP_PROCESS_PREFIX}{os.getpid()}"
@@ -1332,64 +1345,24 @@ def _cleanup_word_inetcache() -> None:
 
 
 def _cleanup_user_recent() -> None:
-    # Seit Windows Vista liegt der Recent-Ordner unter
-    # %APPDATA%\Microsoft\Windows\Recent. %USERPROFILE%\Recent ist nur
-    # noch eine Kompatibilitaets-Junction mit Deny-List-ACL (Auflisten
-    # wirft PermissionError) und dient hier lediglich als Fallback.
-    candidates = []
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        candidates.append(
-            os.path.join(appdata, "Microsoft", "Windows", "Recent"))
-    user_profile = os.environ.get("USERPROFILE")
-    if user_profile:
-        candidates.append(os.path.join(user_profile, "Recent"))
-
-    recent_dir = None
-    for cand in candidates:
-        if cand.lower().endswith(os.sep + "recent") and os.path.isdir(cand):
-            recent_dir = cand
-            break
-    if recent_dir is None:
+    # Bis 29.09.2026 loeschte diese Funktion JEDE Verknuepfung im
+    # Windows-Ordner "Zuletzt verwendet" - auch die des Anwenders. Jetzt
+    # entfernt sie nur Verknuepfungen, die seit dem Skriptstart entstanden
+    # sind und auf das bearbeitete Verzeichnis oder den Arbeitsordner
+    # zeigen (_gemeinsam.recent_eigene_entfernen). Ohne _gemeinsam.py
+    # bleibt der Ordner unangetastet.
+    entfernen = getattr(gem, "recent_eigene_entfernen", None)
+    if entfernen is None:
         return
-
-    files_deleted = 0
-    files_skipped = 0
-    bytes_freed   = 0
-
     try:
-        for entry in os.listdir(recent_dir):
-            if not entry.lower().endswith(".lnk"):
-                continue
-            fpath = os.path.join(recent_dir, entry)
-            if not os.path.isfile(fpath):
-                continue
-            try:
-                fsize = os.path.getsize(fpath)
-            except OSError:
-                fsize = 0
-            try:
-                try:
-                    os.chmod(fpath, stat.S_IWRITE)
-                except Exception as _e:
-                    detail_logger.debug(f"_cleanup_user_recent: Exception verworfen: {_e!r}")
-                os.remove(fpath)
-                files_deleted += 1
-                bytes_freed   += fsize
-            except (OSError, PermissionError) as e:
-                files_skipped += 1
-                detail_logger.debug(
-                    f"Recent: .lnk gesperrt, uebersprungen: {fpath} ({e})")
+        geloescht, gesperrt = entfernen()
     except Exception as e:
         detail_logger.debug(f"Recent-Cleanup unerwarteter Fehler: {e}")
         return
-
-    if files_deleted > 0 or files_skipped > 0:
-        kb = bytes_freed / 1024
+    if geloescht or gesperrt:
         detail_logger.info(
-            f"Windows-Recent aufgeraeumt: "
-            f"{files_deleted} .lnk-Dateien geloescht ({kb:.1f} KB), "
-            f"{files_skipped} gesperrt/uebersprungen")
+            f"Windows-Recent: {geloescht} eigene Verknuepfung(en) entfernt, "
+            f"{gesperrt} gesperrt/uebersprungen")
 
 
 def _init_word_app() -> tuple:
@@ -1458,10 +1431,11 @@ def _init_word_app() -> tuple:
         app.Options.NoPromptForTemplateID = True
     except Exception as _e:
         detail_logger.debug(f"_init_word_app: Exception verworfen: {_e!r}")
-    try:
-        app.DisplayRecentFiles = False
-    except Exception as _e:
-        detail_logger.debug(f"_init_word_app: Exception verworfen: {_e!r}")
+    # Frueher stand hier app.DisplayRecentFiles = False. Das ist keine
+    # Sitzungs-, sondern eine Profileinstellung: Word zeigte danach dauerhaft
+    # keine zuletzt verwendeten Dokumente mehr an ("Max Display"=0 unter
+    # HKCU\...\Word\File MRU), auch nach dem Skriptlauf. Die eigenen
+    # Eintraege raeumt _clear_recent_files() gezielt ab.
     return app, pid
 
 
@@ -1477,11 +1451,22 @@ def _restore_word_options(app) -> None:
 
 
 def _clear_recent_files(word_app: win32com.client.CDispatch) -> None:
+    # Word traegt Arbeitskopien trotz AddToRecentFiles=False in die Liste
+    # "Zuletzt verwendet" ein (am 29.09.2026 in der Registry gesehen). Bis
+    # dahin wurde hier die GANZE Liste geleert, samt der Eintraege des
+    # Anwenders. Jetzt fallen nur Eintraege, die im bearbeiteten
+    # Verzeichnis oder im Arbeitsordner liegen; ohne _gemeinsam.py bleibt
+    # die Liste unangetastet.
+    ist_eigen = getattr(gem, "recent_ist_eigen", None)
+    if ist_eigen is None:
+        return
     try:
         count = word_app.RecentFiles.Count
         for i in range(count, 0, -1):
             try:
-                word_app.RecentFiles(i).Delete()
+                eintrag = word_app.RecentFiles(i)
+                if ist_eigen(os.path.join(eintrag.Path, eintrag.Name)):
+                    eintrag.Delete()
             except Exception as _e:
                 detail_logger.debug(f"_clear_recent_files: Exception verworfen: {_e!r}")
     except Exception as _e:
@@ -1877,13 +1862,15 @@ def check_required_modules() -> None:
 
 def cleanup_orphaned_temp_dirs() -> None:
     try:
-        if not os.path.isdir(TEMP_PROCESS_PARENT):
-            return
         own_pid = os.getpid()
-        for entry in os.listdir(TEMP_PROCESS_PARENT):
+        eintraege = []
+        for parent in (TEMP_PROCESS_PARENT, _TEMP_PROCESS_PARENT_ALT):
+            if os.path.isdir(parent):
+                eintraege.extend((parent, e) for e in os.listdir(parent))
+        for parent, entry in eintraege:
             if not entry.startswith(TEMP_PROCESS_PREFIX):
                 continue
-            full = os.path.join(TEMP_PROCESS_PARENT, entry)
+            full = os.path.join(parent, entry)
             if not os.path.isdir(full):
                 continue
             pid_str = entry[len(TEMP_PROCESS_PREFIX):]
@@ -3856,7 +3843,7 @@ if __name__ == "__main__":
 
     # --- Vorab-Check der Trust-Center-Einstellungen ---
     if not auto_mode:
-        docs_folder = os.path.join(os.path.expanduser("~"), "Documents")
+        docs_folder = TEMP_PROCESS_PARENT
         print("\n" + "!" * 66)
         print("  WICHTIGER CHECK: TRUST-CENTER EINSTELLUNGEN")
         print("!" * 66)
@@ -4003,7 +3990,8 @@ if __name__ == "__main__":
             print(f"  Grund: {smoke_msg}")
             print()
             print("  Mögliche Ursachen:")
-            print("    • Dokumentenordner nicht als vertrauenswürdiger Speicherort eingetragen")
+            print(f"    • Arbeitsordner {TEMP_PROCESS_PARENT}")
+            print("      nicht als vertrauenswürdiger Speicherort eingetragen")
             print("    • Geschützte Ansicht für unsichere Speicherorte noch aktiv")
             print("    • Word/Office-Profil beschädigt oder fehlende Desktop-Ordner")
             print("      (siehe Trust-Center-Hinweis weiter oben)")
@@ -4135,6 +4123,8 @@ if __name__ == "__main__":
             print(f"\nVerarbeite: '{start_dir}'")
         print("-" * 66)
 
+        if gem is not None and hasattr(gem, "recent_wurzel_hinzufuegen"):
+            gem.recent_wurzel_hinzufuegen(start_dir)
         stats_result, info_result, mode_dist_result, run_completed = process_directory(
             start_dir, word_app, max_compat, passwords, count_first,
             resume_file=resume_file,
@@ -4264,7 +4254,7 @@ if __name__ == "__main__":
     print("=" * 66)
 
     if not auto_mode:
-        docs_folder = os.path.join(os.path.expanduser("~"), "Documents")
+        docs_folder = TEMP_PROCESS_PARENT
         print()
         print("!" * 66)
         print("  HINWEIS: TRUST-CENTER EINSTELLUNGEN ZURÜCKSETZEN (falls gewünscht)")

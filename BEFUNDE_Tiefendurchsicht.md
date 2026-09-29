@@ -76,7 +76,8 @@ Excel-COM war verfuegbar und wurde benutzt (Kennwortverhalten von `SaveAs`,
 > kamen neun weitere Fehler ans Licht, alle behoben - siehe Abschnitt 10.
 > Am Abend folgte eine Durchsicht mit neun kritischen Pruefagenten
 > (rund 95 Meldungen, nachgeprueft, behoben, alle Office-Skripte erneut am
-> echten Office getestet) - siehe Abschnitt 11.
+> echten Office getestet) - siehe Abschnitt 11. In der Nacht wurden die
+> dort offenen Punkte umgesetzt und gemessen - siehe Abschnitt 12.
 
 **Empfehlung:** Erster Lauf je Skript mit `-WhatIf` bzw. `--dry-run` auf
 einem Testbestand, nicht auf Q:/R:. Die Probelauf-Pfade wurden in dieser
@@ -692,6 +693,79 @@ einzelnen Belege liegen in den Kommentaren an den geaenderten Stellen.
   Datei in der Skript-Instanz; ein Waechter-Eingriff traefe sie mit.
 - 5_OCR: `try_remove_empty_password` ersetzt das Original weiterhin sofort
   (verlustarm, nur ohne Verschluesselung).
+
+Alle diese Punkte sind inzwischen erledigt - siehe Abschnitt 12.
+
+---
+
+### 12. Nachtrag 29.09.2026 (nachts): Entscheidungen und Restpunkte aus Abschnitt 11
+
+Alle Punkte der Liste "Offen / bewusst nicht geaendert" aus Abschnitt 11
+sind umgesetzt und am echten Office gemessen (Office 2024; Laeufe ausserhalb
+der Claude-App gestartet, siehe "Messfalle" unten).
+
+**Entscheidungen des Anwenders:**
+
+| Punkt | Umsetzung | Beleg |
+|---|---|---|
+| Symbolschriften (4b, ebenso 4a und 4c betroffen) | Text in Wingdings, Symbol, Webdings usw. behaelt seine Schrift. Erkennung: feste Liste plus alle installierten Schriften mit Symbolzeichensatz (GDI). Word: formatgebundene Suche vor dem Umstellen, danach die vier Schriftnamen zurueck; Excel: Halbierung des Zellbereichs bis zu einheitlichen Teilen, Mischzellen zeichenweise; PowerPoint: abschnittsweise (Runs). | Symbolproben Word 13/13, Excel 13/13, PowerPoint 8/8 (alte 4a-Fassung: 7 Symbole umgestellt). Per "Symbol einfuegen" gesetzte Zeichen (w:sym) blieben schon vorher erhalten. |
+| Arbeitskopien nicht in "Dokumente" (2c, 6 - und ebenso 2a, 2b, 3a-c, 4a-c, 5, 7) | Gemeinsamer Ordner `%LOCALAPPDATA%\Dateimigration-Arbeitskopien`; alte Reste in "Dokumente" raeumen die Skripte weiter ab. Nur 1, 9 und 10 lagen schon ausserhalb. **Der neue Ordner muss als vertrauenswuerdiger Speicherort eingetragen werden** (wie vorher "Dokumente"). | Alle zehn Office-Skripte: keine neuen Ordner in "Dokumente", Arbeitsordner nach dem Lauf leer. |
+| Zuletzt verwendet (3a, 3c - und 3b, 4a-c) | Momentaufnahme des Windows-Ordners "Recent" beim Start; entfernt werden nur Verknuepfungen, die danach entstanden sind UND auf das bearbeitete Verzeichnis oder den Arbeitsordner zeigen. Word-Liste (3a, jetzt auch 4a): nur Eintraege in diesen Ordnern. `5 --clear-mru` leert weiterhin alles, der Hilfetext sagt das jetzt. | Echtes System: 3/6 eigene Verknuepfungen entfernt, Waechter-Verknuepfungen (alt, fremd) blieben. |
+
+**Restpunkte:**
+
+| Punkt | Umsetzung | Beleg |
+|---|---|---|
+| 4b/4c: Wartezeit bei Kennwortdateien | Vorab erkannt und uebersprungen: verschluesselt (CFB statt ZIP; .xls ueber msoffcrypto), Schreibreservierung (`fileSharing`, .xls FILESHARING-Satz), Aenderungskennwort (`p:modifyVerifier`). Ebenso in **7** (dort 180 s je Datei). | 4b: 17 Mappen in 20 s statt 2x60 s Waechter; 7: 26 s statt 407 s. |
+| 4b: Attribute bei eigener .xls-Umwandlung | Schreibschutz/Versteckt/System/Archiv werden gelesen, bevor der Schreibschutz fuers Speichern faellt, und am Ende zurueckgeschrieben (Fehlerfall: aufs Original). Betraf auch direkt bearbeitete Mappen. | `attr.xls` -> `attr.xlsx` mit 0x23 (R+H+A). |
+| XLM-Namen am echten Excel | Mappe mit `GET.CELL` in einem Namen auf Paketebene gebaut (die Oberflaeche nimmt solche Namen per COM nicht an), von Excel als .xls gespeichert. | 3b und 4b: Ergebnis `.xlsm`, Name `Zellfarbe = GET.CELL(63,Tabelle1!$A$1)` erhalten; 7 behaelt die `.xlsm`. |
+| 0 Stage 2: Installer aus dem Benutzerkontext | Authenticode-Pruefung der privaten Kopie: gueltig + erwarteter Herausgeber (Ghostscript: Artifex; Java: Eclipse, Microsoft, Oracle, Azul, Amazon, BellSoft) -> ausfuehren; gebrochene Signatur -> Abbruch; unsigniert oder fremder Herausgeber -> nur nach Bestaetigung im Admin-Fenster (mit SHA-256), ohne Konsole Abbruch. | 7/7 Faelle mit echten Dateien (gueltig, fremd, manipuliert, unsigniert, bestaetigt). |
+| 2c/3c/4c: PowerPoint waehrend des Laufs geoeffnet | 4c prueft jetzt wie 2c/3c vor jeder Datei und beendet den Lauf, wenn in seiner Instanz etwas offen ist; PowerPoint bleibt offen. | Echt nachgestellt (Doppelklick waehrend des Laufs): Lauf endet, Praesentation bleibt offen. |
+| 5_OCR: Leer-Kennwort-Entschluesselung ersetzte das Original sofort | Jetzt Arbeitskopie wie bei der Reparatur; das Original wird nur mit dem geprueften Ergebnis ersetzt. | Funktion: Kopie unverschluesselt, Original byte-gleich. Regression tpdf: 6/6/0, danach 0/12/0 wie zuvor. |
+
+**Nebenbei gefunden und behoben:**
+
+- **4b hat Excel-Textfelder nie umgestellt**: `Shape.HasTextFrame` gibt es
+  nur in PowerPoint; die Abfrage warf immer, der Fehler wurde verschluckt.
+- **4c stellte ueber `TextEffect.FontName` ganze Textrahmen um** (jede Form
+  mit Text hat ein TextEffect-Objekt) - jetzt nur noch bei klassischem WordArt.
+- **3a stellte Words Anzeige "Zuletzt verwendet" dauerhaft auf 0**
+  (`DisplayRecentFiles = False` ist eine Profileinstellung). Die Liste selbst
+  blieb in der Registry erhalten, war aber unsichtbar. Die Zeile ist entfernt.
+  **Auf Rechnern, auf denen 3a lief:** Word > Optionen > Erweitert >
+  "Diese Anzahl zuletzt verwendeter Dokumente anzeigen" wieder setzen.
+- **3a und 4a trugen Arbeitskopien trotz `AddToRecentFiles=False` in Words
+  Liste ein** (in der Registry gesehen: sechs Eintraege von 4a, einer von 3a).
+- **3b entfernte beim Umwandeln einer .xls deren Schreibreservierungs-
+  Kennwort stillschweigend** - solche Dateien werden jetzt uebersprungen
+  (erst 2b).
+- **5_OCR: der Entschluesselungszweig griff praktisch nie** - PyMuPDF meldet
+  eine PDF mit reinem Owner-Kennwort nicht als verschluesselt; ocrmypdf
+  verarbeitet sie selbst (gemessen). Der Zweig bleibt fuer Sonderfaelle.
+- Excel-COM in spaeter Bindung: `Range.Characters(i, n)` und
+  `TextRange2.Runs(i)` scheitern ("Mitglied nicht gefunden" bzw.
+  "Auflistung nicht unterstuetzt"); `GetCharacters`/`GetRuns` gehen.
+
+**Messfalle dieser Umgebung:** Die Claude-Desktop-App ist ein MSIX-Paket.
+Dateien, die aus ihr heraus unter `%LOCALAPPDATA%`/`%APPDATA%` (ausser Temp)
+angelegt werden, landen virtualisiert im Paketordner - Word sieht sie nicht
+("Datei nicht gefunden"). Die Office-Tests liefen deshalb ueber einen per WMI
+ausserhalb des Pakets gestarteten Prozess, so wie der Anwender die Skripte
+startet. Beim Anwender tritt die Falle nicht auf.
+
+**Verbleibt (bewusst):**
+
+- PowerPoint: oeffnet der Anwender eine Datei, WAEHREND ein Aufruf haengt,
+  traefe der Waechter-Eingriff sie mit (zwischen zwei Dateien wird jetzt
+  geprueft, waehrend eines haengenden Aufrufs geht das per COM nicht).
+- 4b: sehr kleinteilig formatierte Blaetter (> 20 000 Teilbereiche) werden
+  pauschal umgestellt; reine Symbolzellen kommen zurueck, Symbolzeichen
+  INNERHALB gemischter Zellen nicht (Warnung im Protokoll).
+- Nicht erkannt: Aenderungskennwort in .ppt, Kennwoerter in .xlsb.
+- 2a/2b/2c (PowerShell) hinterlassen wie bisher Recent-Verknuepfungen auf
+  ihre (geloeschten) Arbeitskopien.
+- 0 Stage 2 mit `--yes`: die Bestaetigung fuer unsignierte Installer gilt
+  als erteilt (Tesseract und veraPDF sind unsigniert).
 
 ---
 

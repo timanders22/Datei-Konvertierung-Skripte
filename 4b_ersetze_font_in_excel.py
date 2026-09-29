@@ -33,7 +33,7 @@
 # 3. VERTRAUENSWÜRDIGE SPEICHERORTE:
 #    ☑ Vertrauenswürdige Speicherorte im Netzwerk zulassen
 #    Folgende Speicherorte hinzufügen:
-#    • C:\Users\<Benutzername>\Documents (temporärer Arbeitsordner des Skripts)
+#    • %LOCALAPPDATA%\Dateimigration-Arbeitskopien (temporärer Arbeitsordner des Skripts)
 #    • Q:\ oder \\server\dfs (Quelldateien)
 #    Jeweils: ☑ Unterordner ... sind ebenfalls vertrauenswürdig
 #
@@ -136,6 +136,35 @@ try:
     import _gemeinsam as gem
 except Exception:
     gem = None
+
+# Zuletzt verwendet: Ausgangszustand merken, damit spaeter nur die
+# eigenen Eintraege verschwinden (siehe _cleanup_user_recent).
+if gem is not None and hasattr(gem, "recent_momentaufnahme"):
+    gem.recent_momentaufnahme()
+
+# Symbolschriften (Wingdings, Symbol ...) werden nie ersetzt: dort steht
+# hinter jedem Zeichencode ein Bild, und aus einem Haekchen wuerde in Arial
+# ein Buchstabe. Erkennung in _gemeinsam.py (feste Liste plus alle
+# installierten Schriften mit Symbolzeichensatz); fehlt es, gilt diese Liste.
+_SYMBOLSCHRIFTEN_RUECKFALL = (
+    "Symbol", "Wingdings", "Wingdings 2", "Wingdings 3", "Webdings",
+    "Marlett", "MT Extra", "Bookshelf Symbol 7", "MS Reference Specialty",
+    "MS Outlook", "ZapfDingbats", "Zapf Dingbats", "Segoe MDL2 Assets",
+    "Segoe Fluent Icons",
+)
+
+
+def _symbolschrift_namen() -> list:
+    if gem is not None and hasattr(gem, "symbolschrift_namen"):
+        return gem.symbolschrift_namen()
+    return list(_SYMBOLSCHRIFTEN_RUECKFALL)
+
+
+def _ist_symbolschrift(name) -> bool:
+    if gem is not None and hasattr(gem, "ist_symbolschrift"):
+        return gem.ist_symbolschrift(name)
+    return bool(name) and str(name).strip().lower() in {
+        n.lower() for n in _SYMBOLSCHRIFTEN_RUECKFALL}
 
 try:
     import pythoncom
@@ -256,10 +285,14 @@ DEFAULT_FONT_NAME = "Arial"
 NEW_FONT_NAME     = DEFAULT_FONT_NAME
 auto_mode         = False
 
-TEMP_BASE_PATH    = os.path.join(
-    _resolve_user_shell_folder("Personal", "Documents"),
-    "4b_ersetze_font_in_excel"
-)
+# Gemeinsamer Arbeitsordner der Office-Skripte. Bis 29.09.2026 lag er in
+# "Dokumente"; bei OneDrive-Ordnersicherung wanderte so jede Arbeitskopie
+# in die Cloud. %LOCALAPPDATA% wird nie umgeleitet.
+ARBEITS_BASIS     = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP")
+    or _resolve_user_shell_folder("Personal", "Documents"),
+    "Dateimigration-Arbeitskopien")
+TEMP_BASE_PATH    = os.path.join(ARBEITS_BASIS, "4b_ersetze_font_in_excel")
 TEMP_PROCESS_PATH = TEMP_BASE_PATH
 MAX_PATH_LEN      = 240
 WINDOWS_MAX_PATH  = 260
@@ -916,80 +949,24 @@ def _cleanup_excel_inetcache() -> None:
 
 
 def _cleanup_user_recent() -> None:
-    """Raeumt den Windows-Recent-Ordner (%USERPROFILE%\\Recent) auf.
-
-    Hier liegen .lnk-Verknuepfungen aller kuerzlich geoeffneten Dateien
-    (nicht nur Excel). Bei einem Lauf ueber tausende Tabellen sammeln
-    sich entsprechend viele Verknuepfungen an, was die Recent-Liste
-    in Office-Anwendungen, Explorer und Sprung-Listen verlangsamt.
-
-    Es werden NUR .lnk-Dateien geloescht. Der Recent-Ordner selbst
-    bleibt erhalten.
-
-    BEWUSSTE DESIGN-ENTSCHEIDUNG: Diese Verknuepfungen sind systemweit
-    (alle Programme), nicht nur Excel. Akzeptabel im Kontext eines
-    Massen-Verarbeitungs-Skripts.
-
-    DARF NUR AUFGERUFEN WERDEN, WENN DAS SKRIPT-EXCEL NICHT LAEUFT.
-    """
-    # Seit Windows Vista liegt der Recent-Ordner unter
-    # %APPDATA%\Microsoft\Windows\Recent. %USERPROFILE%\Recent ist nur
-    # noch eine Kompatibilitaets-Junction mit Deny-List-ACL (Auflisten
-    # wirft PermissionError) und dient hier lediglich als Fallback.
-    candidates = []
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        candidates.append(
-            os.path.join(appdata, "Microsoft", "Windows", "Recent"))
-    user_profile = os.environ.get("USERPROFILE")
-    if user_profile:
-        candidates.append(os.path.join(user_profile, "Recent"))
-
-    recent_dir = None
-    for cand in candidates:
-        if cand.lower().endswith(os.sep + "recent") and os.path.isdir(cand):
-            recent_dir = cand
-            break
-    if recent_dir is None:
+    # Bis 29.09.2026 loeschte diese Funktion JEDE Verknuepfung im
+    # Windows-Ordner "Zuletzt verwendet" - auch die des Anwenders. Jetzt
+    # entfernt sie nur Verknuepfungen, die seit dem Skriptstart entstanden
+    # sind und auf das bearbeitete Verzeichnis oder den Arbeitsordner
+    # zeigen (_gemeinsam.recent_eigene_entfernen). Ohne _gemeinsam.py
+    # bleibt der Ordner unangetastet.
+    entfernen = getattr(gem, "recent_eigene_entfernen", None)
+    if entfernen is None:
         return
-
-    files_deleted = 0
-    files_skipped = 0
-    bytes_freed   = 0
-
     try:
-        for entry in os.listdir(recent_dir):
-            if not entry.lower().endswith(".lnk"):
-                continue
-            fpath = os.path.join(recent_dir, entry)
-            if not os.path.isfile(fpath):
-                continue
-            try:
-                fsize = os.path.getsize(fpath)
-            except OSError:
-                fsize = 0
-            try:
-                try:
-                    os.chmod(fpath, stat.S_IWRITE)
-                except Exception as _e:
-                    detail_logger.debug(f"_cleanup_user_recent: Exception verworfen: {_e!r}")
-                os.remove(fpath)
-                files_deleted += 1
-                bytes_freed   += fsize
-            except (OSError, PermissionError) as e:
-                files_skipped += 1
-                detail_logger.debug(
-                    f"Recent: .lnk gesperrt, uebersprungen: {fpath} ({e})")
+        geloescht, gesperrt = entfernen()
     except Exception as e:
         detail_logger.debug(f"Recent-Cleanup unerwarteter Fehler: {e}")
         return
-
-    if files_deleted > 0 or files_skipped > 0:
-        kb = bytes_freed / 1024
+    if geloescht or gesperrt:
         detail_logger.info(
-            f"Windows-Recent aufgeraeumt: "
-            f"{files_deleted} .lnk-Dateien geloescht ({kb:.1f} KB), "
-            f"{files_skipped} gesperrt/uebersprungen")
+            f"Windows-Recent: {geloescht} eigene Verknuepfung(en) entfernt, "
+            f"{gesperrt} gesperrt/uebersprungen")
 
 
 # Whitelist fuer den Windows-Temp-Cleanup: NUR Excel-/Office-eigene Reste
@@ -1688,6 +1665,112 @@ def _is_xls_encrypted(file_path: str) -> bool:
     except Exception:
         return False
 
+def _xls_hat_schreibkennwort(lp: str) -> bool:
+    """BIFF8: FILESHARING-Satz (0x005B) mit Kennwort-Hash im Globals-Teil."""
+    try:
+        import olefile   # kommt mit msoffcrypto; fehlt es, keine Erkennung
+    except ImportError:
+        return False
+    import struct
+    try:
+        with olefile.OleFileIO(lp) as ole:
+            name = "Workbook" if ole.exists("Workbook") else "Book"
+            if not ole.exists(name):
+                return False
+            daten = ole.openstream(name).read()
+    except Exception as _e:
+        detail_logger.debug(f"_xls_hat_schreibkennwort: {_e!r}")
+        return False
+    pos = 0
+    while pos + 4 <= len(daten):
+        typ, laenge = struct.unpack_from("<HH", daten, pos)
+        if typ == 0x005B and laenge >= 4:
+            return struct.unpack_from("<H", daten, pos + 6)[0] != 0
+        if typ == 0x000A:                    # EOF des Globals-Teils
+            return False
+        pos += 4 + laenge
+    return False
+
+
+def _excel_kennwort_grund(path: str) -> str:
+    """'' wenn Excel die Mappe ohne Kennwortabfrage oeffnet, sonst den Grund.
+
+    Gemessen am 29.09.2026 mit Excel 2024: eine verschluesselte .xlsx
+    (Oeffnungskennwort) und eine mit Schreibreservierungs-Kennwort hingen
+    bis zum Waechter (je 60 s plus Excel-Neustart). 4a erkennt beides seit
+    demselben Tag vorab; hier fehlte es, nur verschluesselte .xls wurden
+    erkannt.
+    - Verschluesselt: OOXML-Datei im CFB-Container statt ZIP; .xls ueber
+      _is_xls_encrypted.
+    - Schreibkennwort: <fileSharing> mit Kennwort-Hash in xl/workbook.xml
+      bzw. FILESHARING-Satz in der .xls (die reine Empfehlung
+      "schreibgeschuetzt oeffnen" ohne Kennwort bleibt erlaubt).
+    """
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        lp = prepare_long_path(path)
+        if ext in (".xls", ".xlt"):
+            if _is_xls_encrypted(path):
+                return "verschluesselt"
+            return "schreibkennwort" if _xls_hat_schreibkennwort(lp) else ""
+        with open(lp, "rb") as f:
+            kopf = f.read(8)
+        if kopf.startswith(b"\xD0\xCF\x11\xE0"):
+            return "verschluesselt"
+        if not kopf.startswith(b"PK"):
+            return ""
+        with zipfile.ZipFile(lp) as z:
+            try:
+                wb = z.read("xl/workbook.xml").decode("utf-8", errors="ignore")
+            except KeyError:
+                return ""                    # .xlsb: binaer, keine Erkennung
+        m = re.search(r"<(?:\w+:)?fileSharing\b[^>]*>", wb)
+        if m and re.search(r"\b(reservationPassword|hashValue|algorithmName)=", m.group(0)):
+            return "schreibkennwort"
+    except Exception as _e:
+        detail_logger.debug(f"_excel_kennwort_grund: {_e!r}")
+    return ""
+
+
+# ==================================================================
+# Dateiattribute
+# ==================================================================
+# Bis 29.09.2026 gingen Schreibschutz/Versteckt/System verloren: der
+# Schreibschutz wurde zum Speichern entfernt und nie zurueckgesetzt, und eine
+# umgewandelte .xls-Mappe entsteht per SaveAs ohnehin mit Normalattributen.
+# 3b erhaelt sie (gleiche Maske).
+_SETZBARE_ATTRIBUTE = (
+    0x0001      # READONLY
+    | 0x0002    # HIDDEN
+    | 0x0004    # SYSTEM
+    | 0x0020    # ARCHIVE
+    | 0x2000    # NOT_CONTENT_INDEXED
+)
+
+
+def _dateiattribute_lesen(pfad: str):
+    try:
+        return win32file.GetFileAttributesW(prepare_long_path(pfad))
+    except Exception as _e:
+        detail_logger.debug(f"_dateiattribute_lesen: {_e!r}")
+        return None
+
+
+def _dateiattribute_zurueck(pfad: str, attribute) -> None:
+    """Schreibt gemerkte Dateiattribute zurueck (best effort, protokolliert)."""
+    if attribute is None or not pfad or not os.path.exists(prepare_long_path(pfad)):
+        return
+    wert = attribute & _SETZBARE_ATTRIBUTE
+    if not wert:
+        wert = 0x0080           # NORMAL
+    try:
+        win32file.SetFileAttributesW(prepare_long_path(pfad), wert)
+        detail_logger.debug(f"Dateiattribute wiederhergestellt (0x{wert:X}): {pfad}")
+    except Exception as _e:
+        detail_logger.warning(
+            f"Dateiattribute (0x{wert:X}) nicht wiederherstellbar: {pfad} – {_e!r}")
+
+
 # ==================================================================
 # Integritätsprüfung
 # ==================================================================
@@ -1947,9 +2030,9 @@ def dry_run_directory(directory: str) -> dict:
         if is_locked_by_other(file_path):
             stats["GESPERRT"] += 1
             tag = "GESPERRT     "
-        elif ext in (".xls", ".xlt") and _is_xls_encrypted(file_path):
+        elif _excel_kennwort_grund(file_path):
             stats["VERSCHLUESSELT"] += 1
-            tag = "VERSCHLÜSSELT"
+            tag = "KENNWORT     "
         elif ext in (".xls", ".xlt"):
             stats["KONVERTIEREN"] += 1
             tag = "KONVERTIEREN "
@@ -1964,7 +2047,7 @@ def dry_run_directory(directory: str) -> dict:
     print( "    Würden konvertiert (.xls/.xlt → neu,")
     print(f"                        Original ersetzt!):  {stats['KONVERTIEREN']}")
     print(f"    Gesperrt (würden übersprungen):          {stats['GESPERRT']}")
-    print(f"    OLE-verschlüsselt (würden übersprungen): {stats['VERSCHLUESSELT']}")
+    print(f"    Kennwortgeschützt (würden übersprungen): {stats['VERSCHLUESSELT']}")
     print(f"    GESAMT:                                  {sum(stats.values())}")
     return stats
 
@@ -2010,29 +2093,201 @@ def file_generator(directory: str):
                 continue
 
 # ==================================================================
+# Schrift setzen, Symbolschriften schonen
+# ==================================================================
+# Bis 29.09.2026 setzte 4b die Zielschrift pauschal (UsedRange, Formatvor-
+# lagen, Textfelder, Kopfzeilen) - auch ueber Wingdings/Symbol. Aus einem
+# Haekchen wurde dabei ein "ü". Jetzt bleibt Text in Symbolschrift stehen.
+
+# Obergrenze fuer die Halbierung je Blatt (COM-Aufrufe). Wird sie gerissen,
+# setzt _zellschrift_setzen den Rest pauschal und holt reine Symbolzellen
+# danach zurueck (siehe dort).
+ZELLSCHRIFT_BUDGET   = 20000
+# Laengere Mischzellen werden nicht zeichenweise gelesen (ein Aufruf je
+# Zeichen); sie behalten ihre Schriften.
+ZEICHENWEISE_MAX_LEN = 2000
+
+
+def _com_eigenschaft(obj, name: str, *args):
+    """Eigenschaft MIT Argumenten (Characters, Runs) in spaeter Bindung.
+
+    Gemessen am 29.09.2026: Range.Characters(1, 3) wirft "Mitglied nicht
+    gefunden", TextRange2.Runs(1) "Auflistung nicht unterstuetzt" - pywin32
+    holt erst die Eigenschaft ohne Argumente und ruft dann deren
+    Standardmitglied auf. Die Get-Form (GetCharacters/GetRuns) reicht die
+    Argumente richtig durch.
+    """
+    try:
+        methode = getattr(obj, "Get" + name)
+    except AttributeError:
+        methode = getattr(obj, name)
+    return methode(*args)
+
+
+def _font_name_setzen(font, font_name: str) -> None:
+    """Setzt font.Name, ausser die bisherige Schrift ist eine Symbolschrift."""
+    try:
+        if _ist_symbolschrift(font.Name):
+            return
+    except Exception as _e:
+        detail_logger.debug(f"_font_name_setzen: Exception verworfen: {_e!r}")
+    font.Name = font_name
+
+
+def _textrange2_setzen(tr, font_name: str) -> None:
+    """TextRange2 (Textfeld, SmartArt): Symbol-Abschnitte bleiben stehen.
+
+    Gemessen am 29.09.2026: bei gemischten Schriften liefert
+    TextRange2.Font.Name einen leeren Namen - dann wird abschnittsweise
+    (Runs) gesetzt.
+    """
+    name = tr.Font.Name
+    if name:
+        if not _ist_symbolschrift(name):
+            tr.Font.Name = font_name
+        return
+    for i in range(1, tr.Runs.Count + 1):
+        try:
+            run = _com_eigenschaft(tr, "Runs", i, 1)
+            if not _ist_symbolschrift(run.Font.Name):
+                run.Font.Name = font_name
+        except Exception as _e:
+            detail_logger.debug(f"_textrange2_setzen: Exception verworfen: {_e!r}")
+
+
+def _zelle_zeichenweise(zelle, font_name: str) -> None:
+    """Mischzelle (Rich Text): nur Abschnitte ohne Symbolschrift umstellen."""
+    try:
+        wert = zelle.Value2
+        if not isinstance(wert, str) or not wert or len(wert) > ZEICHENWEISE_MAX_LEN:
+            return
+        namen = [_com_eigenschaft(zelle, "Characters", i, 1).Font.Name
+                 for i in range(1, len(wert) + 1)]
+    except Exception as _e:
+        detail_logger.debug(f"_zelle_zeichenweise: Exception verworfen: {_e!r}")
+        return
+    start = 0
+    while start < len(namen):
+        ende = start
+        while ende + 1 < len(namen) and namen[ende + 1] == namen[start]:
+            ende += 1
+        if namen[start] != font_name and not _ist_symbolschrift(namen[start]):
+            try:
+                _com_eigenschaft(zelle, "Characters", start + 1,
+                                 ende - start + 1).Font.Name = font_name
+            except Exception as _e:
+                detail_logger.debug(f"_zelle_zeichenweise: Exception verworfen: {_e!r}")
+        start = ende + 1
+
+
+def _symbolzellen_finden(rng) -> list:
+    """(Adresse, Schrift) der Zellen, die GANZ in einer Symbolschrift stehen.
+
+    Gemessen am 29.09.2026: Range.Find mit SearchFormat findet so nur Zellen
+    mit einheitlicher Zellschrift, keine Mischzellen. FindNext ignoriert
+    SearchFormat, deshalb wird Find mit After= wiederholt.
+    """
+    treffer = []
+    try:
+        xl = rng.Application
+    except Exception:
+        return treffer
+    try:
+        for name in _symbolschrift_namen():
+            try:
+                xl.FindFormat.Clear()
+                xl.FindFormat.Font.Name = name
+                letzte = rng.Cells(rng.Cells.Count)
+                erste = rng.Find("", letzte, -4123, 2, 1, 1, False, False, True)
+                zelle = erste
+                while zelle is not None and len(treffer) < ZELLSCHRIFT_BUDGET:
+                    treffer.append((zelle.Address, zelle.Font.Name))
+                    zelle = rng.Find("", zelle, -4123, 2, 1, 1, False, False, True)
+                    if zelle is not None and zelle.Address == erste.Address:
+                        break
+            except Exception as _e:
+                detail_logger.debug(f"_symbolzellen_finden: Exception verworfen: {_e!r}")
+    finally:
+        try:
+            xl.FindFormat.Clear()
+        except Exception as _e:
+            detail_logger.debug(f"_symbolzellen_finden: Exception verworfen: {_e!r}")
+    return treffer
+
+
+def _zellschrift_setzen(sheet, rng, font_name: str) -> bool:
+    """Setzt die Zellschrift in rng und schont Symbolschriften.
+
+    Ein einheitlicher Bereich kostet einen Aufruf; ist er gemischt, wird er
+    halbiert, bis jeder Teil einheitlich ist. Einzelne Mischzellen werden
+    zeichenweise bearbeitet. Reisst die Halbierung ZELLSCHRIFT_BUDGET, wird
+    der Rest pauschal gesetzt und reine Symbolzellen danach zurueckgeholt -
+    dann koennen Symbolzeichen INNERHALB von Mischzellen umgestellt sein.
+    Rueckgabe: False in diesem Rueckfall.
+    """
+    stapel = [rng]
+    budget = ZELLSCHRIFT_BUDGET
+    while stapel:
+        r = stapel.pop()
+        budget -= 1
+        if budget < 0:
+            stapel.append(r)
+            break
+        name = r.Font.Name
+        if name:
+            if name != font_name and not _ist_symbolschrift(name):
+                r.Font.Name = font_name
+            continue
+        zeilen = r.Rows.Count
+        spalten = r.Columns.Count
+        if zeilen == 1 and spalten == 1:
+            _zelle_zeichenweise(r, font_name)
+            continue
+        if zeilen >= spalten:
+            h = zeilen // 2
+            stapel.append(sheet.Range(r.Cells(1, 1), r.Cells(h, spalten)))
+            stapel.append(sheet.Range(r.Cells(h + 1, 1), r.Cells(zeilen, spalten)))
+        else:
+            h = spalten // 2
+            stapel.append(sheet.Range(r.Cells(1, 1), r.Cells(zeilen, h)))
+            stapel.append(sheet.Range(r.Cells(1, h + 1), r.Cells(zeilen, spalten)))
+    if not stapel:
+        return True
+    for r in stapel:
+        gerettet = _symbolzellen_finden(r)
+        r.Font.Name = font_name
+        for adresse, alt in gerettet:
+            try:
+                sheet.Range(adresse).Font.Name = alt
+            except Exception as _e:
+                detail_logger.debug(f"_zellschrift_setzen: Exception verworfen: {_e!r}")
+    return False
+
+
+# ==================================================================
 # Diagramm-Schriftarten
 # ==================================================================
 def _set_chart_fonts(chart, font_name: str, depth: int = 0) -> None:
     try:
-        chart.ChartArea.Format.TextFrame2.TextRange.Font.Name = font_name
+        _textrange2_setzen(chart.ChartArea.Format.TextFrame2.TextRange, font_name)
     except Exception as _e:
         detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     try:
         if chart.HasTitle:
-            chart.ChartTitle.Font.Name = font_name
+            _font_name_setzen(chart.ChartTitle.Font, font_name)
     except Exception as _e:
         detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     try:
         for axis in chart.Axes():
             try:
-                axis.TickLabels.Font.Name = font_name
+                _font_name_setzen(axis.TickLabels.Font, font_name)
             except Exception as _e:
                 detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
             try:
                 if axis.HasTitle:
-                    axis.AxisTitle.Font.Name = font_name
+                    _font_name_setzen(axis.AxisTitle.Font, font_name)
             except Exception as _e:
                 detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
     except Exception as _e:
@@ -2040,14 +2295,14 @@ def _set_chart_fonts(chart, font_name: str, depth: int = 0) -> None:
 
     try:
         if chart.HasLegend:
-            chart.Legend.Font.Name = font_name
+            _font_name_setzen(chart.Legend.Font, font_name)
     except Exception as _e:
         detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     try:
         if chart.HasDataTable:
             try:
-                chart.DataTable.Font.Name = font_name
+                _font_name_setzen(chart.DataTable.Font, font_name)
             except Exception as _e:
                 detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
     except Exception as _e:
@@ -2058,7 +2313,7 @@ def _set_chart_fonts(chart, font_name: str, depth: int = 0) -> None:
             try:
                 if series.HasDataLabels:
                     try:
-                        series.DataLabels().Font.Name = font_name
+                        _font_name_setzen(series.DataLabels().Font, font_name)
                     except Exception as _e:
                         detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
                     try:
@@ -2069,7 +2324,7 @@ def _set_chart_fonts(chart, font_name: str, depth: int = 0) -> None:
                                 try:
                                     pt = pts_coll.Item(j)
                                     if pt.HasDataLabel:
-                                        pt.DataLabel.Font.Name = font_name
+                                        _font_name_setzen(pt.DataLabel.Font, font_name)
                                 except Exception as _e:
                                     detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
                     except Exception as _e:
@@ -2080,7 +2335,7 @@ def _set_chart_fonts(chart, font_name: str, depth: int = 0) -> None:
                 for tl in series.Trendlines():
                     try:
                         if tl.DisplayEquation or tl.DisplayRSquared:
-                            tl.DataLabel.Font.Name = font_name
+                            _font_name_setzen(tl.DataLabel.Font, font_name)
                     except Exception as _e:
                         detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
             except Exception as _e:
@@ -2089,7 +2344,7 @@ def _set_chart_fonts(chart, font_name: str, depth: int = 0) -> None:
         detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
     try:
-        chart.PlotArea.Format.TextFrame2.TextRange.Font.Name = font_name
+        _textrange2_setzen(chart.PlotArea.Format.TextFrame2.TextRange, font_name)
     except Exception as _e:
         detail_logger.debug(f"_set_chart_fonts: Exception verworfen: {_e!r}")
 
@@ -2132,13 +2387,16 @@ def _process_sheet_shape(shape, font_name: str, depth: int = 0) -> None:
             detail_logger.debug(f"_process_sheet_shape: Exception verworfen: {_e!r}")
         return
 
+    # Excel-Formen kennen kein HasTextFrame (das ist PowerPoint): die
+    # Abfrage warf bis 29.09.2026 immer AttributeError, und 4b liess jedes
+    # Textfeld unveraendert. TextFrame2.HasText ist die Excel-Form.
     try:
-        if shape.HasTextFrame:
+        if shape.TextFrame2.HasText:
             try:
-                shape.TextFrame2.TextRange.Font.Name = font_name
+                _textrange2_setzen(shape.TextFrame2.TextRange, font_name)
             except Exception:
                 try:
-                    shape.TextFrame.Characters().Font.Name = font_name
+                    _font_name_setzen(shape.TextFrame.Characters().Font, font_name)
                 except Exception as _e:
                     detail_logger.debug(f"_process_sheet_shape: Exception verworfen: {_e!r}")
     except Exception as _e:
@@ -2148,7 +2406,7 @@ def _process_sheet_shape(shape, font_name: str, depth: int = 0) -> None:
         if getattr(shape, "HasSmartArt", False):
             for node in shape.SmartArt.AllNodes:
                 try:
-                    node.TextFrame2.TextRange.Font.Name = font_name
+                    _textrange2_setzen(node.TextFrame2.TextRange, font_name)
                 except Exception as _e:
                     detail_logger.debug(f"_process_sheet_shape: Exception verworfen: {_e!r}")
     except Exception as _e:
@@ -2180,8 +2438,9 @@ def _replace_header_footer_fonts(sheet, font_name: str) -> None:
 
             if '&"' in value:
                 new_value = _HEADER_FONT_RE.sub(
-                    lambda m: f'&"{font_name},{m.group(2)}"' if m.group(2)
-                              else f'&"{font_name}"',
+                    lambda m: m.group(0) if _ist_symbolschrift(m.group(1))
+                              else (f'&"{font_name},{m.group(2)}"' if m.group(2)
+                                    else f'&"{font_name}"'),
                     value
                 )
             else:
@@ -2232,7 +2491,7 @@ def _set_list_object_fonts(sheet, font_name: str) -> None:
         try:
             lo = los.Item(i)
             try:
-                lo.Range.Font.Name = font_name
+                _zellschrift_setzen(sheet, lo.Range, font_name)
             except Exception as _e:
                 detail_logger.debug(f"_set_list_object_fonts: Exception verworfen: {_e!r}")
         except Exception as _e:
@@ -2250,10 +2509,10 @@ def _set_pivot_table_fonts(sheet, font_name: str) -> None:
         try:
             pt = pts.Item(i)
             try:
-                pt.TableRange2.Font.Name = font_name
+                _zellschrift_setzen(sheet, pt.TableRange2, font_name)
             except Exception:
                 try:
-                    pt.TableRange1.Font.Name = font_name
+                    _zellschrift_setzen(sheet, pt.TableRange1, font_name)
                 except Exception as _e:
                     detail_logger.debug(f"_set_pivot_table_fonts: Exception verworfen: {_e!r}")
         except Exception as _e:
@@ -2565,12 +2824,15 @@ def replace_fonts_in_workbook(
     # wird nach der Datei-Ersetzung wieder angewendet (Admin-Kontext:
     # vollständig inkl. Owner; Nutzer-Kontext: DACL).
     orig_sd = _get_security_descriptor(original_path)
+    orig_attr = _dateiattribute_lesen(original_path)
 
-    # ── OLE-Verschlüsselungserkennung ─────────────────────────────────
-    if ext in (".xls", ".xlt") and _is_xls_encrypted(file_path):
-        pbar.write(f"  →  ÜBERSPRUNGEN (OLE-verschlüsselt): "
+    # ── Kennwort-Erkennung (Verschluesselung, Schreibkennwort) ─────────
+    _grund = _excel_kennwort_grund(file_path)
+    if _grund:
+        _text = "verschlüsselt" if _grund == "verschluesselt" else "Schreibkennwort"
+        pbar.write(f"  →  ÜBERSPRUNGEN ({_text}): "
                    f"{os.path.basename(original_path)}")
-        detail_logger.info(f"Übersprungen (OLE-verschlüsselt): {original_path}")
+        detail_logger.info(f"Übersprungen ({_text}): {original_path}")
         return "SKIPPED"
 
     # ── Long-Path-Behandlung ──────────────────────────────────────────
@@ -2752,7 +3014,7 @@ def replace_fonts_in_workbook(
         try:
             for style in workbook.Styles:
                 try:
-                    style.Font.Name = font_name
+                    _font_name_setzen(style.Font, font_name)
                 except Exception as _e:
                     detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
         except Exception as e:
@@ -2795,8 +3057,11 @@ def replace_fonts_in_workbook(
                         pbar.write(
                             f"  ⚠  Blatt '{sheet.Name}': UsedRange unrealistisch groß "
                             f"({_ur_rows}×{_ur_cols}) – Schriftart nur via Styles gesetzt")
-                    else:
-                        _ur.Font.Name = font_name
+                    elif not _zellschrift_setzen(sheet, _ur, font_name):
+                        detail_logger.warning(
+                            f"Blatt '{sheet.Name}': sehr kleinteilig formatiert - "
+                            f"Rest pauschal gesetzt; Symbolzeichen in Mischzellen "
+                            f"koennen umgestellt sein")
                 except Exception as e:
                     detail_logger.debug(
                         f"UsedRange.Font.Name fehlgeschlagen auf '{sheet.Name}': {e}")
@@ -2816,7 +3081,7 @@ def replace_fonts_in_workbook(
                     try:
                         for comment in sheet.Comments:
                             try:
-                                comment.Shape.TextFrame.Characters().Font.Name = font_name
+                                _font_name_setzen(comment.Shape.TextFrame.Characters().Font, font_name)
                             except Exception as _e:
                                 detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
                     except Exception as _e:
@@ -3248,6 +3513,10 @@ def replace_fonts_in_workbook(
                         else:
                             time.sleep(0.5)
 
+        # ── 9.5. DATEIATTRIBUTE WIEDERHERSTELLEN (zuletzt: Schreibschutz) ─
+        _dateiattribute_zurueck(
+            new_path if (was_converted and new_path) else original_path, orig_attr)
+
         # Nachweisliste: Pfadwechsel (.xls/.xlt -> neu, oder Ausweichname
         # bei Kollision) in die Konvertierungs-CSV.
         if was_converted and new_path and new_path.lower() != original_path.lower():
@@ -3287,6 +3556,10 @@ def replace_fonts_in_workbook(
             except Exception as _e:
                 detail_logger.debug(f"replace_fonts_in_workbook: Exception verworfen: {_e!r}")
             workbook = None
+
+        # Das Original steht unveraendert da, nur der Schreibschutz war fuer
+        # das Speichern entfernt - zuruecksetzen.
+        _dateiattribute_zurueck(original_path, orig_attr)
 
         # Bereits geschriebene, aber nie gepruefte Zieldatei entfernen.
         # Bei .xls/.xlt schreibt Stage 1 new_path auf die Freigabe, BEVOR
@@ -4006,6 +4279,8 @@ if __name__ == "__main__":
     exit_code    = 0
 
     try:
+        if gem is not None and hasattr(gem, "recent_wurzel_hinzufuegen"):
+            gem.recent_wurzel_hinzufuegen(start_dir)
         stats_result, run_completed = process_directory(
             start_dir, NEW_FONT_NAME, metadata_selected,
             count_first, show_progress=show_progress,

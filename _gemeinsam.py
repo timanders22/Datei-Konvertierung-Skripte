@@ -54,6 +54,13 @@ __all__ = [
     "preset_liste",
     "Laufprotokoll",
     "schreibbares_verzeichnis",
+    "recent_momentaufnahme",
+    "recent_wurzel_hinzufuegen",
+    "recent_ist_eigen",
+    "recent_eigene_entfernen",
+    "symbolschriften",
+    "symbolschrift_namen",
+    "ist_symbolschrift",
 ]
 
 VERSION = "1.0.0"
@@ -498,6 +505,260 @@ def schreibbares_verzeichnis(kandidaten: List[Optional[str]]) -> Optional[str]:
         except Exception:
             continue
     return None
+
+
+# ==================================================================
+# Zuletzt verwendet: nur die eigenen Eintraege entfernen
+# ==================================================================
+# Bis 29.09.2026 loeschten 3a-4c JEDE .lnk-Datei in
+# %APPDATA%\Microsoft\Windows\Recent und 3a zusaetzlich die ganze
+# Word-Liste "Zuletzt verwendet" - auch die Eintraege, die der Anwender
+# selbst angelegt hatte. Jetzt gilt:
+#   * recent_momentaufnahme() merkt sich beim Skriptstart, welche
+#     Verknuepfungen schon da waren. Die bleiben immer stehen.
+#   * recent_eigene_entfernen() loescht nur Verknuepfungen, die NACH der
+#     Momentaufnahme entstanden sind UND deren Ziel in einem eigenen
+#     Ordner liegt: im bearbeiteten Verzeichnis (recent_wurzel_hinzufuegen)
+#     oder im Arbeitsordner der Skripte bzw. %TEMP%.
+# Ohne Momentaufnahme wird nichts geloescht. Oeffnet der Anwender waehrend
+# des Laufs selbst eine Datei aus dem bearbeiteten Verzeichnis, faellt
+# deren neuer Eintrag mit weg - von aussen nicht unterscheidbar.
+
+_RECENT_VORHER: Optional[set] = None
+_RECENT_WURZELN: List[str] = []
+
+
+def _recent_ordner() -> Optional[str]:
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    d = os.path.join(appdata, "Microsoft", "Windows", "Recent")
+    return d if os.path.isdir(d) else None
+
+
+def _pfad_norm(p: str) -> str:
+    p = os.path.abspath(p)
+    # %TEMP% steht oft in 8.3-Form (C:\Users\ABCDEF~1\...), das Ziel einer
+    # Verknuepfung aber in Langform - ohne Angleichen passt nichts zusammen.
+    if "~" in p:
+        try:
+            import ctypes
+            puffer = ctypes.create_unicode_buffer(32768)
+            if ctypes.windll.kernel32.GetLongPathNameW(p, puffer, 32768):
+                p = puffer.value
+        except Exception:
+            pass
+    p = os.path.normcase(p)
+    if p.startswith("\\\\?\\unc\\"):
+        p = "\\\\" + p[8:]
+    elif p.startswith("\\\\?\\"):
+        p = p[4:]
+    return p.rstrip("\\")
+
+
+def _eigene_wurzeln() -> List[str]:
+    wurzeln = list(_RECENT_WURZELN)
+    lokal = os.environ.get("LOCALAPPDATA")
+    if lokal:
+        wurzeln.append(_pfad_norm(os.path.join(lokal, "Dateimigration-Arbeitskopien")))
+    temp = os.environ.get("TEMP")
+    if temp:
+        wurzeln.append(_pfad_norm(temp))
+    return [w for w in wurzeln if w]
+
+
+def recent_momentaufnahme() -> None:
+    """Merkt sich die vorhandenen Recent-Verknuepfungen (nur beim ersten Aufruf)."""
+    global _RECENT_VORHER
+    if _RECENT_VORHER is not None:
+        return
+    d = _recent_ordner()
+    if d is None:
+        _RECENT_VORHER = set()
+        return
+    try:
+        _RECENT_VORHER = {n.lower() for n in os.listdir(d)}
+    except OSError:
+        # Unbekannter Ausgangszustand: lieber gar nichts loeschen.
+        _RECENT_VORHER = None
+
+
+def recent_wurzel_hinzufuegen(pfad: Optional[str]) -> None:
+    """Meldet ein bearbeitetes Verzeichnis als eigene Wurzel an."""
+    if pfad:
+        try:
+            w = _pfad_norm(pfad)
+        except Exception:
+            return
+        if w and w not in _RECENT_WURZELN:
+            _RECENT_WURZELN.append(w)
+
+
+def recent_ist_eigen(pfad: Optional[str]) -> bool:
+    """True, wenn pfad in einer eigenen Wurzel liegt (oder sie selbst ist)."""
+    if not pfad:
+        return False
+    try:
+        p = _pfad_norm(pfad)
+    except Exception:
+        return False
+    for w in _eigene_wurzeln():
+        if p == w or p.startswith(w + "\\"):
+            return True
+    return False
+
+
+def _lnk_ziel_lesen(pythoncom, shell, lnk: str) -> Optional[str]:
+    link = pythoncom.CoCreateInstance(
+        shell.CLSID_ShellLink, None, pythoncom.CLSCTX_INPROC_SERVER,
+        shell.IID_IShellLink)
+    link.QueryInterface(pythoncom.IID_IPersistFile).Load(lnk, 0)
+    return link.GetPath(0)[0] or None
+
+
+def _lnk_ziel(lnk: str) -> Optional[str]:
+    try:
+        import pythoncom
+        from win32com.shell import shell
+    except Exception:
+        return None
+    # Die Skripte haben COM im Hauptthread laengst initialisiert. Ein
+    # eigenes CoInitialize/CoUninitialize-Paar stoerte dort die noch
+    # lebenden Office-Objekte (pywin32 meldete beim Freigeben einen
+    # Win32-Fehler) - deshalb nur in einem Thread ohne COM selbst
+    # initialisieren.
+    try:
+        return _lnk_ziel_lesen(pythoncom, shell, lnk)
+    except pythoncom.com_error as e:
+        if e.hresult != -2147221008:        # CO_E_NOTINITIALIZED
+            return None
+    except Exception:
+        return None
+    try:
+        pythoncom.CoInitialize()
+    except Exception:
+        return None
+    try:
+        return _lnk_ziel_lesen(pythoncom, shell, lnk)
+    except Exception:
+        return None
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def recent_eigene_entfernen() -> Tuple[int, int]:
+    """Loescht neue Recent-Verknuepfungen auf eigene Pfade.
+
+    Rueckgabe: (geloescht, gesperrt).
+    """
+    if _RECENT_VORHER is None:
+        return 0, 0
+    d = _recent_ordner()
+    if d is None:
+        return 0, 0
+    geloescht = gesperrt = 0
+    try:
+        namen = os.listdir(d)
+    except OSError:
+        return 0, 0
+    for name in namen:
+        if not name.lower().endswith(".lnk") or name.lower() in _RECENT_VORHER:
+            continue
+        voll = os.path.join(d, name)
+        if not os.path.isfile(voll) or not recent_ist_eigen(_lnk_ziel(voll)):
+            continue
+        try:
+            os.remove(voll)
+            geloescht += 1
+        except OSError:
+            gesperrt += 1
+    return geloescht, gesperrt
+
+
+# ==================================================================
+# Symbolschriften (fuer 4a/4b/4c)
+# ==================================================================
+# In Wingdings, Symbol & Co. steht hinter jedem Zeichencode ein Bild
+# (Haekchen, Pfeil, Kaestchen). Stellt ein Skript solchen Text auf Arial um,
+# bleibt der Code stehen und aus dem Haekchen wird ein Buchstabe ("ü" statt
+# des Hakens). Diese Schriften duerfen deshalb nie ersetzt werden.
+
+SYMBOLSCHRIFTEN_FEST_NAMEN = (
+    "Symbol", "Wingdings", "Wingdings 2", "Wingdings 3", "Webdings",
+    "Marlett", "MT Extra", "Bookshelf Symbol 7", "MS Reference Specialty",
+    "MS Outlook", "ZapfDingbats", "Zapf Dingbats", "ITC Zapf Dingbats",
+    "Monotype Sorts", "Segoe MDL2 Assets", "Segoe Fluent Icons",
+    "Holo MDL2 Assets", "Wingdings-Regular",
+)
+SYMBOLSCHRIFTEN_FEST = frozenset(n.lower() for n in SYMBOLSCHRIFTEN_FEST_NAMEN)
+
+_SYMBOLSCHRIFTEN_CACHE: Optional[frozenset] = None
+_SYMBOLSCHRIFTEN_NAMEN: List[str] = []
+
+
+def symbolschriften() -> frozenset:
+    """Namen (klein) aller Symbolschriften: feste Liste + installierte.
+
+    Installierte Schriften mit SYMBOL_CHARSET liefert GDI
+    (EnumFontFamiliesExW); damit sind auch Symbolschriften erfasst, die in
+    der festen Liste fehlen.
+    """
+    global _SYMBOLSCHRIFTEN_CACHE
+    if _SYMBOLSCHRIFTEN_CACHE is not None:
+        return _SYMBOLSCHRIFTEN_CACHE
+    namen = {n.lower(): n for n in SYMBOLSCHRIFTEN_FEST_NAMEN}
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class LOGFONTW(ctypes.Structure):
+            _fields_ = [("lfHeight", wintypes.LONG), ("lfWidth", wintypes.LONG),
+                        ("lfEscapement", wintypes.LONG), ("lfOrientation", wintypes.LONG),
+                        ("lfWeight", wintypes.LONG), ("lfItalic", wintypes.BYTE),
+                        ("lfUnderline", wintypes.BYTE), ("lfStrikeOut", wintypes.BYTE),
+                        ("lfCharSet", wintypes.BYTE), ("lfOutPrecision", wintypes.BYTE),
+                        ("lfClipPrecision", wintypes.BYTE), ("lfQuality", wintypes.BYTE),
+                        ("lfPitchAndFamily", wintypes.BYTE),
+                        ("lfFaceName", wintypes.WCHAR * 32)]
+
+        SYMBOL_CHARSET = 2
+        rueckruf_typ = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.POINTER(LOGFONTW),
+                                          ctypes.c_void_p, wintypes.DWORD, wintypes.LPARAM)
+
+        def _rueckruf(lf, _tm, _typ, _param):
+            if lf.contents.lfCharSet == SYMBOL_CHARSET:
+                name = lf.contents.lfFaceName.lstrip("@").strip()
+                if name:
+                    namen.setdefault(name.lower(), name)
+            return 1
+
+        gdi32 = ctypes.windll.gdi32
+        user32 = ctypes.windll.user32
+        user32.GetDC.restype = wintypes.HDC
+        gdi32.EnumFontFamiliesExW.argtypes = [wintypes.HDC, ctypes.POINTER(LOGFONTW),
+                                              rueckruf_typ, wintypes.LPARAM, wintypes.DWORD]
+        hdc = user32.GetDC(None)
+        try:
+            lf = LOGFONTW()
+            lf.lfCharSet = SYMBOL_CHARSET
+            gdi32.EnumFontFamiliesExW(hdc, ctypes.byref(lf), rueckruf_typ(_rueckruf), 0, 0)
+        finally:
+            user32.ReleaseDC(None, hdc)
+    except Exception:
+        pass      # feste Liste genuegt als Rueckfall
+    _SYMBOLSCHRIFTEN_NAMEN[:] = sorted(namen.values(), key=str.lower)
+    _SYMBOLSCHRIFTEN_CACHE = frozenset(namen)
+    return _SYMBOLSCHRIFTEN_CACHE
+
+
+def symbolschrift_namen() -> List[str]:
+    """Dieselben Schriften in Originalschreibung (fuer Suchen mit Format)."""
+    symbolschriften()
+    return list(_SYMBOLSCHRIFTEN_NAMEN)
+
+
+def ist_symbolschrift(name: Optional[str]) -> bool:
+    return bool(name) and str(name).strip().lower() in symbolschriften()
 
 
 # ==================================================================

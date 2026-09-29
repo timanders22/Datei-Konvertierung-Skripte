@@ -3,7 +3,7 @@
 # Stand:   11.06.2026
 # Pfad:    Scannt rekursiv das gewaehlte Verzeichnis auf .docm, .xlsm, .pptm
 # Logik:   Konvertiert NUR, wenn 0 Zeilen VBA-Code enthalten sind.
-# Methode: Dateien werden lokal in den Dokumente-Ordner kopiert, dort
+# Methode: Dateien werden lokal nach %LOCALAPPDATA%\Dateimigration-Arbeitskopien kopiert, dort
 #          verarbeitet und anschliessend zurueck auf das Netzlaufwerk geschrieben.
 #
 # Excel 4.0 Makros (XLM):
@@ -267,7 +267,11 @@ $scriptDir = Resolve-ScriptDirectory
 $timestamp = (Get-Date).ToString("yyyy-MM-dd_HHmmss")
 $logFile  = Join-Path -Path $scriptDir -ChildPath "7_Dateien_ohne_Makro_finden_$timestamp.log"
 $skipLog  = Join-Path -Path $scriptDir -ChildPath "7_Dateien_ohne_Makro_finden_ManuellePruefung_$timestamp.csv"
-$tempDir  = Join-Path -Path ([Environment]::GetFolderPath("MyDocuments")) -ChildPath "7_Dateien_ohne_Makro_finden_$PID"
+# Gemeinsamer Arbeitsordner der Office-Skripte unter %LOCALAPPDATA%. Bis
+# 29.09.2026 "Dokumente" - bei OneDrive-Ordnersicherung wanderte jede
+# Arbeitskopie in die Cloud; %LOCALAPPDATA% wird nie umgeleitet.
+$arbeitsBasis = Join-Path $(if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $env:TEMP }) 'Dateimigration-Arbeitskopien'
+$tempDir  = Join-Path -Path $arbeitsBasis -ChildPath "7_Dateien_ohne_Makro_finden_$PID"
 $utf8Bom  = New-Object System.Text.UTF8Encoding $true
 $restartThreshold = 500
 # Frist je Datei fuer Oeffnen, VBA-Pruefung und Speichern (siehe
@@ -281,7 +285,8 @@ $cancelled        = $false
 # Alte Temp-Ordner (>24h) frueherer/abgestuerzter Laeufe entfernen -
 # Filter passt zum aktuellen Skriptpraefix.
 $staleTempThreshold = (Get-Date).AddHours(-24)
-Get-ChildItem -LiteralPath ([Environment]::GetFolderPath("MyDocuments")) -Directory -Filter "7_Dateien_ohne_Makro_finden_*" -ErrorAction SilentlyContinue |
+@($arbeitsBasis, [Environment]::GetFolderPath("MyDocuments")) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+    ForEach-Object { Get-ChildItem -LiteralPath $_ -Directory -Filter "7_Dateien_ohne_Makro_finden_*" -ErrorAction SilentlyContinue } |
     Where-Object { $_.LastWriteTime -lt $staleTempThreshold } |
     ForEach-Object {
         try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop -WhatIf:$false } catch {}
@@ -491,6 +496,65 @@ function Test-HasExcel4Macro {
         return $false
     } catch {
         return $null
+    } finally {
+        if ($null -ne $zip) { try { $zip.Dispose() } catch {} }
+        if ($null -ne $fs)  { try { $fs.Dispose() }  catch {} }
+    }
+}
+
+function Get-OoxmlKennwortGrund {
+    <#
+        '' wenn Office die Datei ohne Kennwortabfrage oeffnet, sonst der
+        Grund ('verschluesselt' / 'Schreibkennwort').
+
+        Gemessen am 29.09.2026 (Office 2024): eine verschluesselte .docm und
+        .xlsm liefen je bis zum Zeitwaechter (180 s) und kosteten einen
+        Office-Neustart. Erkannt wird:
+          - verschluesselt: OOXML-Datei im CFB-Container statt ZIP
+          - Schreibkennwort: w:writeProtection mit Hash (Word),
+            fileSharing mit Kennwort (Excel), p:modifyVerifier (PowerPoint)
+    #>
+    param([string]$Path, [string]$Ext)
+
+    $fs = $null; $zip = $null
+    try {
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open,
+                  [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $kopf = New-Object byte[] 4
+        if ($fs.Read($kopf, 0, 4) -lt 4) { return '' }
+        if ($kopf[0] -eq 0xD0 -and $kopf[1] -eq 0xCF -and $kopf[2] -eq 0x11 -and $kopf[3] -eq 0xE0) {
+            return 'verschluesselt'
+        }
+        if ($kopf[0] -ne 0x50 -or $kopf[1] -ne 0x4B) { return '' }
+        [void]$fs.Seek(0, [System.IO.SeekOrigin]::Begin)
+        $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Read)
+        $teil = switch ($Ext) {
+            '.docm' { 'word/settings.xml' }
+            '.xlsm' { 'xl/workbook.xml' }
+            '.pptm' { 'ppt/presentation.xml' }
+            default { $null }
+        }
+        if (-not $teil) { return '' }
+        $eintrag = $zip.Entries | Where-Object { $_.FullName -eq $teil } | Select-Object -First 1
+        if (-not $eintrag) { return '' }
+        $sr = New-Object System.IO.StreamReader($eintrag.Open())
+        try { $xml = $sr.ReadToEnd() } finally { $sr.Close() }
+        switch ($Ext) {
+            '.docm' {
+                $m = [regex]::Match($xml, '<w:writeProtection\b[^>]*>')
+                if ($m.Success -and $m.Value -match 'w:(hashValue|hash|cryptProviderType|salt)=') { return 'Schreibkennwort' }
+            }
+            '.xlsm' {
+                $m = [regex]::Match($xml, '<(?:\w+:)?fileSharing\b[^>]*>')
+                if ($m.Success -and $m.Value -match '\b(reservationPassword|hashValue|algorithmName)=') { return 'Schreibkennwort' }
+            }
+            '.pptm' {
+                if ($xml -match '<(?:\w+:)?modifyVerifier\b') { return 'Schreibkennwort' }
+            }
+        }
+        return ''
+    } catch {
+        return ''
     } finally {
         if ($null -ne $zip) { try { $zip.Dispose() } catch {} }
         if ($null -ne $fs)  { try { $fs.Dispose() }  catch {} }
@@ -1534,6 +1598,7 @@ $stats = @{
     KeptXlmUnknown = 0
     KeptNoAccess   = 0
     SkippedLong    = 0
+    SkippedPassword = 0
     Errors         = 0
     WouldConvert   = 0
 }
@@ -1707,6 +1772,14 @@ foreach ($type in $fileTypes) {
             if (-not (Wait-FileAvailable -Path $localCopy -MaxAttempts 12 -DelayMs 300)) {
                 Write-Log "Lokale Kopie nicht freigegeben (AV-Scanner?): $fileName" -Level "WARN"
                 $stats.Errors++
+                continue
+            }
+
+            $kennwort = Get-OoxmlKennwortGrund -Path $localCopy -Ext $type.Ext
+            if ($kennwort) {
+                Write-Log "UEBERSPRUNGEN ($kennwort): $fileName" -Level "WARN"
+                Write-SkipLogEntry -Source $filePath -Reason "Kennwort ($kennwort) - nicht geprueft"
+                $stats.SkippedPassword++
                 continue
             }
 
@@ -2197,6 +2270,7 @@ if ($stats.WouldConvert -gt 0) {
 Write-Log ("Beibehalten (kein VBA-Zugriff):    {0}" -f $stats.KeptNoAccess)
 $stats.SkippedLong = $script:SkippedPathTooLong
 Write-Log ("Uebersprungen (Pfad zu lang):      {0}" -f $stats.SkippedLong)
+Write-Log ("Uebersprungen (Kennwort):          {0}" -f $stats.SkippedPassword)
 Write-Log ("Fehler:                            {0}" -f $stats.Errors)
 Write-Log "Logdateien:"
 Write-Log "  $logFile"

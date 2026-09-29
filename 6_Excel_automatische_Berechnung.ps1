@@ -520,9 +520,13 @@ Write-Host ""
 
 # --- TEMPORAERER ORDNER ---
 $runId      = [guid]::NewGuid().ToString("N").Substring(0, 8)
-# GetFolderPath beruecksichtigt umgeleitete Documents-Ordner (z.B. OneDrive)
+# Gemeinsamer Arbeitsordner der Office-Skripte unter %LOCALAPPDATA%. Bis
+# 29.09.2026 lag er in "Dokumente" - bei OneDrive-Ordnersicherung wurde so
+# jede Arbeitskopie (auch im Probelauf) hochgeladen. %LOCALAPPDATA% wird
+# nie umgeleitet. Alte Reste in "Dokumente" raeumt der Cleanup unten mit ab.
 $docsFolder = [Environment]::GetFolderPath('MyDocuments')
-$tempFolder = Join-Path $docsFolder "6_Excel_automatische_Berechnung_$runId"
+$arbeitsBasis = Join-Path $(if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $env:TEMP }) 'Dateimigration-Arbeitskopien'
+$tempFolder = Join-Path $arbeitsBasis "6_Excel_automatische_Berechnung_$runId"
 
 # Logs liegen direkt neben Skript/EXE. PSScriptRoot greift bei direktem
 # Aufruf; bei ps2exe-EXEs ist PSScriptRoot leer - dann liefert die
@@ -547,7 +551,8 @@ $scriptDir = Resolve-ScriptDirectory
 
 # --- CLEANUP: alte Temp-Ordner (>24h) und alte Logs (>30 Tage) ---
 $staleTempThreshold = (Get-Date).AddHours(-24)
-Get-ChildItem -LiteralPath $docsFolder -Directory -Filter "6_Excel_automatische_Berechnung_*" -ErrorAction SilentlyContinue |
+@($arbeitsBasis, $docsFolder) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+    ForEach-Object { Get-ChildItem -LiteralPath $_ -Directory -Filter "6_Excel_automatische_Berechnung_*" -ErrorAction SilentlyContinue } |
     Where-Object { $_.LastWriteTime -lt $staleTempThreshold } |
     ForEach-Object {
         try {

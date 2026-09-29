@@ -38,7 +38,7 @@
 # 3. VERTRAUENSWÜRDIGE SPEICHERORTE:
 #    ☑ Vertrauenswürdige Speicherorte im Netzwerk zulassen
 #    Folgende Speicherorte hinzufügen:
-#    • C:\Users\<Benutzername>\Documents (temporärer Arbeitsordner des Skripts)
+#    • %LOCALAPPDATA%\Dateimigration-Arbeitskopien (temporärer Arbeitsordner des Skripts)
 #    • Q:\ oder \\server\dfs (Quelldateien)
 #    Jeweils: ☑ Unterordner ... sind ebenfalls vertrauenswürdig
 #
@@ -143,6 +143,11 @@ try:
 except Exception:
     gem = None
 
+# Zuletzt verwendet: Ausgangszustand merken, damit spaeter nur die
+# eigenen Eintraege verschwinden (siehe _cleanup_user_recent).
+if gem is not None and hasattr(gem, "recent_momentaufnahme"):
+    gem.recent_momentaufnahme()
+
 
 
 IS_FROZEN = getattr(sys, "frozen", False)
@@ -245,6 +250,21 @@ def _resolve_script_directory() -> str:
 
 _docs_base = _resolve_documents_dir()
 
+# Gemeinsamer Arbeitsordner der Office-Skripte (Arbeitskopien, Lock-Datei).
+# Bis 29.09.2026 lag beides in "Dokumente"; bei OneDrive-Ordnersicherung
+# wanderte so jede Arbeitskopie in die Cloud. %LOCALAPPDATA% wird nie
+# umgeleitet. _docs_base bleibt nur Kandidat fuer das Protokollverzeichnis.
+def _resolve_arbeits_basis() -> str:
+    wurzel = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    try:
+        if os.path.isdir(wurzel):
+            wurzel = win32api.GetLongPathName(wurzel)
+    except Exception as _e:
+        detail_logger.debug(f"_resolve_arbeits_basis: Exception verworfen: {_e!r}")
+    return os.path.join(wurzel, "Dateimigration-Arbeitskopien")
+
+_arbeits_basis = _resolve_arbeits_basis()
+
 def _select_log_directory() -> str:
     candidates = [_resolve_script_directory(), _docs_base, tempfile.gettempdir()]
     for d in candidates:
@@ -260,7 +280,7 @@ def _select_log_directory() -> str:
     return os.getcwd()
 
 TEMP_PROCESS_PATH = os.path.join(
-    _docs_base, f"3c_ppt_pptx_auf_neueste_Version_aktualisieren_{os.getpid()}"
+    _arbeits_basis, f"3c_ppt_pptx_auf_neueste_Version_aktualisieren_{os.getpid()}"
 )
 _TEMP_PROCESS_PREFIX_LOWER = "3c_ppt_pptx_auf_neueste_version_aktualisieren_"
 MAX_PATH_LEN           = 240
@@ -603,7 +623,11 @@ def _lock_file_path(target_dir: str) -> str:
     digest = hashlib.sha1(
         os.path.normcase(os.path.abspath(target_dir)).encode("utf-8")
     ).hexdigest()[:16]
-    return os.path.join(_docs_base, f"3c_ppt_updater_{digest}.lock")
+    try:
+        os.makedirs(_arbeits_basis, exist_ok=True)
+    except OSError:
+        pass
+    return os.path.join(_arbeits_basis, f"3c_ppt_updater_{digest}.lock")
 
 
 def _acquire_lock(target_dir: str) -> Optional[str]:
@@ -1500,64 +1524,24 @@ def _cleanup_ppt_inetcache() -> None:
 
 
 def _cleanup_user_recent() -> None:
-    # Seit Windows Vista liegt der Recent-Ordner unter
-    # %APPDATA%\Microsoft\Windows\Recent. %USERPROFILE%\Recent ist nur
-    # noch eine Kompatibilitaets-Junction mit Deny-List-ACL (Auflisten
-    # wirft PermissionError) und dient hier lediglich als Fallback.
-    candidates = []
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        candidates.append(
-            os.path.join(appdata, "Microsoft", "Windows", "Recent"))
-    user_profile = os.environ.get("USERPROFILE")
-    if user_profile:
-        candidates.append(os.path.join(user_profile, "Recent"))
-
-    recent_dir = None
-    for cand in candidates:
-        if cand.lower().endswith(os.sep + "recent") and os.path.isdir(cand):
-            recent_dir = cand
-            break
-    if recent_dir is None:
+    # Bis 29.09.2026 loeschte diese Funktion JEDE Verknuepfung im
+    # Windows-Ordner "Zuletzt verwendet" - auch die des Anwenders. Jetzt
+    # entfernt sie nur Verknuepfungen, die seit dem Skriptstart entstanden
+    # sind und auf das bearbeitete Verzeichnis oder den Arbeitsordner
+    # zeigen (_gemeinsam.recent_eigene_entfernen). Ohne _gemeinsam.py
+    # bleibt der Ordner unangetastet.
+    entfernen = getattr(gem, "recent_eigene_entfernen", None)
+    if entfernen is None:
         return
-
-    files_deleted = 0
-    files_skipped = 0
-    bytes_freed   = 0
-
     try:
-        for entry in os.listdir(recent_dir):
-            if not entry.lower().endswith(".lnk"):
-                continue
-            fpath = os.path.join(recent_dir, entry)
-            if not os.path.isfile(fpath):
-                continue
-            try:
-                fsize = os.path.getsize(fpath)
-            except OSError:
-                fsize = 0
-            try:
-                try:
-                    os.chmod(fpath, 0o666)
-                except Exception as _e:
-                    detail_logger.debug(f"_cleanup_user_recent: Exception verworfen: {_e!r}")
-                os.remove(fpath)
-                files_deleted += 1
-                bytes_freed   += fsize
-            except (OSError, PermissionError) as e:
-                files_skipped += 1
-                detail_logger.debug(
-                    f"Recent: .lnk gesperrt, uebersprungen: {fpath} ({e})")
+        geloescht, gesperrt = entfernen()
     except Exception as e:
         detail_logger.debug(f"Recent-Cleanup unerwarteter Fehler: {e}")
         return
-
-    if files_deleted > 0 or files_skipped > 0:
-        kb = bytes_freed / 1024
+    if geloescht or gesperrt:
         detail_logger.info(
-            f"Windows-Recent aufgeraeumt: "
-            f"{files_deleted} .lnk-Dateien geloescht ({kb:.1f} KB), "
-            f"{files_skipped} gesperrt/uebersprungen")
+            f"Windows-Recent: {geloescht} eigene Verknuepfung(en) entfernt, "
+            f"{gesperrt} gesperrt/uebersprungen")
 
 
 # ==================================================================
@@ -3615,6 +3599,8 @@ if __name__ == "__main__":
             print(f"\nVerarbeite: '{start_dir}'")
         print("-" * 66)
 
+        if gem is not None and hasattr(gem, "recent_wurzel_hinzufuegen"):
+            gem.recent_wurzel_hinzufuegen(start_dir)
         stats_result, run_completed = process_directory(
             start_dir, skip_pwd, count_first,
             show_progress=show_progress,

@@ -62,6 +62,12 @@ Trockenlauf; `10_dateinamen_bereinigen.py` etwa `--dry-run`. Auf einem
 Bestand, den man nicht selbst angelegt hat, ist der erste Lauf immer ein
 Probelauf.
 
+**Arbeitsordner.** Die Office-Skripte legen ihre Arbeitskopien unter
+`%LOCALAPPDATA%\Dateimigration-Arbeitskopien` ab — nicht in „Dokumente",
+das bei OneDrive-Ordnersicherung jede Kopie hochladen würde. Tragen Sie
+diesen Ordner in Word, Excel und PowerPoint als vertrauenswürdigen
+Speicherort ein (mit Unterordnern); die Skripte nennen ihn beim Start.
+
 **Sicherung.** Die Skripte arbeiten auf den Dateien selbst. Was sie ändern,
 ändern sie richtig — aber eine Sicherung ersetzt das nicht.
 
@@ -83,6 +89,14 @@ Benutzerkennwort, sonst bleibt die Datei, wie sie ist.
 **`7` wandelt nur, was wirklich makrofrei ist.** Nicht „sieht so aus" —
 gezählt werden die Zeilen VBA-Code. Bei einer einzigen bleibt die Datei
 unangetastet.
+
+**`4a`–`4c` lassen Symbolschriften stehen.** Text in Wingdings, Symbol,
+Webdings und anderen Symbolschriften behält seine Schrift — sonst würde aus
+einem Häkchen ein Buchstabe.
+
+**Die Listen „Zuletzt verwendet" bleiben Ihre.** Entfernt werden nur
+Einträge, die während des Laufs für das bearbeitete Verzeichnis oder den
+Arbeitsordner entstanden sind.
 
 **Nichts wird stillschweigend zurechtgebogen.** Was nicht ins Muster passt,
 steht hinterher im Protokoll.

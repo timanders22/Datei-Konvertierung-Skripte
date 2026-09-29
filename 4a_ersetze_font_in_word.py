@@ -34,7 +34,7 @@
 # 3. VERTRAUENSWÜRDIGE SPEICHERORTE:
 #    ☑ Vertrauenswürdige Speicherorte im Netzwerk zulassen (nur bei Netzwerkquellen)
 #    Folgende Speicherorte hinzufügen:
-#    • <Documents>\4a_ersetze_font_in_word
+#    • %LOCALAPPDATA%\Dateimigration-Arbeitskopien\4a_ersetze_font_in_word
 #      (zwingend – temporärer Arbeitsordner des Skripts für Long-Path-Dateien)
 #    • Bei Quellen auf Q:\, R:\, G:\ oder \\server\dfs zusätzlich:
 #      jeweiligen Pfad eintragen, ☑ Unterordner sind ebenfalls vertrauenswürdig
@@ -145,6 +145,35 @@ try:
     import _gemeinsam as gem
 except Exception:
     gem = None
+
+# Zuletzt verwendet: Ausgangszustand merken, damit spaeter nur die
+# eigenen Eintraege verschwinden (siehe _cleanup_user_recent).
+if gem is not None and hasattr(gem, "recent_momentaufnahme"):
+    gem.recent_momentaufnahme()
+
+# Symbolschriften (Wingdings, Symbol ...) werden nie ersetzt: dort steht
+# hinter jedem Zeichencode ein Bild, und aus einem Haekchen wuerde in Arial
+# ein Buchstabe. Erkennung in _gemeinsam.py (feste Liste plus alle
+# installierten Schriften mit Symbolzeichensatz); fehlt es, gilt diese Liste.
+_SYMBOLSCHRIFTEN_RUECKFALL = (
+    "Symbol", "Wingdings", "Wingdings 2", "Wingdings 3", "Webdings",
+    "Marlett", "MT Extra", "Bookshelf Symbol 7", "MS Reference Specialty",
+    "MS Outlook", "ZapfDingbats", "Zapf Dingbats", "Segoe MDL2 Assets",
+    "Segoe Fluent Icons",
+)
+
+
+def _symbolschrift_namen() -> list:
+    if gem is not None and hasattr(gem, "symbolschrift_namen"):
+        return gem.symbolschrift_namen()
+    return list(_SYMBOLSCHRIFTEN_RUECKFALL)
+
+
+def _ist_symbolschrift(name) -> bool:
+    if gem is not None and hasattr(gem, "ist_symbolschrift"):
+        return gem.ist_symbolschrift(name)
+    return bool(name) and str(name).strip().lower() in {
+        n.lower() for n in _SYMBOLSCHRIFTEN_RUECKFALL}
 
 # ==================================================================
 # COM-Konstanten
@@ -280,7 +309,13 @@ def _get_documents_base() -> str:
 # Konfiguration
 # ==================================================================
 NEW_FONT_NAME     = "Arial"
-TEMP_BASE_PATH    = os.path.join(_get_documents_base(), "4a_ersetze_font_in_word")
+# Gemeinsamer Arbeitsordner der Office-Skripte. Bis 29.09.2026 lag er in
+# "Dokumente"; bei OneDrive-Ordnersicherung wanderte so jede Arbeitskopie
+# in die Cloud. %LOCALAPPDATA% wird nie umgeleitet.
+ARBEITS_BASIS     = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or _get_documents_base(),
+    "Dateimigration-Arbeitskopien")
+TEMP_BASE_PATH    = os.path.join(ARBEITS_BASIS, "4a_ersetze_font_in_word")
 TEMP_PROCESS_PATH = None
 MAX_PATH_LEN      = 240
 WINDOWS_MAX_PATH  = 260
@@ -520,80 +555,24 @@ def _cleanup_word_inetcache() -> None:
 
 
 def _cleanup_user_recent() -> None:
-    """Raeumt den Windows-Recent-Ordner (%USERPROFILE%\\Recent) auf.
-
-    Hier liegen .lnk-Verknuepfungen aller kuerzlich geoeffneten Dateien
-    (nicht nur Word). Bei einem Lauf ueber tausende Dokumente sammeln
-    sich entsprechend viele Verknuepfungen an, was die Recent-Liste
-    in Office-Anwendungen, Explorer und Sprung-Listen verlangsamt.
-
-    Es werden NUR .lnk-Dateien geloescht. Der Recent-Ordner selbst
-    bleibt erhalten.
-
-    BEWUSSTE DESIGN-ENTSCHEIDUNG: Diese Verknuepfungen sind systemweit
-    (alle Programme), nicht nur Word. Akzeptabel im Kontext eines
-    Massen-Verarbeitungs-Skripts.
-
-    DARF NUR AUFGERUFEN WERDEN, WENN DAS SKRIPT-WORD NICHT LAEUFT.
-    """
-    # Seit Windows Vista liegt der Recent-Ordner unter
-    # %APPDATA%\Microsoft\Windows\Recent. %USERPROFILE%\Recent ist nur
-    # noch eine Kompatibilitaets-Junction mit Deny-List-ACL (Auflisten
-    # wirft PermissionError) und dient hier lediglich als Fallback.
-    candidates = []
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        candidates.append(
-            os.path.join(appdata, "Microsoft", "Windows", "Recent"))
-    user_profile = os.environ.get("USERPROFILE")
-    if user_profile:
-        candidates.append(os.path.join(user_profile, "Recent"))
-
-    recent_dir = None
-    for cand in candidates:
-        if cand.lower().endswith(os.sep + "recent") and os.path.isdir(cand):
-            recent_dir = cand
-            break
-    if recent_dir is None:
+    # Bis 29.09.2026 loeschte diese Funktion JEDE Verknuepfung im
+    # Windows-Ordner "Zuletzt verwendet" - auch die des Anwenders. Jetzt
+    # entfernt sie nur Verknuepfungen, die seit dem Skriptstart entstanden
+    # sind und auf das bearbeitete Verzeichnis oder den Arbeitsordner
+    # zeigen (_gemeinsam.recent_eigene_entfernen). Ohne _gemeinsam.py
+    # bleibt der Ordner unangetastet.
+    entfernen = getattr(gem, "recent_eigene_entfernen", None)
+    if entfernen is None:
         return
-
-    files_deleted = 0
-    files_skipped = 0
-    bytes_freed   = 0
-
     try:
-        for entry in os.listdir(recent_dir):
-            if not entry.lower().endswith(".lnk"):
-                continue
-            fpath = os.path.join(recent_dir, entry)
-            if not os.path.isfile(fpath):
-                continue
-            try:
-                fsize = os.path.getsize(fpath)
-            except OSError:
-                fsize = 0
-            try:
-                try:
-                    os.chmod(fpath, stat.S_IWRITE)
-                except Exception as _e:
-                    detail_logger.debug(f"_cleanup_user_recent: Exception verworfen: {_e!r}")
-                os.remove(fpath)
-                files_deleted += 1
-                bytes_freed   += fsize
-            except (OSError, PermissionError) as e:
-                files_skipped += 1
-                detail_logger.debug(
-                    f"Recent: .lnk gesperrt, uebersprungen: {fpath} ({e})")
+        geloescht, gesperrt = entfernen()
     except Exception as e:
         detail_logger.debug(f"Recent-Cleanup unerwarteter Fehler: {e}")
         return
-
-    if files_deleted > 0 or files_skipped > 0:
-        kb = bytes_freed / 1024
+    if geloescht or gesperrt:
         detail_logger.info(
-            f"Windows-Recent aufgeraeumt: "
-            f"{files_deleted} .lnk-Dateien geloescht ({kb:.1f} KB), "
-            f"{files_skipped} gesperrt/uebersprungen")
+            f"Windows-Recent: {geloescht} eigene Verknuepfung(en) entfernt, "
+            f"{gesperrt} gesperrt/uebersprungen")
 
 
 # ==================================================================
@@ -1128,6 +1107,27 @@ def test_trust_center_smoke(timeout: float = 25.0) -> Tuple[bool, str, str]:
             detail_logger.debug(f"test_trust_center_smoke: Exception verworfen: {_e!r}")
 
 
+def _eigene_word_mru_entfernen(word) -> None:
+    # Word traegt die Arbeitskopien trotz AddToRecentFiles=False in seine
+    # Liste "Zuletzt verwendet" ein (am 29.09.2026 in der Registry
+    # gesehen: sechs Eintraege auf 4a-Arbeitsordner). Entfernt werden nur
+    # Eintraege im bearbeiteten Verzeichnis oder im Arbeitsordner; ohne
+    # _gemeinsam.py bleibt die Liste unangetastet.
+    ist_eigen = getattr(gem, "recent_ist_eigen", None)
+    if ist_eigen is None or word is None:
+        return
+    try:
+        for i in range(word.RecentFiles.Count, 0, -1):
+            try:
+                eintrag = word.RecentFiles(i)
+                if ist_eigen(os.path.join(eintrag.Path, eintrag.Name)):
+                    eintrag.Delete()
+            except Exception as _e:
+                detail_logger.debug(f"_eigene_word_mru_entfernen: Exception verworfen: {_e!r}")
+    except Exception as _e:
+        detail_logger.debug(f"_eigene_word_mru_entfernen: Exception verworfen: {_e!r}")
+
+
 def _restore_word_settings(
     word,
     original_screen_updating: bool,
@@ -1138,6 +1138,7 @@ def _restore_word_settings(
     original_update_links: bool = False,
     original_no_prompt_convert: bool = False,
 ) -> None:
+    _eigene_word_mru_entfernen(word)
     try:
         word.ScreenUpdating = original_screen_updating
     except Exception as _e:
@@ -2006,6 +2007,89 @@ def file_generator(directory: str):
 # Font-Ersetzung auf einzelnen Ranges/Shapes (COM)
 # ==================================================================
 
+# Bis 29.09.2026 setzte 4a die Zielschrift pauschal - auch ueber Text in
+# Wingdings/Symbol. Aus einem Haekchen wurde dabei ein "ü". Jetzt merkt sich
+# _set_font_on_range vorher alle Stellen in Symbolschrift (Word-Suche mit
+# Format) und schreibt ihre vier Schriftnamen danach zurueck.
+
+# Obergrenze je Bereich und Schrift - schuetzt vor einer Endlosschleife,
+# falls Word an einer Stelle nicht weitersucht.
+SYMBOL_STELLEN_MAX = 20000
+
+# Symbolschriften, die das gerade bearbeitete Dokument ueberhaupt kennt
+# (None = unbekannt, dann werden alle gesucht). Gemessen am 29.09.2026: jede
+# Suche kostet je Textbereich einen COM-Aufruf; alle 22 Symbolschriften
+# ueber Haupttext, Kopf-/Fusszeilen, Tabellen und Textfelder machten aus
+# 10 s pro Dokument ueber eine Minute.
+_SYMBOL_KANDIDATEN = None
+
+
+def _symbolschriften_im_dokument(doc):
+    """Symbolschriften aus word/fontTable.xml der geoeffneten Datei, oder None."""
+    try:
+        with zipfile.ZipFile(prepare_long_path(doc.FullName)) as z:
+            xml = z.read("word/fontTable.xml").decode("utf-8", errors="ignore")
+    except Exception as _e:
+        detail_logger.debug(f"_symbolschriften_im_dokument: Exception verworfen: {_e!r}")
+        return None
+    namen = set(re.findall(r'<w:font\s+w:name="([^"]+)"', xml))
+    return sorted(n for n in namen if _ist_symbolschrift(n))
+
+
+def _symbolstellen_finden(rng) -> list:
+    """Stellen in Symbolschrift: (Start, Ende, Name, Ascii, Other, Bi, FarEast)."""
+    stellen = []
+    try:
+        anfang, ende = rng.Start, rng.End
+    except Exception:
+        return stellen
+    kandidaten = (_SYMBOL_KANDIDATEN if _SYMBOL_KANDIDATEN is not None
+                  else _symbolschrift_namen())
+    for name in kandidaten:
+        try:
+            r = rng.Duplicate
+            f = r.Find
+            f.ClearFormatting()
+            f.Text = ""
+            f.Replacement.Text = ""
+            f.Format = True
+            f.Forward = True
+            f.Wrap = 0                      # wdFindStop
+            f.MatchWildcards = False
+            f.Font.Name = name
+            n = 0
+            while f.Execute() and n < SYMBOL_STELLEN_MAX:
+                if r.Start >= ende or r.End <= anfang or r.End <= r.Start:
+                    break
+                s, e = max(r.Start, anfang), min(r.End, ende)
+                fo = r.Font
+                stellen.append((s, e, fo.Name, fo.NameAscii, fo.NameOther,
+                                fo.NameBi, fo.NameFarEast))
+                n += 1
+                r.Collapse(0)               # wdCollapseEnd
+        except Exception as _e:
+            detail_logger.debug(f"_symbolstellen_finden: Exception verworfen: {_e!r}")
+    return stellen
+
+
+def _symbolstellen_zurueck(rng, stellen: list) -> None:
+    for s, e, name, ascii_, other, bi, fe in stellen:
+        try:
+            r = rng.Duplicate
+            r.SetRange(s, e)
+            fo = r.Font
+            for attr, wert in (("Name", name), ("NameAscii", ascii_),
+                               ("NameOther", other), ("NameBi", bi),
+                               ("NameFarEast", fe)):
+                if wert:
+                    try:
+                        setattr(fo, attr, wert)
+                    except Exception as _e:
+                        detail_logger.debug(f"_symbolstellen_zurueck: Exception verworfen: {_e!r}")
+        except Exception as _e:
+            detail_logger.debug(f"_symbolstellen_zurueck: Exception verworfen: {_e!r}")
+
+
 def _set_all_font_names(font, font_name: str) -> None:
     try:
         if font.Name != font_name:
@@ -2022,14 +2106,26 @@ def _set_all_font_names(font, font_name: str) -> None:
 
 def _set_font_on_range(rng, font_name: str) -> None:
     try:
+        einheitlich = rng.Font.Name
+    except Exception:
+        einheitlich = ""
+    if _ist_symbolschrift(einheitlich):
+        return
+    # Einheitliche, normale Schrift: darin steckt keine Symbolschrift, die
+    # Suche entfaellt. Word meldet bei gemischten Schriften einen leeren Namen.
+    stellen = [] if einheitlich else _symbolstellen_finden(rng)
+    try:
         _set_all_font_names(rng.Font, font_name)
     except Exception as _e:
         detail_logger.debug(f"_set_font_on_range: Exception verworfen: {_e!r}")
+    if stellen:
+        _symbolstellen_zurueck(rng, stellen)
 
 
 def _apply_smartart_node(node, font_name: str) -> None:
     try:
-        _set_all_font_names(node.TextFrame2.TextRange.Font, font_name)
+        if not _ist_symbolschrift(node.TextFrame2.TextRange.Font.Name):
+            _set_all_font_names(node.TextFrame2.TextRange.Font, font_name)
     except Exception as _e:
         detail_logger.debug(f"_apply_smartart_node: Exception verworfen: {_e!r}")
     try:
@@ -2072,7 +2168,7 @@ def _set_font_on_shape(shape, font_name: str) -> None:
 
     try:
         tef = shape.TextEffect
-        if tef is not None:
+        if tef is not None and not _ist_symbolschrift(tef.FontName):
             tef.FontName = font_name
     except Exception as _e:
         detail_logger.debug(f"_set_font_on_shape: Exception verworfen: {_e!r}")
@@ -2270,7 +2366,7 @@ def replace_fonts_in_document_com(
 ) -> str:
     # word_app_global wird hier ggf. auf None gesetzt, wenn der Watchdog
     # die Word-Instanz killt. Aufrufer prueft danach und startet Word neu.
-    global word_app_global
+    global word_app_global, _SYMBOL_KANDIDATEN
 
     pbar.write(f"Prüfe: {os.path.basename(file_path)}")
     detail_logger.info(f"=== Starte: {file_path} ===")
@@ -2596,9 +2692,14 @@ def replace_fonts_in_document_com(
         except Exception as e_conv:
             detail_logger.debug(f"doc.Convert() nicht möglich: {e_conv}")
 
+        _SYMBOL_KANDIDATEN = _symbolschriften_im_dokument(doc)
+        detail_logger.debug(f"Symbolschriften im Dokument: {_SYMBOL_KANDIDATEN}")
+
         # ── 1. Formatvorlagen (Styles) ────────────────────────────────────
         for style in doc.Styles:
             try:
+                if _ist_symbolschrift(style.Font.Name):
+                    continue
                 _set_all_font_names(style.Font, font_name)
             except Exception as _e:
                 detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
@@ -3780,6 +3881,8 @@ if __name__ == "__main__":
     stats_result = None
 
     try:
+        if gem is not None and hasattr(gem, "recent_wurzel_hinzufuegen"):
+            gem.recent_wurzel_hinzufuegen(start_dir)
         stats_result = process_directory(
             start_dir, NEW_FONT_NAME, metadata_types, count_first,
             show_progress=show_progress,

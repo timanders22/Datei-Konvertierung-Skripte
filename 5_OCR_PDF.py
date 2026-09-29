@@ -29,7 +29,9 @@
 # ANHÄNGE: Dateien mit eingebetteten Dateien (ZUGFeRD/XRechnung, Akten-
 # anhänge) werden bei PDF/A-Ausgabe übersprungen. Jede Ausgabe wird vor dem
 # Ersetzen gegen das Original geprüft (Seiten, Anhänge, Formularfelder).
-# --clear-mru:         Recent-Documents-Liste leeren (Default: Aus)
+# --clear-mru:         GESAMTE Windows-Liste "Zuletzt verwendet" leeren,
+#                      auch fremde Eintraege (Default: Aus). Das Skript
+#                      selbst legt dort keine Eintraege an.
 # --no-initial-scan:   Watch-Modus: vorhandene PDFs beim Start NICHT
 #                      einreihen (Default: Initial-Scan aktiv)
 # --print-safe:        Bildschonendes Profil für ALLE Dateien erzwingen
@@ -563,21 +565,6 @@ def _get_app_data_dir() -> str:
     return d
 
 
-def _get_documents_folder() -> str:
-    p = _get_known_folder(FOLDERID_DOCUMENTS)
-    if p and os.path.isdir(p):
-        return p
-    userprofile = os.environ.get("USERPROFILE", "")
-    if userprofile:
-        docs = os.path.join(userprofile, "Documents")
-        if os.path.isdir(docs):
-            return docs
-    docs = os.path.join(os.path.expanduser("~"), "Documents")
-    if os.path.isdir(docs):
-        return docs
-    return os.environ.get("TEMP", os.environ.get("TMP", r"C:\Temp"))
-
-
 # ==================================================================
 # Konfiguration
 # ==================================================================
@@ -600,8 +587,12 @@ def _get_log_dir() -> str:
 
 LOG_DIR = _get_log_dir()
 
+# Gemeinsamer Arbeitsordner der Skriptsammlung. Bis 29.09.2026 lag er in
+# "Dokumente"; bei OneDrive-Ordnersicherung wanderte so jede Arbeitskopie
+# in die Cloud. %LOCALAPPDATA% wird nie umgeleitet.
 TEMP_DIR = os.path.join(
-    _get_documents_folder(),
+    os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+    "Dateimigration-Arbeitskopien",
     f"5_OCR_PDF_Processing_{os.getpid()}"
 )
 MAX_PATH_LEN      = 200
@@ -1120,6 +1111,9 @@ def _install_signal_handlers() -> None:
 # ==================================================================
 
 def clear_mru() -> None:
+    # Leert die GANZE Windows-Liste "Zuletzt verwendet" (SHAddToRecentDocs
+    # mit NULL), nicht nur eigene Eintraege - deshalb nur auf ausdruecklichen
+    # Wunsch (--clear-mru). ocrmypdf und dieses Skript legen dort nichts an.
     try:
         SHARD_PIDL = 0x00000001
         ctypes.windll.shell32.SHAddToRecentDocs(SHARD_PIDL, None)
@@ -1851,7 +1845,7 @@ def is_real_pdf(file_path: str) -> bool:
 
 
 def create_temp_copy(file_path: str, temp_dir: str) -> Optional[str]:
-    # Temp-Kopie nach Documents (lokal) mit AV-Scanner-Toleranz
+    # Temp-Kopie in den lokalen Arbeitsordner mit AV-Scanner-Toleranz
     try:
         base = os.path.basename(file_path)
         max_name = TEMP_BASENAME_MAX - 33
@@ -2624,35 +2618,36 @@ def pruefe_ausgabe_vollstaendig(original: str, ocr_eingabe: str,
     return "; ".join(gruende) if gruende else None
 
 
-def try_remove_empty_password(file_path: str, temp_dir: str) -> bool:
-    # Scanner/Multifunktionsgeraete erzeugen haeufig PDFs mit reinem
-    # Owner-Passwort: is_encrypted ist wahr, aber das Benutzerpasswort
-    # ist leer. Solche Dateien lassen sich mit pikepdf oeffnen und
-    # unverschluesselt neu speichern; Zeitstempel und NTFS-Sicherheits-
-    # info des Originals bleiben dabei erhalten. PDFs mit echtem
-    # Benutzerpasswort scheitern hier und werden wie bisher uebersprungen.
+def entschluesselte_arbeitskopie(file_path: str, temp_dir: str) -> Optional[str]:
+    """Entschluesselt eine PDF mit leerem Benutzerpasswort in eine ARBEITSKOPIE.
+
+    Scanner/Multifunktionsgeraete erzeugen haeufig PDFs mit reinem
+    Owner-Passwort: is_encrypted ist wahr, aber das Benutzerpasswort ist
+    leer. pikepdf oeffnet sie und speichert sie unverschluesselt. PDFs mit
+    echtem Benutzerpasswort scheitern hier (None) und werden uebersprungen.
+
+    Bis 29.09.2026 hiess die Funktion try_remove_empty_password und schob
+    das Ergebnis SOFORT ueber das Original - auch wenn die Datei danach
+    wegen Formularfeldern, Anhaengen, Marker oder einem OCR-Fehler gar
+    nicht bearbeitet wurde. Das Original verlor dann seine Verschluesselung
+    (und damit z. B. Druck-/Kopiersperren) ohne jede OCR. Jetzt gilt dasselbe
+    wie fuer die Reparatur (Befund E2): die Arbeitskopie ist nur die
+    OCR-Eingabe, ersetzt wird das Original erst mit dem geprueften Ergebnis.
+    """
     try:
         import pikepdf
     except ImportError:
-        return False
-    tmp_path   = os.path.join(temp_dir, f"{uuid.uuid4().hex}_decrypted.pdf")
-    orig_times = _read_file_times(file_path)
-    orig_sd    = _get_security_descriptor(file_path)
+        return None
+    tmp_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}_decrypted.pdf")
     try:
         with pikepdf.Pdf.open(_lp(file_path), password="") as pdf:
             pdf.save(tmp_path)
-        if not safe_replace_with_retry(tmp_path, file_path):
-            safe_remove(tmp_path)
-            return False
-        _apply_security_descriptor(file_path, orig_sd)
-        if orig_times:
-            _write_file_times(file_path, orig_times)
-        return True
+        return tmp_path
     except Exception as e:
         log_debug("decrypt",
                   f"Leeres-Passwort-Entschluesselung nicht moeglich ({file_path}): {_fmt_exc(e)}")
         safe_remove(tmp_path)
-        return False
+        return None
 
 
 # ==================================================================
@@ -3769,14 +3764,20 @@ def process_pdf_file(
     pwrite(f"  ℹ️  Seiten: {pdf_info['pages']}, "
            f"Größe: {pdf_info['size_mb']:.2f} MB")
 
+    entschluesselt: Optional[str] = None
     if pdf_info["is_encrypted"]:
         # Owner-Only-Verschluesselung (leeres Benutzerpasswort) ist bei
-        # Scanner-PDFs haeufig und laesst sich verlustfrei entfernen.
+        # Scanner-PDFs haeufig; die OCR laeuft auf einer entschluesselten
+        # Arbeitskopie, das Original bleibt bis zum Ersetzen unveraendert.
         pwrite("  🔐 Verschlüsselt – prüfe auf leeres Benutzerpasswort ...")
-        if try_remove_empty_password(file_path, temp_dir):
-            pwrite("  🔓 Owner-Only-Verschlüsselung entfernt – Verarbeitung möglich")
-            linfo(log_context, f"Leeres Benutzerpasswort – Verschluesselung entfernt: {file_path}")
-            pdf_info = get_pdf_info(file_path)
+        entschluesselt = entschluesselte_arbeitskopie(file_path, temp_dir)
+        if entschluesselt:
+            arbeitsreste.append(entschluesselt)
+            pwrite("  🔓 Leeres Benutzerpasswort – entschlüsselte Arbeitskopie (Original unverändert)")
+            linfo(log_context, f"Leeres Benutzerpasswort – Arbeitskopie {entschluesselt}: {file_path}")
+            pdf_info = get_pdf_info(entschluesselt)
+            pdf_info["path"]    = file_path
+            pdf_info["size_mb"] = file_size_mb
             if not pdf_info["is_valid"] or pdf_info["is_encrypted"]:
                 pwrite("  ⚠️  Nach Entschlüsselung nicht lesbar – überspringe")
                 lwarn(log_context, f"Nach Entschluesselung nicht lesbar: {file_path}")
@@ -3865,7 +3866,7 @@ def process_pdf_file(
     repariert: Optional[str] = None
     if pdf_info["needs_repair"]:
         pwrite("  🔧 Beschädigte PDF-Struktur – repariere Arbeitskopie ...")
-        repariert = repair_pdf_arbeitskopie(file_path, temp_dir)
+        repariert = repair_pdf_arbeitskopie(entschluesselt or file_path, temp_dir)
         if repariert:
             arbeitsreste.append(repariert)
             pwrite("  ✓ Reparatur erfolgreich (Arbeitskopie; Original unverändert)")
@@ -3959,8 +3960,11 @@ def process_pdf_file(
 
     # --- Temporäre Kopie als Input (mit AV-Scanner-Toleranz) ---
     # Nach einer Reparatur ist die reparierte Arbeitskopie die Eingabe.
+    # Nach einer Entschluesselung ebenso deren Arbeitskopie.
     if repariert and safe_exists(repariert):
         temp_input = repariert
+    elif entschluesselt and safe_exists(entschluesselt):
+        temp_input = entschluesselt
     else:
         temp_input = create_temp_copy(file_path, temp_dir)
     if not temp_input:
@@ -5749,7 +5753,8 @@ def main() -> None:
                         help="Reste abgebrochener Läufe (*.pdf.tmp_new, *.pdf.tmp_marker, "
                              "inhaltsgleiche *.pdf.backup) beim Start rekursiv aufräumen")
     parser.add_argument("--clear-mru", action="store_true",
-                        help="Recent-Documents-Liste leeren (Default: aus)")
+                        help="GESAMTE Windows-Liste 'Zuletzt verwendet' leeren, auch "
+                             "fremde Einträge; das Skript selbst legt keine an (Default: aus)")
     parser.add_argument("--no-initial-scan", action="store_true",
                         help="Watch-Modus: vorhandene PDFs beim Start nicht einreihen")
     parser.add_argument("--print-safe", action="store_true",
