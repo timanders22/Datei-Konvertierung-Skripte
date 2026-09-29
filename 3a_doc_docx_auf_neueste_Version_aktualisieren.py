@@ -1663,6 +1663,37 @@ def safe_word_open(word_app, file_path, pw, is_binary,
     )
 
 
+def _schreibkennwort_entfernen(pfad: str) -> bool:
+    """Entfernt <w:writeProtection> mit Kennwort-Hash aus einer .docx/.docm.
+
+    Gemessen am 30.09.2026: aus einer .doc mit Schreibkennwort erzeugt Word
+    per SaveAs2 eine .docx, die das Kennwort weiter traegt - WritePassword=""
+    wird dabei ignoriert. Entscheidung des Anwenders vom selben Tag:
+    Schreibkennwoerter werden beim Umwandeln entfernt (wie in 3b). Der
+    Bearbeitungsschutz (w:documentProtection) ist etwas anderes und bleibt.
+    Rueckgabe: True, wenn etwas entfernt wurde.
+    """
+    import zipfile
+    try:
+        with zipfile.ZipFile(prepare_long_path(pfad)) as z:
+            settings = z.read("word/settings.xml")
+    except Exception:
+        return False
+    muster = re.compile(rb"<w:writeProtection\b[^>]*/>|<w:writeProtection\b[^>]*>.*?</w:writeProtection>", re.S)
+    treffer = muster.search(settings)
+    if not treffer or not re.search(rb"w:(hashValue|hash|salt|cryptProviderType)=", treffer.group(0)):
+        return False
+    neu = pfad + ".ohne_kennwort"
+    with zipfile.ZipFile(prepare_long_path(pfad)) as zi, zipfile.ZipFile(neu, "w", zipfile.ZIP_DEFLATED) as zo:
+        for info in zi.infolist():
+            daten = zi.read(info.filename)
+            if info.filename == "word/settings.xml":
+                daten = muster.sub(b"", daten)
+            zo.writestr(info, daten)
+    os.replace(neu, pfad)
+    return True
+
+
 def safe_word_saveas(word_app, doc, target_path, file_format, compat_mode,
                      timeout: float = SAVEAS_TIMEOUT, word_pid=None):
     try:
@@ -3251,6 +3282,10 @@ def end_compatibility_mode(
         doc.Close(SaveChanges=COM_FALSE)
         doc = None
         time.sleep(0.3)
+
+        if _schreibkennwort_entfernen(temp_save_path):
+            pbar.write("  → Schreibkennwort entfernt.")
+            detail_logger.info(f"Schreibkennwort entfernt: {original_path}")
 
         if not verify_file(temp_save_path):
             raise Exception("Verifizierung der konvertierten Datei fehlgeschlagen")

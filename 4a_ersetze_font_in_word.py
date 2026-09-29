@@ -2266,6 +2266,26 @@ def _eigene_besitzerdatei_entfernen(path: str) -> None:
             detail_logger.warning(f"Besitzerdatei nicht entfernbar: {owner} – {e!r}")
 
 
+def _kopie_ohne_schreibkennwort(quelle: str, ziel: str) -> None:
+    """Kopie einer .docx/.docm/.dotx/.dotm ohne <w:writeProtection>.
+
+    Entscheidung des Anwenders vom 30.09.2026: Schreibkennwoerter werden
+    entfernt, nicht uebersprungen. Word selbst kann ein so geschuetztes
+    Dokument nur schreibgeschuetzt oeffnen; Stage 2 speichert aber teils per
+    Save() an Ort und Stelle. Deshalb auf Dateiebene, in einer Arbeitskopie,
+    die wie eine Langpfad-Kopie behandelt und am Ende zurueckgeschoben wird.
+    Die Empfehlung "schreibgeschuetzt oeffnen" ohne Kennwort geht dabei mit.
+    """
+    muster = re.compile(rb"<w:writeProtection\b[^>]*/>|<w:writeProtection\b[^>]*>.*?</w:writeProtection>", re.S)
+    with zipfile.ZipFile(prepare_long_path(quelle)) as zi, \
+            zipfile.ZipFile(ziel, "w", zipfile.ZIP_DEFLATED) as zo:
+        for info in zi.infolist():
+            daten = zi.read(info.filename)
+            if info.filename == "word/settings.xml":
+                daten = muster.sub(b"", daten)
+            zo.writestr(info, daten)
+
+
 def _ooxml_kennwort_grund(path: str) -> str:
     """'' wenn die OOXML-Datei ohne Kennwort zu oeffnen ist, sonst den Grund.
 
@@ -2429,11 +2449,8 @@ def replace_fonts_in_document_com(
                        f"{os.path.basename(original_path)}")
             detail_logger.info(f"Übersprungen (OOXML verschlüsselt): {original_path}")
             return "SKIPPED_ENCRYPTED"
-        if _kw_grund == "schreibkennwort":
-            pbar.write(f"  ->  ÜBERSPRUNGEN (Schreibkennwort – vorher mit 2a entfernen): "
-                       f"{os.path.basename(original_path)}")
-            detail_logger.info(f"Übersprungen (Schreibkennwort): {original_path}")
-            return "SKIPPED_PASSWORD"
+    else:
+        _kw_grund = ""
 
     # ── Schreibschutz-Prüfung (OS-Level) ───────────────────────────────────
     was_read_only = False
@@ -2488,6 +2505,31 @@ def replace_fonts_in_document_com(
                     detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
             return "ERROR"
 
+    # ── Schreibkennwort (OOXML): Arbeitskopie ohne Kennwort ──────────────
+    if _kw_grund == "schreibkennwort":
+        try:
+            os.makedirs(TEMP_PROCESS_PATH, exist_ok=True)
+            ohne = os.path.join(TEMP_PROCESS_PATH, f"ohne_kennwort_{uuid.uuid4().hex}{ext}")
+            _kopie_ohne_schreibkennwort(file_path, ohne)
+            if is_temp_copy:
+                try:
+                    os.remove(file_path)
+                except OSError as _e:
+                    detail_logger.debug(f"Alte Temp-Kopie nicht entfernbar: {_e!r}")
+            file_path    = ohne
+            is_temp_copy = True
+            pbar.write(f"  ->  Schreibkennwort wird entfernt: {os.path.basename(original_path)}")
+            detail_logger.info(f"Schreibkennwort entfernt (Arbeitskopie): {original_path}")
+        except Exception as e:
+            log_error(original_path, Exception(f"Kopie ohne Schreibkennwort fehlgeschlagen: {e}"))
+            if was_read_only:
+                try:
+                    safe_ro = prepare_long_path(original_path)
+                    os.chmod(safe_ro, os.stat(safe_ro).st_mode & ~stat.S_IWRITE)
+                except Exception as _e:
+                    detail_logger.debug(f"replace_fonts_in_document_com: Exception verworfen: {_e!r}")
+            return "ERROR"
+
     try:
         # ── STAGE 1: .doc/.dot → temp .docx/.dotx ─────────────────────────
         if ext in (".doc", ".dot"):
@@ -2498,11 +2540,17 @@ def replace_fonts_in_document_com(
             # WORD_OPEN_TIMEOUT die Word-Instanz; die Aufrufer-Schleife
             # erkennt anhand word_app_global=None den toten Zustand und
             # startet beim naechsten File neu.
+            # ReadOnly: Stage 1 liest nur und schreibt per SaveAs2 in eine
+            # neue Datei. Schreibend oeffnen fragte bei einer .doc mit
+            # Schreibkennwort unsichtbar nach dem Kennwort (Waechter);
+            # schreibgeschuetzt oeffnet Word sie ohne Abfrage (gemessen
+            # 30.09.2026), und SaveAs2 mit WritePassword="" laesst das
+            # Kennwort weg - gewollt (Entscheidung vom 30.09.2026).
             def _do_open_stage1():
                 return word_app.Documents.Open(
                     file_path,
                     ConfirmConversions = COM_FALSE,
-                    ReadOnly          = COM_FALSE,
+                    ReadOnly          = COM_TRUE,
                     AddToRecentFiles  = COM_FALSE,
                     OpenAndRepair     = COM_FALSE,
                     NoEncodingDialog  = COM_TRUE,
@@ -2575,7 +2623,8 @@ def replace_fonts_in_document_com(
                     "Documents.SaveAs2 (Stage 1)",
                     WORD_SAVE_TIMEOUT, word_pid_global,
                     lambda: doc.SaveAs2(temp_stage1_path, FileFormat=new_format,
-                                        AddToRecentFiles=COM_FALSE),
+                                        AddToRecentFiles=COM_FALSE,
+                                        WritePassword=""),
                     word_create_time_global
                 )
             except TimeoutError:
@@ -2604,6 +2653,15 @@ def replace_fonts_in_document_com(
             file_path     = temp_stage1_path
             new_path      = os.path.splitext(original_path)[0] + new_ext
             was_converted = True
+            # Gemessen am 30.09.2026: die aus einer .doc mit Schreibkennwort
+            # erzeugte .docx trug das Kennwort trotz WritePassword="" weiter,
+            # und Stage 2 (schreibend) hing in der unsichtbaren Abfrage bis
+            # zum Waechter. Deshalb hier auf Dateiebene nachziehen.
+            if _ooxml_kennwort_grund(temp_stage1_path) == "schreibkennwort":
+                _ohne = temp_stage1_path + ".ohne_kennwort"
+                _kopie_ohne_schreibkennwort(temp_stage1_path, _ohne)
+                os.replace(_ohne, temp_stage1_path)
+                detail_logger.info(f"Schreibkennwort entfernt (nach Stage 1): {original_path}")
             detail_logger.debug(
                 "Stage 1 abgeschlossen – öffne für Font-Verarbeitung (Stage 2)")
 

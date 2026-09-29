@@ -2068,7 +2068,7 @@ def dry_run_directory(directory: str) -> dict:
         if is_locked_by_other(file_path):
             stats["GESPERRT"] += 1
             tag = "GESPERRT     "
-        elif _excel_kennwort_grund(file_path):
+        elif _excel_kennwort_grund(file_path) == "verschluesselt":
             stats["VERSCHLUESSELT"] += 1
             tag = "KENNWORT     "
         elif ext in (".xls", ".xlt"):
@@ -2085,7 +2085,7 @@ def dry_run_directory(directory: str) -> dict:
     print( "    Würden konvertiert (.xls/.xlt → neu,")
     print(f"                        Original ersetzt!):  {stats['KONVERTIEREN']}")
     print(f"    Gesperrt (würden übersprungen):          {stats['GESPERRT']}")
-    print(f"    Kennwortgeschützt (würden übersprungen): {stats['VERSCHLUESSELT']}")
+    print(f"    Verschlüsselt (würden übersprungen):     {stats['VERSCHLUESSELT']}")
     print(f"    GESAMT:                                  {sum(stats.values())}")
     return stats
 
@@ -2865,13 +2865,22 @@ def replace_fonts_in_workbook(
     orig_attr = _dateiattribute_lesen(original_path)
 
     # ── Kennwort-Erkennung (Verschluesselung, Schreibkennwort) ─────────
+    # Schreibkennwort: seit 30.09.2026 entfernen statt ueberspringen
+    # (Entscheidung des Anwenders). Gemessen: schreibgeschuetzt oeffnet Excel
+    # solche Mappen (.xlsx/.xls/.xlsb) ohne Abfrage, und SaveAs mit leerem
+    # WriteResPassword speichert sie ohne Kennwort. Save() und SaveCopyAs
+    # scheiden fuer diese Mappen aus (schreibgeschuetzt bzw. Kennwort bleibt).
     _grund = _excel_kennwort_grund(file_path)
-    if _grund:
-        _text = "verschlüsselt" if _grund == "verschluesselt" else "Schreibkennwort"
-        pbar.write(f"  →  ÜBERSPRUNGEN ({_text}): "
+    schreibkennwort_entfernen = (_grund == "schreibkennwort")
+    if _grund == "verschluesselt":
+        pbar.write(f"  →  ÜBERSPRUNGEN (verschlüsselt): "
                    f"{os.path.basename(original_path)}")
-        detail_logger.info(f"Übersprungen ({_text}): {original_path}")
+        detail_logger.info(f"Übersprungen (verschlüsselt): {original_path}")
         return "SKIPPED"
+    if schreibkennwort_entfernen:
+        pbar.write(f"  →  Schreibkennwort wird entfernt: {os.path.basename(original_path)}")
+        detail_logger.info(f"Schreibkennwort wird entfernt: {original_path}")
+    stage2_ueber_temp_kopie = None
 
     # ── Long-Path-Behandlung ──────────────────────────────────────────
     if len(file_path) > MAX_PATH_LEN:
@@ -2929,7 +2938,7 @@ def replace_fonts_in_workbook(
             file_path,
             timeout          = OPEN_TIMEOUT_SECONDS,
             UpdateLinks      = 0,
-            ReadOnly         = COM_FALSE,
+            ReadOnly         = COM_TRUE if schreibkennwort_entfernen else COM_FALSE,
             IgnoreReadOnlyRecommended = COM_TRUE,
             Notify           = COM_FALSE,
             AddToMru         = COM_FALSE,
@@ -3023,7 +3032,8 @@ def replace_fonts_in_workbook(
                 safe_excel_save(
                     excel_app,
                     lambda: workbook.SaveAs(
-                        temp_stage1_path, FileFormat=new_format, AddToMru=COM_FALSE),
+                        temp_stage1_path, FileFormat=new_format, AddToMru=COM_FALSE,
+                        WriteResPassword=""),
                 )
                 detail_logger.debug(
                     f"Stage 1 (Long-Path): Als {new_ext} gespeichert → {temp_stage1_path}")
@@ -3040,7 +3050,8 @@ def replace_fonts_in_workbook(
                 safe_excel_save(
                     excel_app,
                     lambda: workbook.SaveAs(
-                        new_path, FileFormat=new_format, AddToMru=COM_FALSE),
+                        new_path, FileFormat=new_format, AddToMru=COM_FALSE,
+                        WriteResPassword=""),
                 )
                 detail_logger.debug(f"Stage 1: Als {new_ext} gespeichert → {new_path}")
 
@@ -3184,7 +3195,28 @@ def replace_fonts_in_workbook(
         #                         Close per _av_safe_move atomar zum Original.
         save_in_place_safe = was_converted or is_temp_copy
 
-        if save_in_place_safe:
+        if schreibkennwort_entfernen and not was_converted:
+            # Schreibgeschuetzt geoeffnet: nur SaveAs in eine neue Datei,
+            # mit leerem Schreibkennwort (siehe oben). Nach einer .xls-
+            # Umwandlung hat Stage 1 das bereits erledigt (SaveAs mit
+            # WriteResPassword=""), dann greift der regulaere Zweig.
+            os.makedirs(TEMP_PROCESS_PATH, exist_ok=True)
+            _ziel_s2 = os.path.join(TEMP_PROCESS_PATH, f"stage2_{uuid.uuid4().hex}{ext}")
+            _fmt_s2  = workbook.FileFormat
+            safe_excel_save(
+                excel_app,
+                lambda: workbook.SaveAs(
+                    _ziel_s2, FileFormat=_fmt_s2, Password="", WriteResPassword="",
+                    ReadOnlyRecommended=COM_FALSE, AddToMru=COM_FALSE)
+            )
+            if is_temp_copy:
+                # Langpfad: Schritt 8 schiebt die Temp-Kopie zurueck - das
+                # Ergebnis muss deshalb nach dem Schliessen dort liegen.
+                stage2_ueber_temp_kopie = _ziel_s2
+            else:
+                temp_stage2_path = _ziel_s2
+            detail_logger.debug(f"Stage 2: SaveAs ohne Schreibkennwort -> {_ziel_s2}")
+        elif save_in_place_safe:
             # Anders als PowerPoint braucht Excel kein erzwungenes SaveAs zur
             # Schema-Re-Serialisierung - das uebernimmt der regulaere Save bei
             # modernen OOXML-Formaten ohnehin.
@@ -3213,6 +3245,11 @@ def replace_fonts_in_workbook(
             workbook.Close(SaveChanges=COM_FALSE)
             workbook = None
             detail_logger.debug("Arbeitsmappe geschlossen")
+
+        if stage2_ueber_temp_kopie is not None:
+            _wait_file_released(stage2_ueber_temp_kopie, timeout=10.0)
+            os.replace(stage2_ueber_temp_kopie, file_path)
+            stage2_ueber_temp_kopie = None
 
         # ── 5.5. Stage-2-Tempdatei → Original verschieben ──────────────
         # Nur wenn der direct-on-original-Save-Pfad genommen wurde

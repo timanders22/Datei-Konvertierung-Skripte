@@ -561,6 +561,44 @@ function Get-OoxmlKennwortGrund {
     }
 }
 
+function Remove-OoxmlSchreibkennwort {
+    <#
+        Entfernt das Schreib-/Aenderungskennwort aus der LOKALEN Kopie
+        (Entscheidung des Anwenders vom 30.09.2026: entfernen statt
+        ueberspringen). Office selbst kann solche Dateien nur
+        schreibgeschuetzt oeffnen, PowerPoint sie dann gar nicht speichern
+        (gemessen) - deshalb auf Dateiebene, wie 2a-2c:
+          .docm  w:writeProtection  (word/settings.xml)
+          .xlsm  fileSharing        (xl/workbook.xml)
+          .pptm  p:modifyVerifier   (ppt/presentation.xml)
+        Wandelt 7 die Datei um, entsteht sie ohne Kennwort; behaelt 7 sie
+        (Makros), bleibt das Original wie immer unangetastet.
+    #>
+    param([string]$Path, [string]$Ext)
+    $teil = $null; $muster = $null
+    switch ($Ext) {
+        '.docm' { $teil = 'word/settings.xml';    $muster = '<w:writeProtection\b[^>]*/>|<w:writeProtection\b[^>]*>.*?</w:writeProtection>' }
+        '.xlsm' { $teil = 'xl/workbook.xml';      $muster = '<(?:\w+:)?fileSharing\b[^>]*/>|<(?:\w+:)?fileSharing\b[^>]*>.*?</(?:\w+:)?fileSharing>' }
+        '.pptm' { $teil = 'ppt/presentation.xml'; $muster = '<(?:\w+:)?modifyVerifier\b[^>]*/>|<(?:\w+:)?modifyVerifier\b[^>]*>.*?</(?:\w+:)?modifyVerifier>' }
+    }
+    if (-not $teil) { return }
+    $zip = [System.IO.Compression.ZipFile]::Open($Path, [System.IO.Compression.ZipArchiveMode]::Update)
+    try {
+        $eintrag = $zip.GetEntry($teil)
+        if (-not $eintrag) { return }
+        $sr = New-Object System.IO.StreamReader($eintrag.Open())
+        try { $xml = $sr.ReadToEnd() } finally { $sr.Close() }
+        $neu = [regex]::Replace($xml, $muster, '', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+        if ($neu -eq $xml) { return }
+        $eintrag.Delete()
+        $ersatz = $zip.CreateEntry($teil)
+        $sw = New-Object System.IO.StreamWriter($ersatz.Open(), (New-Object System.Text.UTF8Encoding $false))
+        try { $sw.Write($neu) } finally { $sw.Close() }
+    } finally {
+        $zip.Dispose()
+    }
+}
+
 function Get-UserShellFolder {
     param([string]$Name, [string]$Fallback)
     try {
@@ -1784,11 +1822,22 @@ foreach ($type in $fileTypes) {
             }
 
             $kennwort = Get-OoxmlKennwortGrund -Path $localCopy -Ext $type.Ext
-            if ($kennwort) {
+            if ($kennwort -eq 'verschluesselt') {
                 Write-Log "UEBERSPRUNGEN ($kennwort): $fileName" -Level "WARN"
                 Write-SkipLogEntry -Source $filePath -Reason "Kennwort ($kennwort) - nicht geprueft"
                 $stats.SkippedPassword++
                 continue
+            }
+            if ($kennwort) {
+                try {
+                    Remove-OoxmlSchreibkennwort -Path $localCopy -Ext $type.Ext
+                    Write-Log "Schreibkennwort in der Arbeitskopie entfernt: $fileName" -Level "INFO"
+                } catch {
+                    Write-Log "Schreibkennwort nicht entfernbar ($fileName): $($_.Exception.Message)" -Level "WARN"
+                    Write-SkipLogEntry -Source $filePath -Reason "Schreibkennwort nicht entfernbar"
+                    $stats.SkippedPassword++
+                    continue
+                }
             }
 
             Set-DateiWaechter $dateiWaechter -ProcessId $officePids[$type.App] `

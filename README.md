@@ -87,11 +87,12 @@ Dasselbe bei PDFs in `5_OCR_PDF.py`: geprüft wird auf ein *leeres*
 Benutzerkennwort, sonst bleibt die Datei, wie sie ist.
 
 Schreib- und Änderungskennwörter (Datei lässt sich lesen, aber nicht
-speichern) entfernen auch `3b` und `3c` beim Umwandeln — gewollt, damit der
-Bestand nach der Migration bearbeitbar ist. Ausnahme: eine `.ppt` mit
-Änderungskennwort; die kann PowerPoint ohne das Kennwort nicht speichern,
-sie wird übersprungen. `4a`–`4c` und `7` überspringen Dateien mit Kennwort
-sofort, statt auf eine unsichtbare Kennwortabfrage zu warten.
+speichern) entfernen auch `3a`–`3c`, `4a`–`4c` und `7` (dort bei den
+umgewandelten Dateien) — gewollt, damit der Bestand nach der Migration
+bearbeitbar ist. Ausnahme: eine `.ppt` mit Änderungskennwort; die kann
+PowerPoint ohne das Kennwort nicht speichern, sie wird übersprungen. Dateien
+mit Öffnungskennwort werden sofort erkannt und übersprungen, statt auf eine
+unsichtbare Kennwortabfrage zu warten.
 
 **`7` wandelt nur, was wirklich makrofrei ist.** Nicht „sieht so aus" —
 gezählt werden die Zeilen VBA-Code. Bei einer einzigen bleibt die Datei

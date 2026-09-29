@@ -2036,6 +2036,21 @@ def ask_metadata_detail() -> dict:
 PPT_STANDARDKENNWORT = "/01Hannes Ruescher/01"
 
 
+def _kopie_ohne_aenderungskennwort(quelle: str, ziel: str) -> None:
+    """Kopie einer .pptx/.pptm/.ppsx/.potx ohne <p:modifyVerifier> (wie 2c/3c)."""
+    import re
+    import zipfile
+    muster_leer = re.compile(rb"<(?:\w+:)?modifyVerifier\b[^>]*/>")
+    muster_paar = re.compile(rb"<(?:\w+:)?modifyVerifier\b[^>]*>.*?</(?:\w+:)?modifyVerifier>", re.S)
+    with zipfile.ZipFile(_long_path(quelle)) as zi, \
+            zipfile.ZipFile(ziel, "w", zipfile.ZIP_DEFLATED) as zo:
+        for info in zi.infolist():
+            daten = zi.read(info.filename)
+            if info.filename == "ppt/presentation.xml":
+                daten = muster_paar.sub(b"", muster_leer.sub(b"", daten))
+            zo.writestr(info, daten)
+
+
 def _ppt_kennwort_grund(path: str) -> str:
     """'' wenn PowerPoint die Datei ohne Kennwortabfrage oeffnet, sonst den Grund.
 
@@ -2046,9 +2061,11 @@ def _ppt_kennwort_grund(path: str) -> str:
       msoffcrypto (falls installiert).
     - Aenderungskennwort: <p:modifyVerifier> in ppt/presentation.xml bzw.
       bei .ppt die Verschluesselung mit dem Standardkennwort.
-    4c ueberspringt beides: eine Praesentation mit Aenderungskennwort laesst
-    sich zwar schreibgeschuetzt oeffnen, aber nicht speichern (gemessen;
-    "Presentation cannot be modified"). Das Kennwort entfernt 2c bzw. 3c.
+    Eine Praesentation mit Aenderungskennwort laesst sich zwar
+    schreibgeschuetzt oeffnen, aber nicht speichern (gemessen; "Presentation
+    cannot be modified", auch mit Untitled/SaveCopyAs). 4c entfernt es
+    deshalb seit 30.09.2026 auf Dateiebene in einer Arbeitskopie
+    (Entscheidung des Anwenders); bei .ppt geht das nicht - uebersprungen.
     """
     import re
     import zipfile
@@ -2115,7 +2132,9 @@ def dry_run_directory(directory: str) -> dict:
         if _is_locked_by_other_user(file_path):
             stats["GESPERRT"] += 1
             tag = "GESPERRT     "
-        elif _ppt_kennwort_grund(file_path):
+        elif (_ppt_kennwort_grund(file_path) == "verschluesselt"
+              or (_ppt_kennwort_grund(file_path) == "schreibkennwort"
+                  and ext in (".ppt", ".pps", ".pot"))):
             stats["KENNWORT"] += 1
             tag = "KENNWORT     "
         elif ext in (".ppt", ".pps", ".pot"):
@@ -2573,9 +2592,10 @@ def replace_fonts_in_presentation(
         return "SKIPPED"
 
     _grund = _ppt_kennwort_grund(original_path)
-    if _grund:
+    if _grund == "verschluesselt" or (_grund == "schreibkennwort"
+                                      and ext in (".ppt", ".pps", ".pot")):
         _text = ("verschlüsselt" if _grund == "verschluesselt"
-                 else "Änderungskennwort – vorher 2c oder 3c ausführen")
+                 else "Änderungskennwort in Altformat – ohne das Kennwort nicht entfernbar")
         pbar.write(f"  ->  ÜBERSPRUNGEN ({_text}): "
                    f"{os.path.basename(original_path)}")
         detail_logger.info(f"Übersprungen ({_text}): {original_path}")
@@ -2624,6 +2644,22 @@ def replace_fonts_in_presentation(
                 return "SKIPPED"
         except Exception as e:
             log_error(original_path, Exception(f"Long-Path-Kopie fehlgeschlagen: {e}"))
+            return "ERROR"
+
+    # --- Aenderungskennwort: Arbeitskopie ohne Kennwort (wie Long-Path) ---
+    if _grund == "schreibkennwort":
+        try:
+            os.makedirs(TEMP_PROCESS_PATH, exist_ok=True)
+            ohne = os.path.join(TEMP_PROCESS_PATH, f"ohne_kennwort_{uuid.uuid4().hex}{ext}")
+            _kopie_ohne_aenderungskennwort(file_path, ohne)
+            if is_temp_copy:
+                _safe_remove_with_retry(file_path)
+            file_path    = ohne
+            is_temp_copy = True
+            pbar.write(f"  ->  Änderungskennwort wird entfernt: {os.path.basename(original_path)}")
+            detail_logger.info(f"Änderungskennwort entfernt (Arbeitskopie): {original_path}")
+        except Exception as e:
+            log_error(original_path, Exception(f"Kopie ohne Änderungskennwort fehlgeschlagen: {e}"))
             return "ERROR"
 
     try:

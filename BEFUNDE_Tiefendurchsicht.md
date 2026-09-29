@@ -78,7 +78,7 @@ Excel-COM war verfuegbar und wurde benutzt (Kennwortverhalten von `SaveAs`,
 > (rund 95 Meldungen, nachgeprueft, behoben, alle Office-Skripte erneut am
 > echten Office getestet) - siehe Abschnitt 11. In der Nacht wurden die
 > dort offenen Punkte umgesetzt und gemessen - siehe Abschnitt 12, die
-> Rueckmeldung des Anwenders dazu in Abschnitt 13.
+> Rueckmeldung des Anwenders dazu in Abschnitt 13 und 14.
 
 **Empfehlung:** Erster Lauf je Skript mit `-WhatIf` bzw. `--dry-run` auf
 einem Testbestand, nicht auf Q:/R:. Die Probelauf-Pfade wurden in dieser
@@ -807,6 +807,35 @@ cannot be modified"), auch mit `Untitled`. Die mit msoffcrypto entschluesselte
 Datei lehnt PowerPoint als beschaedigt ab. 3c und 4c ueberspringen sie sofort
 mit Hinweis, 2c meldet einen Fehler (ohne Wartezeit). Der gegenteilige
 Kommentar in 2c ist berichtigt.
+
+---
+
+### 14. Nachtrag 30.09.2026: Schreibkennwoerter auch in 3a, 4a-4c und 7 entfernen
+
+Entscheidung des Anwenders: Schreib-/Aenderungskennwoerter werden ueberall
+entfernt, nicht uebersprungen (4a und 3a sind der Vollstaendigkeit halber
+mit angeglichen - sie verhielten sich wie 4b bzw. umgekehrt wie 3b).
+
+**Gemessen (Office 2024):** Excel und Word oeffnen solche Dateien
+schreibgeschuetzt ohne Abfrage. Excel speichert sie per `SaveAs` mit leerem
+`WriteResPassword` ohne Kennwort (.xlsx, .xls, .xlsb). Word dagegen traegt ein
+Schreibkennwort aus einer .doc per `SaveAs2` in die neue .docx weiter,
+`WritePassword=""` wird ignoriert - dort wird auf Dateiebene nachgezogen.
+PowerPoint siehe Abschnitt 13 (.pptx ueber die Datei, .ppt nicht moeglich).
+
+| Skript | Umsetzung |
+|---|---|
+| 3a | Nach dem Umwandeln `<w:writeProtection>` mit Hash aus der neuen .docx entfernen (Bearbeitungsschutz `w:documentProtection` bleibt, wie bisher). |
+| 4a | .docx & Co.: Arbeitskopie ohne `<w:writeProtection>`, behandelt wie eine Langpfad-Kopie. .doc: Stage 1 oeffnet jetzt schreibgeschuetzt (vorher haette eine .doc mit Schreibkennwort bis zum Waechter gehangen) und zieht das Kennwort nach dem Speichern auf Dateiebene nach. |
+| 4b | Schreibgeschuetzt oeffnen, per `SaveAs` ohne Schreibkennwort speichern (Stage 1 und 2); bei Langpfad-Kopien wird das Ergebnis nach dem Schliessen ueber die Kopie gelegt, die Schritt 8 zurueckschiebt. |
+| 4c | .pptx & Co.: Arbeitskopie ohne `<p:modifyVerifier>` (wie 3c); .ppt weiter uebersprungen. |
+| 7 | Kennwort in der lokalen Kopie entfernen (w:writeProtection, fileSharing, modifyVerifier); die umgewandelte Datei entsteht ohne. Behaelt 7 eine Datei (Makros), bleibt das Original wie immer unangetastet. |
+
+**Beleg:** Bestaende tw2/tx6/tp2 und ein 7-Bestand mit Kennwortdateien, je
+auch mit Pfad ueber 240 Zeichen: 3a 2/2, 4a 4/4, 3b 2/2, 4b 9/9, 3c 4/4,
+4c 4/4, 2c 2/2, 7 3/3 - Schreibkennwort jeweils weg, Oeffnungskennwoerter
+und .ppt mit Aenderungskennwort unveraendert. Regression aller Office-
+Skripte, Symbolproben und 7 danach unveraendert gruen.
 
 ---
 
