@@ -183,7 +183,7 @@ function Resolve-LogDirectory {
         if ([string]::IsNullOrWhiteSpace($cand)) { continue }
         try {
             if (-not [System.IO.Directory]::Exists($cand)) {
-                New-Item -ItemType Directory -Path $cand -Force -ErrorAction Stop | Out-Null
+                New-Item -ItemType Directory -Path $cand -Force -ErrorAction Stop -WhatIf:$false | Out-Null
             }
             $probe = Join-Path $cand (".writetest_{0}" -f ([Guid]::NewGuid().ToString('N')))
             [System.IO.File]::WriteAllText($probe, 'x')
@@ -466,7 +466,7 @@ function Cleanup-AllWord {
     $trackedIds = @($script:TrackedWordPids | Select-Object -Unique)
     foreach ($id in $trackedIds) {
         if (Test-IsOwnWordProcess -ProcessId $id) {
-            try { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue } catch {}
+            try { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
         }
     }
     [System.GC]::Collect()
@@ -1293,8 +1293,8 @@ function Convert-DocToDocx {
                     $WD_FORMAT_DOCX, $WD_FORMAT_DOCM, $WD_FORMAT_DOTX, $WD_FORMAT_DOTM
 
     if (-not (Wait-Job $job -Timeout $FileOpenTimeoutSeconds)) {
-        try { Stop-Job  $job -ErrorAction SilentlyContinue } catch {}
-        try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch {}
+        try { Stop-Job  $job -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
+        try { Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
         if ([System.IO.File]::Exists($pidFile)) {
             try {
                 $savedPid = [int][System.IO.File]::ReadAllText($pidFile).Trim()
@@ -1306,7 +1306,7 @@ function Convert-DocToDocx {
     }
 
     $result = Receive-Job $job
-    try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
     if ([System.IO.File]::Exists($pidFile)) { try { [System.IO.File]::Delete($pidFile) } catch {} }
 
     if ($result.WordPid -and (Test-IsOwnWordProcess -ProcessId ([int]$result.WordPid))) {
@@ -1416,8 +1416,8 @@ function Remove-OpenPassword {
     } -ArgumentList $FilePath, $Passwords, $OriginalExtension, $pidFile
 
     if (-not (Wait-Job $job -Timeout $FileOpenTimeoutSeconds)) {
-        try { Stop-Job  $job -ErrorAction SilentlyContinue } catch {}
-        try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch {}
+        try { Stop-Job  $job -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
+        try { Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
         if ([System.IO.File]::Exists($pidFile)) {
             try {
                 $savedPid = [int][System.IO.File]::ReadAllText($pidFile).Trim()
@@ -1432,7 +1432,7 @@ function Remove-OpenPassword {
     }
 
     $result = Receive-Job $job
-    try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
     if ([System.IO.File]::Exists($pidFile)) { try { [System.IO.File]::Delete($pidFile) } catch {} }
 
     if ($result.WordPid -and (Test-IsOwnWordProcess -ProcessId ([int]$result.WordPid))) {
@@ -1655,14 +1655,14 @@ function Test-WordTrustCenter {
     $completed = Wait-Job $job -Timeout $TimeoutSec
 
     if (-not $completed) {
-        try { Stop-Job   $job -ErrorAction SilentlyContinue } catch {}
-        try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch {}
+        try { Stop-Job   $job -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
+        try { Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
         if ([System.IO.File]::Exists($pidFile)) {
             try {
                 $savedPid = [int][System.IO.File]::ReadAllText($pidFile).Trim()
                 if ($savedPid -gt 0) {
                     $script:TrackedWordPids.Add($savedPid)
-                    try { Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue } catch {}
+                    try { Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
                 }
             } catch {}
             try { [System.IO.File]::Delete($pidFile) } catch {}
@@ -1672,7 +1672,7 @@ function Test-WordTrustCenter {
     }
 
     $result = Receive-Job $job
-    try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
     if ([System.IO.File]::Exists($pidFile)) { try { [System.IO.File]::Delete($pidFile) } catch {} }
     try { [System.IO.File]::Delete($testDocx) } catch {}
     if ($result -and $result.WordPid) { $script:TrackedWordPids.Add([int]$result.WordPid) }
@@ -2099,7 +2099,7 @@ Get-WordFilesRobust (Add-LongPathPrefix $TargetPath) "^\.do[ct][xm]?$" |
         # Reihenfolge wichtig: Unblock-File triggert ggf. AV-Scan. Wir wollen
         # diesen Trigger VOR Wait-FileAvailable haben, damit Wait-FileAvailable
         # das letzte Gate vor ZipFile.Open ist.
-        try { Unblock-File -LiteralPath (Remove-LongPathPrefix $tempFile) -ErrorAction SilentlyContinue } catch {}
+        try { Unblock-File -LiteralPath (Remove-LongPathPrefix $tempFile) -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
 
         if (-not (Wait-FileAvailable -Path (Add-LongPathPrefix $tempFile))) {
             $stats.Skipped++

@@ -238,6 +238,11 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop } catch {
     try { [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression.FileSystem") | Out-Null } catch {}
 }
+# ZipArchive selbst liegt in System.IO.Compression; das laedt .NET erst mit
+# dem ersten ZipFile-Aufruf nach. Test-HasExcel4Macro baut das Archiv aber
+# direkt auf einem FileStream auf - ohne diese Zeile ist der Typ unbekannt
+# und jede Pruefung endet als "nicht pruefbar" (gemessen unter 5.1).
+try { Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop } catch {}
 
 $rootPath = $RootPath
 # Logs liegen direkt neben Skript/EXE. PSScriptRoot greift bei direktem
@@ -265,7 +270,10 @@ $skipLog  = Join-Path -Path $scriptDir -ChildPath "7_Dateien_ohne_Makro_finden_M
 $tempDir  = Join-Path -Path ([Environment]::GetFolderPath("MyDocuments")) -ChildPath "7_Dateien_ohne_Makro_finden_$PID"
 $utf8Bom  = New-Object System.Text.UTF8Encoding $true
 $restartThreshold = 500
-$bannerDate       = Get-Date -Format "dd.MM.yyyy"
+# Frist je Datei fuer Oeffnen, VBA-Pruefung und Speichern (siehe
+# Start-DateiWaechter). Danach wird die eigene Office-Instanz beendet.
+$script:DateiTimeoutSec = 180
+$bannerDate      = Get-Date -Format "dd.MM.yyyy"
 $officePids       = @{ Word = $null; Excel = $null; PowerPoint = $null }
 $officeStartTimes = @{ Word = $null; Excel = $null; PowerPoint = $null }
 $cancelled        = $false
@@ -276,10 +284,10 @@ $staleTempThreshold = (Get-Date).AddHours(-24)
 Get-ChildItem -LiteralPath ([Environment]::GetFolderPath("MyDocuments")) -Directory -Filter "7_Dateien_ohne_Makro_finden_*" -ErrorAction SilentlyContinue |
     Where-Object { $_.LastWriteTime -lt $staleTempThreshold } |
     ForEach-Object {
-        try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop } catch {}
+        try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop -WhatIf:$false } catch {}
     }
 
-if (-not (Test-Path -LiteralPath $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
+if (-not (Test-Path -LiteralPath $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force -WhatIf:$false | Out-Null }
 
 # ==============================================================================
 # Hilfsfunktionen - Anzeige
@@ -434,8 +442,15 @@ function Test-HasExcel4Macro {
     param([string]$FilePath)
 
     $zip = $null
+    $fs  = $null
     try {
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
+        # FileShare.ReadWrite statt ZipFile.OpenRead: die Pruefung laeuft,
+        # waehrend Excel die Mappe zum Schreiben offen haelt. OpenRead teilt
+        # nur Lesezugriff und scheiterte daran bei JEDER .xlsm - alle landeten
+        # als "XLM-Pruefung nicht moeglich" im Behalten-Zweig (nachgestellt).
+        $fs  = New-Object System.IO.FileStream($FilePath, [System.IO.FileMode]::Open,
+                   [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Read)
 
         foreach ($entry in $zip.Entries) {
             if ($entry.FullName -like 'xl/macrosheets/*') { return $true }
@@ -456,6 +471,7 @@ function Test-HasExcel4Macro {
         return $null
     } finally {
         if ($null -ne $zip) { try { $zip.Dispose() } catch {} }
+        if ($null -ne $fs)  { try { $fs.Dispose() }  catch {} }
     }
 }
 
@@ -534,9 +550,9 @@ function Invoke-WindowsTempCleanup {
         try {
             if (-not (Test-WhitelistedTempEntry $_.Name)) { return }
             if ($_.PSIsContainer) {
-                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false
             } else {
-                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue -WhatIf:$false
             }
         } catch {}
     }
@@ -780,7 +796,7 @@ function Stop-TrackedOfficeProcess {
             try { if ($p.StartTime -ne $StartTime) { return } } catch {}
         }
         if (-not $p.HasExited) {
-            $p | Stop-Process -Force -ErrorAction SilentlyContinue
+            $p | Stop-Process -Force -ErrorAction SilentlyContinue -WhatIf:$false
         }
     } catch {}
 }
@@ -840,6 +856,149 @@ function Close-OfficeDocument {
             ".pptm" { $obj.Close() }
         }
     } catch {}
+}
+
+# ------------------------------------------------------------------------------
+# Zeitwaechter je Datei
+# ------------------------------------------------------------------------------
+# Open, VBA-Pruefung und SaveAs laufen synchron im Hauptthread. Haengt Office
+# an einem unsichtbaren Dialog oder einer defekten Datei, kehrt der Aufruf nie
+# zurueck und der Lauf steht - der Smoke-Test sichert nur den Start ab. Ein
+# Hintergrund-Runspace beendet deshalb nach Fristablauf die EIGENE
+# Office-Instanz (Name und Startzeit geprueft, wie in Skript 9). Der blockierte
+# COM-Aufruf wirft daraufhin im Hauptthread, die Datei faellt in den
+# Fehlerzweig und bleibt unveraendert (das Original wird erst NACH dem SaveAs
+# angefasst), und die Instanz wird neu gestartet.
+# Scharfschalten, Entschaerfen und das Beenden laufen unter demselben Schloss.
+# Sonst kann der Waechter eine Instanz beenden, deren Aufruf gerade noch
+# fertig wurde, ohne dass der Hauptthread es erfaehrt - die naechste Datei
+# liefe dann gegen eine tote Instanz.
+function Start-DateiWaechter {
+    param([int]$PollMs = 250)
+    $state = [hashtable]::Synchronized(@{
+        Armed       = $false
+        TargetPid   = 0
+        TargetStart = $null
+        Deadline    = [DateTime]::MaxValue
+        TimedOut    = $false
+        Running     = $true
+    })
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.Open()
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+    $null = $ps.AddScript({
+        param($state, $pollMs)
+        while ($state.Running) {
+            [System.Threading.Monitor]::Enter($state.SyncRoot)
+            try {
+                if ($state.Armed -and [DateTime]::UtcNow -gt $state.Deadline) {
+                    $state.Armed    = $false
+                    $state.TimedOut = $true
+                    try {
+                        $p = Get-Process -Id $state.TargetPid -ErrorAction Stop
+                        if ($p.Name -match '^(WINWORD|EXCEL|POWERPNT)$' -and
+                            ($null -eq $state.TargetStart -or $p.StartTime -eq $state.TargetStart)) {
+                            Stop-Process -Id $state.TargetPid -Force -ErrorAction Stop
+                        }
+                    } catch {}
+                }
+            } finally {
+                [System.Threading.Monitor]::Exit($state.SyncRoot)
+            }
+            Start-Sleep -Milliseconds $pollMs
+        }
+    }).AddArgument($state).AddArgument($PollMs)
+    $handle = $ps.BeginInvoke()
+    return @{ State = $state; PS = $ps; Runspace = $rs; Handle = $handle }
+}
+
+# Ohne eigene PID (Einzelinstanz-Server hat die Sitzung des Anwenders
+# geliefert) bleibt der Waechter aus - fremde Instanzen werden nie beendet.
+function Set-DateiWaechter {
+    param($Waechter, [Nullable[int]]$ProcessId, $StartTime, [int]$TimeoutSec)
+    if ($null -eq $Waechter) { return }
+    $s = $Waechter.State
+    [System.Threading.Monitor]::Enter($s.SyncRoot)
+    try {
+        $s.TimedOut = $false
+        if ($null -eq $ProcessId -or $ProcessId -le 0) { $s.Armed = $false; return }
+        $s.TargetPid   = [int]$ProcessId
+        $s.TargetStart = $StartTime
+        $s.Deadline    = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+        $s.Armed       = $true
+    } finally {
+        [System.Threading.Monitor]::Exit($s.SyncRoot)
+    }
+}
+
+# Entschaerft und meldet, ob die Frist abgelaufen ist (die Instanz also
+# beendet wurde). Ohne -Quittieren bleibt der Merker stehen, damit der
+# Fehlerzweig und der finally-Zweig derselben Datei ihn noch sehen; der
+# finally-Zweig quittiert, sonst loeste der Merker bei der naechsten Datei,
+# die vor dem Oeffnen abbricht (Kopie gescheitert), einen zweiten Neustart aus.
+function Clear-DateiWaechter {
+    param($Waechter, [switch]$Quittieren)
+    if ($null -eq $Waechter) { return $false }
+    $s = $Waechter.State
+    [System.Threading.Monitor]::Enter($s.SyncRoot)
+    try {
+        $s.Armed = $false
+        $war = [bool]$s.TimedOut
+        if ($Quittieren) { $s.TimedOut = $false }
+        return $war
+    } finally {
+        [System.Threading.Monitor]::Exit($s.SyncRoot)
+    }
+}
+
+function Stop-DateiWaechter {
+    param($Waechter)
+    if ($null -eq $Waechter) { return }
+    $Waechter.State.Armed   = $false
+    $Waechter.State.Running = $false
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while (-not $Waechter.Handle.IsCompleted -and $sw.ElapsedMilliseconds -lt 2000) {
+        Start-Sleep -Milliseconds 50
+    }
+    if ($Waechter.Handle.IsCompleted) {
+        try { $Waechter.PS.EndInvoke($Waechter.Handle) } catch {}
+    } else {
+        try { $Waechter.PS.Stop() } catch {}
+    }
+    try { $Waechter.PS.Dispose() } catch {}
+    try { $Waechter.Runspace.Close() } catch {}
+    try { $Waechter.Runspace.Dispose() } catch {}
+}
+
+# Beendet die eigene Instanz fuer einen Dateityp und startet sie neu -
+# periodisch gegen Speicher-Drift und nach einem Waechter-Eingriff.
+# Die Hauptschleife laeuft auf Skriptebene, daher $script:.
+function Restart-OfficeFuerTyp {
+    param([string]$Ext)
+    switch ($Ext) {
+        ".docm" {
+            Stop-OfficeApp $script:word $officePids.Word
+            [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
+            Stop-TrackedOfficeProcess $officePids.Word $officeStartTimes.Word
+            $r = Start-TrackedOfficeApp -AppType "Word" -ProcessName "WINWORD"
+            $script:word = $r.App; $officePids.Word = $r.ProcessId; $officeStartTimes.Word = $r.StartTime
+        }
+        ".xlsm" {
+            Stop-OfficeApp $script:excel $officePids.Excel
+            [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
+            Stop-TrackedOfficeProcess $officePids.Excel $officeStartTimes.Excel
+            $r = Start-TrackedOfficeApp -AppType "Excel" -ProcessName "EXCEL"
+            $script:excel = $r.App; $officePids.Excel = $r.ProcessId; $officeStartTimes.Excel = $r.StartTime
+        }
+        ".pptm" {
+            Stop-OfficeApp $script:pptx $officePids.PowerPoint
+            [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
+            Stop-TrackedOfficeProcess $officePids.PowerPoint $officeStartTimes.PowerPoint
+            $r = Start-TrackedOfficeApp -AppType "PowerPoint" -ProcessName "POWERPNT"
+            $script:pptx = $r.App; $officePids.PowerPoint = $r.ProcessId; $officeStartTimes.PowerPoint = $r.StartTime
+        }
+    }
 }
 
 # ------------------------------------------------------------------------------
@@ -982,7 +1141,7 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
 
     if ($null -eq $finished) {
         # Timeout - Job killen + ggf. zugehoerigen Office-Prozess.
-        try { Stop-Job -Job $job -ErrorAction SilentlyContinue } catch {}
+        try { Stop-Job -Job $job -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
         # Bevor wir die Job-Output entsorgen, versuchen wir noch die ChildPid
         # zu lesen (Job hat sie evtl. geschrieben, bevor er hing).
         $childPid = $null
@@ -995,16 +1154,16 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
             # Check greift (PID-Recycling-Schutz - siehe dort).
             Stop-TrackedOfficeProcess $childPid
         }
-        try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } catch {}
+        try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
         if (Test-Path -LiteralPath $TestPath) {
-            Remove-Item -LiteralPath $TestPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $TestPath -Force -ErrorAction SilentlyContinue -WhatIf:$false
         }
         return @{ Success = $false; TimedOut = $true; Message = "TIMEOUT nach $TimeoutSec s" }
     }
 
     $jobResult = $null
     try { $jobResult = Receive-Job -Job $job -ErrorAction SilentlyContinue } catch {}
-    try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
 
     if ($jobResult -and $jobResult.Success) {
         return @{ Success = $true; TimedOut = $false; Message = "" }
@@ -1206,7 +1365,7 @@ foreach ($cand in $logDirCandidates) {
     if ([string]::IsNullOrWhiteSpace($cand)) { continue }
     try {
         if (-not [System.IO.Directory]::Exists($cand)) {
-            New-Item -ItemType Directory -Path $cand -Force -ErrorAction Stop | Out-Null
+            New-Item -ItemType Directory -Path $cand -Force -ErrorAction Stop -WhatIf:$false | Out-Null
         }
         $tryLog  = Join-Path $cand (Split-Path $logFile -Leaf)
         $trySkip = Join-Path $cand (Split-Path $skipLog -Leaf)
@@ -1234,6 +1393,7 @@ Write-Log "Initialisiere Office-Komponenten..."
 # Office-Initialisierung
 # ==============================================================================
 $word = $null; $excel = $null; $pptx = $null
+$dateiWaechter = $null
 $abortedByException = $false
 
 try {
@@ -1308,10 +1468,21 @@ Write-Log "Office-Smoke-Test erfolgreich (Word, Excel, PowerPoint)." -Level "SUC
 # Konfiguration Dateitypen
 # ==============================================================================
 $fileTypes = @(
-    @{ Ext = ".docm"; Target = ".docx"; Format = 12 }
-    @{ Ext = ".xlsm"; Target = ".xlsx"; Format = 51 }
-    @{ Ext = ".pptm"; Target = ".pptx"; Format = 24 }
+    @{ Ext = ".docm"; Target = ".docx"; Format = 12; App = "Word" }
+    @{ Ext = ".xlsm"; Target = ".xlsx"; Format = 51; App = "Excel" }
+    @{ Ext = ".pptm"; Target = ".pptx"; Format = 24; App = "PowerPoint" }
 )
+
+# ==============================================================================
+# Zeitwaechter je Datei starten (siehe Start-DateiWaechter)
+# ==============================================================================
+$dateiWaechter = Start-DateiWaechter
+foreach ($t in $fileTypes) {
+    if (-not ($officePids[$t.App] -gt 0)) {
+        Write-Log (("Zeitwaechter fuer {0} wirkungslos: keine eigene Instanz erkannt (laeuft {0} bereits?). " +
+                    "Eine haengende {1}-Datei haelt den Lauf dann an.") -f $t.App, $t.Ext) -Level "WARN"
+    }
+}
 
 # ==============================================================================
 # Long-Path Vorbereitung
@@ -1411,29 +1582,7 @@ foreach ($type in $fileTypes) {
         # ==============================================================================
         if ($processedInBatch -ge $restartThreshold) {
             Write-Log "App-Restart nach $processedInBatch Dateien (Memory-Hygiene)..." -Level "INFO"
-            switch ($type.Ext) {
-                ".docm" {
-                    Stop-OfficeApp $word $officePids.Word
-                    [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
-                    Stop-TrackedOfficeProcess $officePids.Word $officeStartTimes.Word
-                    $r = Start-TrackedOfficeApp -AppType "Word" -ProcessName "WINWORD"
-                    $word = $r.App; $officePids.Word = $r.ProcessId; $officeStartTimes.Word = $r.StartTime
-                }
-                ".xlsm" {
-                    Stop-OfficeApp $excel $officePids.Excel
-                    [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
-                    Stop-TrackedOfficeProcess $officePids.Excel $officeStartTimes.Excel
-                    $r = Start-TrackedOfficeApp -AppType "Excel" -ProcessName "EXCEL"
-                    $excel = $r.App; $officePids.Excel = $r.ProcessId; $officeStartTimes.Excel = $r.StartTime
-                }
-                ".pptm" {
-                    Stop-OfficeApp $pptx $officePids.PowerPoint
-                    [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
-                    Stop-TrackedOfficeProcess $officePids.PowerPoint $officeStartTimes.PowerPoint
-                    $r = Start-TrackedOfficeApp -AppType "PowerPoint" -ProcessName "POWERPNT"
-                    $pptx = $r.App; $officePids.PowerPoint = $r.ProcessId; $officeStartTimes.PowerPoint = $r.StartTime
-                }
-            }
+            Restart-OfficeFuerTyp $type.Ext
             $processedInBatch = 0
         }
 
@@ -1487,11 +1636,20 @@ foreach ($type in $fileTypes) {
         $localTarget = $null
 
         try {
-            New-Item -ItemType Directory -Path $guidDir -Force | Out-Null
+            New-Item -ItemType Directory -Path $guidDir -Force -WhatIf:$false | Out-Null
 
             # Lokale Kopie unter generischem Kurznamen, damit Original-Filename
             # die 259-Zeichen-Grenze des lokalen Temp-Pfads nicht reisst.
-            $localCopy = Join-Path $guidDir "work$($type.Ext)"
+            #
+            # [string] ist Pflicht, nicht Zierde: Join-Path liefert einen in
+            # PSObject verpackten String, und den reicht PowerShell an COM
+            # nicht als Text weiter. Word.SaveAs2 blieb damit bei JEDER .docm
+            # haengen - der Hauptthread drehte mit voller CPU-Last und kam
+            # auch nicht zurueck, als Word beendet wurde (nachgestellt unter
+            # 5.1 mit Word 2024: mit Join-Path haengt es, mit [string] ist
+            # die Datei nach 0,1 s geschrieben). Documents.Open vertrug den
+            # verpackten Wert zufaellig.
+            $localCopy = [string](Join-Path $guidDir "work$($type.Ext)")
 
             try {
                 $origTimestamp = [System.IO.File]::GetLastWriteTime($filePathLong)
@@ -1519,6 +1677,8 @@ foreach ($type in $fileTypes) {
                 continue
             }
 
+            Set-DateiWaechter $dateiWaechter -ProcessId $officePids[$type.App] `
+                -StartTime $officeStartTimes[$type.App] -TimeoutSec $script:DateiTimeoutSec
             switch ($type.Ext) {
                 ".docm" { $obj = $word.Documents.Open($localCopy, $false, $false) }
                 ".xlsm" { $obj = $excel.Workbooks.Open($localCopy, 0, $false) }
@@ -1635,7 +1795,8 @@ foreach ($type in $fileTypes) {
 
                     # Lokales Save-Target unter Kurznamen, damit langer Original-Filename
                     # die 259-Zeichen-Grenze des lokalen Pfades nicht reisst.
-                    $localTarget = Join-Path $guidDir "work$($type.Target)"
+                    # [string]: siehe $localCopy - ohne haengt SaveAs2.
+                    $localTarget = [string](Join-Path $guidDir "work$($type.Target)")
 
                     switch ($type.Ext) {
                         ".docm" { $obj.SaveAs2($localTarget, $type.Format) }
@@ -1646,6 +1807,12 @@ foreach ($type in $fileTypes) {
                     Close-OfficeDocument $obj $type.Ext
                     Release-ComObject $obj
                     $obj = $null
+                    # Ab hier nur noch Dateioperationen - ein langsames
+                    # Netzlaufwerk darf die Office-Instanz nicht kosten.
+                    # Lief die Frist trotzdem gerade ab, ist das Ergebnis
+                    # vollstaendig (SaveAs kehrte zurueck); den Neustart
+                    # erledigt der finally-Zweig.
+                    $null = Clear-DateiWaechter $dateiWaechter
 
                     if ($null -ne $origTimestamp) {
                         try { [System.IO.File]::SetLastWriteTime($localTarget, $origTimestamp) } catch {}
@@ -1805,18 +1972,28 @@ foreach ($type in $fileTypes) {
                 Write-SkipLogEntry -Source $filePath -Reason 'Datei liess sich nicht oeffnen'
             }
         } catch {
-            Write-Log "Fehler bei $fileName : $($_.Exception.Message)" -Level "ERROR"
+            $fehlerText = $_.Exception.Message
+            if ($dateiWaechter.State.TimedOut) {
+                $fehlerText = "TIMEOUT nach $($script:DateiTimeoutSec) s - $($type.App) blockierte (Dialog, Passwort oder defekte Datei); Instanz beendet, Datei unveraendert"
+            }
+            Write-Log "Fehler bei $fileName : $fehlerText" -Level "ERROR"
             $stats.Errors++
-            Write-SkipLogEntry -Source $filePath -Reason ("Fehler: " + $_.Exception.Message)
+            Write-SkipLogEntry -Source $filePath -Reason ("Fehler: " + $fehlerText)
             if ($null -ne $obj) {
                 Close-OfficeDocument $obj $type.Ext
             }
         } finally {
+            $abgelaufen = Clear-DateiWaechter $dateiWaechter -Quittieren
             Release-ComObject $obj
             $obj = $null
+            if ($abgelaufen) {
+                Write-Log "Zeitwaechter hat $($type.App) beendet - starte neu..." -Level "WARN"
+                Restart-OfficeFuerTyp $type.Ext
+                $processedInBatch = 0
+            }
 
             if (Test-Path -LiteralPath $guidDir) {
-                Remove-Item -LiteralPath $guidDir -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $guidDir -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false
             }
         }
     }
@@ -1831,6 +2008,7 @@ foreach ($type in $fileTypes) {
     # Cleanup (laeuft auch bei Exception/Abbruch garantiert)
     # ==============================================================================
     Write-Log "Beende Prozesse..."
+    try { Stop-DateiWaechter $dateiWaechter } catch {}
     try { Stop-OfficeApp $word $officePids.Word } catch {}
     try { Stop-OfficeApp $excel $officePids.Excel } catch {}
     try { Stop-OfficeApp $pptx $officePids.PowerPoint } catch {}
@@ -1845,7 +2023,7 @@ foreach ($type in $fileTypes) {
 
     try {
         if ((Get-ChildItem $tempDir -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0) {
-            Remove-Item -LiteralPath $tempDir -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $tempDir -Force -ErrorAction SilentlyContinue -WhatIf:$false
         }
     } catch {}
 

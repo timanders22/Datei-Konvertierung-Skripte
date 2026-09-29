@@ -70,6 +70,10 @@ Excel-COM war verfuegbar und wurde benutzt (Kennwortverhalten von `SaveAs`,
 > **Die COM-Pfade wurden daraufhin getestet - siehe Abschnitt 9.**
 > Stand jetzt: `2a`, `3a`, `4a`, `4c` bestanden, `2c` und `3c` mit Befund
 > (einer davon behoben), `7` blockiert, `9` weiterhin ungetestet.
+>
+> **Stand 29.09.2026:** Jetzt sind auch `2b`, `3b`, `4b`, `6`, `7` und `9`
+> gegen das echte Office gelaufen, jeweils Probelauf und Echtlauf. Dabei
+> kamen neun weitere Fehler ans Licht, alle behoben - siehe Abschnitt 10.
 
 **Empfehlung:** Erster Lauf je Skript mit `-WhatIf` bzw. `--dry-run` auf
 einem Testbestand, nicht auf Q:/R:. Die Probelauf-Pfade wurden in dieser
@@ -187,6 +191,33 @@ zu sein.** Mitkorrigiert wurden unter anderem:
    wurden fuer immer uebersprungen. Betraf `10`, `1_temp`, `3a`, `3c`.
 5. **Probelauf und Echtlauf trafen unterschiedliche Entscheidungen.**
    Betraf `3b`, `3c`, `4b`, `5_OCR` - teils mit Loeschungen im Probelauf.
+
+Ergaenzt am 29.09.2026 (Belege in Abschnitt 10):
+
+6. **Cmdlet-Ausgaben nie ungewandelt an COM geben.** `Join-Path`,
+   `Split-Path` & Co. liefern in `PSObject` verpackte Strings. Word
+   `SaveAs2` blieb damit unbegrenzt haengen, `Documents.Open` vertrug es
+   zufaellig. Pfade fuer Office immer als `[string](...)` uebergeben.
+   Ausgaben von Skriptfunktionen sind nicht verpackt (gemessen).
+7. **Muster 2 gilt auch fuer das Aufraeumen.** Unter `-WhatIf` wurden
+   `Stop-Process` auf die EIGENEN Office-Instanzen, `Stop-Job`/`Remove-Job`
+   und `Unblock-File` auf Temp-Kopien nur simuliert - Office-Prozesse und
+   Jobs blieben stehen, in `7` fehlte sogar der Arbeitsordner. Jeder Aufruf,
+   der nur skripteigene Dinge anfasst, braucht `-WhatIf:$false`. Code in
+   `Start-Job`-Bloecken und eigenen Runspaces ist nicht betroffen.
+8. **Excel-Kennwoerter:** `WriteResPassword` hat hoechstens 15 Zeichen -
+   ein laengerer Wert laesst `Workbooks.Open` fuer JEDE Mappe scheitern.
+   Ein leerer String gilt als "nicht angegeben" und oeffnet den
+   Kennwortdialog. `Worksheet.Unprotect()` ohne Argument oeffnet ebenfalls
+   einen Dialog; `Unprotect("")` wirft sofort. Word `Unprotect()` wirft
+   dagegen sofort (gemessen).
+9. **Dateien lesen, die Office offen haelt:** nur mit
+   `FileShare.ReadWrite`. `ZipFile.OpenRead` teilt nur Lesezugriff und
+   scheitert. `Add-Type System.IO.Compression.FileSystem` laedt
+   `System.IO.Compression` (mit `ZipArchive`) NICHT mit.
+10. **Kennwortdialoge unsichtbarer Office-Instanzen koennen auf dem
+    Bildschirm erscheinen.** Wer dort klickt, verfaelscht Testergebnisse
+    (siehe Abschnitt 10, Testbedingungen).
 
 ---
 
@@ -387,6 +418,8 @@ ungeschuetzte Dateien byteidentisch. **Nicht geaendert:** welche Sperren als
 Schutz gelten, ist eine fachliche Entscheidung, keine Fehlerkorrektur.
 Empfehlung: `spLocks` nur anfassen, wenn die Datei daneben echten Schutz
 traegt (`modifyVerifier`, `writeProtection`, Verschluesselung).
+**-> Behoben am 29.09.2026** (Abschnitt 10): `noGrp` und `noChangeAspect`
+zaehlen nicht mehr als Sperre, die ungeschuetzte Datei bleibt byteidentisch.
 
 **b) Der Probelauf von `3c` veraenderte die Dateien - behoben.** Der
 Probelauf sagt zu, nichts zu aendern. Gemessen an einer `.ppt`: erster
@@ -425,6 +458,11 @@ fuer immer an, ohne Meldung. Das gehoert vor dem Produktiveinsatz
 nachgezogen; die Muster dafuer stehen im eigenen Skript (Z. 866-981).
 **Offen:** ob Word die `.docm`-Umwandlung nur auf diesem Rechner
 verweigert, ist nicht geklaert.
+**-> Geklaert und behoben am 29.09.2026** (Abschnitt 10): Die Blockade kam
+NICHT aus Word. Der Zielpfad stammte aus `Join-Path` und wurde als
+verpacktes `PSObject` an `SaveAs2` uebergeben; mit `[string]` ist die Datei
+nach 0,1 s geschrieben. Der 20-Zeilen-Nachbau oben hatte denselben Fehler.
+Der fehlende Zeitwaechter ist ebenfalls nachgezogen.
 
 **d) `9` liess sich nicht automatisiert testen - und das ist selbst ein
 Befund.** Als einziges der elf Skripte hat `9` keinen unbeaufsichtigten
@@ -434,11 +472,140 @@ und zwei weitere Antworten kommen ausschliesslich aus `Read-Host`.
 worauf Z. 757 den Lauf beendet - ein Test ueber die Standardeingabe ist
 also konstruktionsbedingt unmoeglich, ein geplanter Task ebenso. `2a`, `2c`
 und `7` koennen das alle. **Der COM-Pfad von `9` bleibt ungetestet.**
+**-> Behoben am 29.09.2026** (Abschnitt 10): `-TargetPath` und
+`-NoInteractive`. Der erste Lauf fand sofort einen schweren Fehler.
 
 **Nebenbefund zur Testmethode:** Word blockiert beim Speichern gelegentlich
 unsichtbar, wenn es mit `Visible = $false` laeuft. Wer diese Skripte
 weiterentwickelt, sollte COM-Erzeugung pro Datei in einen eigenen Prozess
 mit hartem Zeitlimit legen - genau das, was Befund c) fuer `7` fordert.
+**-> Zurueckgezogen am 29.09.2026:** Die "gelegentliche" Blockade war der
+`Join-Path`-Fehler aus Befund c), kein Word-Verhalten. Mit reinen Strings
+blockierte Word in keinem der Laeufe vom 29.09.
+
+---
+
+### 10. Nachtrag 29.09.2026: Gesamtpruefung mit echtem Office
+
+**Vorgehen.** Zuerst statisch: Syntax aller Dateien; fuer Python drei
+geeichte Pruefungen (undefinierte Namen, Aufrufe gegen die Signatur,
+Reihenfolge beim Import); fuer PowerShell unbekannte Befehle, unbekannte
+Parameter, nie zugewiesene Variablen und Aufrufe vor der Definition. Jede
+Pruefung wurde vorher an einer Datei mit absichtlich eingebauten Fehlern
+geeicht. Ergebnis: Python ohne Befund, PowerShell ein echter Randfall (s. u.,
+Nr. 10) und vier erklaerte Fehlalarme. Danach liefen **alle Office-Skripte
+gegen Office 2024** auf Wegwerf-Bestaenden im Scratchpad (nie Q:/R:), je
+Probelauf und Echtlauf. Bewertet wurde am Dateiinhalt (Hash, XML-Merkmale,
+Zellinhalt), nicht am Protokoll des Skripts.
+
+| Skript | Ergebnis 29.09. |
+|---|---|
+| `2a` Word-Schutz | bestanden (Regression nach Nr. 8) |
+| `2b` Excel-Schutz | bestanden - erstmals gelaufen; Nr. 8 |
+| `2c` PowerPoint-Schutz | Nr. 7 und 8 behoben, dann bestanden |
+| `3b` xls->xlsx | bestanden - erstmals gelaufen |
+| `4b` Schrift Excel | Nr. 9 behoben, dann bestanden |
+| `6` Excel-Berechnung | bestanden - erstmals gelaufen; Nr. 8 |
+| `7` Makrofrei-Umwandlung | Nr. 1-4 und 8 behoben, dann bestanden |
+| `9` Defektsuche | Nr. 5 und 6 behoben, dann bestanden |
+
+`3a`, `3c`, `4a`, `4c` sind seit August unveraendert und wurden nicht
+erneut gefahren.
+
+**Behobene Fehler (alle nachgestellt, Gegenprobe nach der Korrektur):**
+
+1. **`7` hat keine einzige `.docm` umgewandelt.** `$localTarget` kam aus
+   `Join-Path` und ging als verpacktes `PSObject` an `Word.SaveAs2` - der
+   Aufruf kehrte nie zurueck, der Hauptthread drehte mit voller CPU-Last.
+   Die veroeffentlichte Fassung hing im Nachbau reproduzierbar, mit
+   `[string](Join-Path ...)` war die Datei nach 0,1 s geschrieben. Das ist
+   die wahre Ursache von Abschnitt 9 c.
+2. **`7` hat keine einzige `.xlsm` umgewandelt.** `Test-HasExcel4Macro`
+   las das Paket per `ZipFile.OpenRead`, waehrend Excel die Mappe offen
+   hielt - Freigabeverletzung, Rueckgabe "nicht pruefbar", Datei behalten.
+   Nach Umstellung auf `FileShare.ReadWrite` war der Typ `ZipArchive`
+   unbekannt, weil `System.IO.Compression` nie geladen wurde; auch das
+   ergaenzt. Jetzt: makrofreie `.xlsm` umgewandelt, XLM-Mappe erkannt und
+   behalten, VBA-Mappe behalten.
+3. **`7` ohne Zeitwaechter (Abschnitt 9 c).** Neu: ein Hintergrund-Runspace
+   beendet nach 180 s die EIGENE Office-Instanz (Name und Startzeit
+   geprueft), die Datei bleibt unveraendert, die Instanz wird neu gestartet.
+   Scharfschalten, Entschaerfen und Beenden laufen unter einem Schloss.
+   Gemessen: haengender Excel-Aufruf nach 3,2 s befreit; Wettlauftest
+   (Frist laeuft genau beim Entschaerfen ab) 120/120 stimmig - geeicht:
+   ohne Schloss findet derselbe Test einen Bruch. Im Gesamtlauf wurden die
+   kennwortgeschuetzte `.docm` und `.xlsm` nach Frist abgebrochen und der
+   Lauf ging weiter. **Grenze:** Dreht der Hauptthread in PowerShell selbst
+   (wie bei Nr. 1), hilft das Beenden von Office nicht - gemessen.
+4. **`-WhatIf` war in `7` unbenutzbar.** Der Arbeitsordner wurde nur
+   simuliert angelegt, der Smoke-Test scheiterte deshalb fuer alle drei
+   Programme, der Lauf brach ab - und die drei eigenen Office-Prozesse
+   blieben stehen (Stop-Process ebenfalls simuliert). Jetzt identisch mit
+   `-ReadOnlyMode`, Bestand byteweise unveraendert.
+5. **`9` meldete JEDE intakte Excel-Datei als "Office-Fehler".** Der
+   Platzhalter fuer `WriteResPassword` war 40 Zeichen lang; Excel erlaubt
+   15 (gemessen: 15 ok, 16 Fehler 0x800A03EC). Eigener 15-stelliger
+   Platzhalter.
+6. **`9` hat jetzt einen unbeaufsichtigten Modus** (`-TargetPath`,
+   `-NoInteractive`): keine Rueckfragen, kein Tastendruck, Bericht wird
+   gespeichert und Excel beendet. Laufen bereits Office-Sitzungen oder
+   scheitert der Smoke-Test, bricht der Lauf mit Exitcode 1 ab;
+   Hintergrundprozesse werden unbeaufsichtigt nie beendet. Ergebnis auf dem
+   Pruefbestand: intakte Dateien und Schreibschutz ohne Meldung, defekte,
+   abgeschnittene und kennwortgeschuetzte Dateien gemeldet, Bestand unveraendert, kein
+   Office-Prozess bleibt zurueck.
+7. **`2c` schrieb jede `.pptx` um (Abschnitt 9 a).** PowerPoint setzt
+   `noGrp` von sich aus - gemessen 72x an Platzhaltern und am
+   Tabellenrahmen einer frisch erzeugten Datei; `noChangeAspect` steht an
+   eingefuegten Bildern. Beide zaehlen nicht mehr. Alt: alle drei
+   Testdateien umgeschrieben; neu: ungeschuetzte Datei byteidentisch,
+   Aenderungskennwort und Formsperre (`noMove`/`noResize`) weiterhin
+   entfernt.
+8. **`-WhatIf` legte in `2a`, `2b`, `2c`, `6`, `7` das eigene Aufraeumen
+   lahm** (Fehlermuster 7). Beleg aus dem `2b`-Probelauf: "WhatIf: ...
+   Stop-Process ... EXCEL", eine Excel-Instanz blieb stehen, `Remove-Job`
+   nur simuliert. 51 Aufrufe ergaenzt (eigene Office-Prozesse, Jobs,
+   Temp-/Log-Ordner, Temp-Kopien, alte Logs); Anwenderdateien bleiben
+   simuliert. Nachher in allen Probelaeufen: Bestand unveraendert, kein
+   Restprozess, simuliert werden nur noch die fachlichen Aenderungen.
+9. **`4b`: `Unprotect()` ohne Kennwort.** Bei einem kennwortgeschuetzten
+   Blatt oeffnet Excel dann einen Kennwortdialog - auch mit
+   `Interactive=False` - und der Lauf steht (gemessen: ueber 60 s ohne
+   Ende). Zusaetzlich meldete die Funktion "entsperrt", sobald der Aufruf
+   ohne Ausnahme zurueckkam: im Testlauf fuer ein Blatt, das danach
+   weiterhin geschuetzt war. Jetzt `Unprotect("")` (wirft nach 0,03 s)
+   und Nachlesen von `ProtectContents`. Blattschutz-Dateien: 0,7 s statt
+   18 s, Status "teilweise" statt falsch "erfolgreich".
+10. **`2c`: `trap` ruft eine spaeter definierte Funktion.** Der `trap`
+    gilt fuer das ganze Skript; faellt ein Fehler vor Zeile ~915, endet der
+    Aufruf in `CommandNotFound` (nachgestellt). Praktisch nur bei
+    PID-Wiederverwendung erreichbar; jetzt mit `Get-Command` abgesichert.
+
+**Offene Beobachtungen (nicht geaendert):**
+
+- **`4b` und verschluesselte bzw. schreibreservierte Mappen:** Das Oeffnen
+  mit `Password=""` loest den Kennwortdialog aus; der 60-s-Waechter von
+  `4b` beendet Excel zuverlaessig, jede solche Datei kostet aber rund eine
+  Minute plus Neustart. Ein nicht leerer Platzhalter half im Kurztest
+  nicht; nicht weiter untersucht. In der vorgesehenen Reihenfolge entfernt
+  `2b` die Schreibreservierung vorher.
+- **`9` klassifiziert grob:** eine abgeschnittene `.xlsx` erscheint als
+  "Office-Fehler", eine `.pptx` aus Zufallsbytes als "Unbekannt". Gemeldet
+  werden beide - kein Fehler, aber die Kategorie hilft wenig.
+- **Excel-Standardschrift dieses Rechners ist "Courier New, 12"**
+  (`HKCU\Software\Microsoft\Office\16.0\Excel\Options\Font`). Kein Skript
+  setzt sie; woher sie stammt, ist nicht feststellbar. Neue Mappen tragen
+  sie - fuer Tests von `4b` wichtig, sonst folgenlos. Nicht angefasst.
+
+**Testbedingungen - fuer kuenftige Laeufe:** Kennwortdialoge unsichtbarer
+Office-Instanzen koennen auf dem Desktop auftauchen. Im ersten `4b`-Lauf
+kamen zwei blockierende Aufrufe nach 18 bzw. 2 s zurueck, im zweiten
+blockierten dieselben bis zum Waechter - dazwischen hat offenbar jemand die
+Dialoge beantwortet. Solche Tests nur laufen lassen, wenn am Rechner
+niemand klickt, und Laufzeiten gegenpruefen.
+
+**Anonymisierung fuer die Veroeffentlichung:** Hinweise auf die Branche
+und ein 8.3-Profilname in einem Kommentar wurden neutralisiert (22 Stellen).
 
 ---
 

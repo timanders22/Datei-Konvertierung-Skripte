@@ -507,7 +507,7 @@ Get-ChildItem -LiteralPath $docsFolder -Directory -Filter "6_Excel_automatische_
     Where-Object { $_.LastWriteTime -lt $staleTempThreshold } |
     ForEach-Object {
         try {
-            Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop -WhatIf:$false
             Write-Host "[CLEANUP]   Alter Temp-Ordner entfernt: $($_.Name)" -ForegroundColor DarkGray
         } catch {
             Write-Host "[WARNUNG]   Alter Temp-Ordner nicht loeschbar: $($_.Name)" -ForegroundColor DarkYellow
@@ -565,7 +565,7 @@ if ($logFile) {
         Where-Object { $_.LastWriteTime -lt $staleLogThreshold -and $_.FullName -ne $logFile } |
         ForEach-Object {
             try {
-                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop -WhatIf:$false
                 Write-Host "[CLEANUP]   Alte Log-Datei entfernt: $($_.Name)" -ForegroundColor DarkGray
             } catch { }
         }

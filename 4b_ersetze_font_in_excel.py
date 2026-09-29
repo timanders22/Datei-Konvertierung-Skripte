@@ -2228,10 +2228,18 @@ def _set_pivot_table_fonts(sheet, font_name: str) -> None:
 # ==================================================================
 def _unprotect_sheet_if_possible(sheet) -> bool:
     """
-    Versucht, ein Tabellenblatt zu entsperren. Bei passwortgeschuetzten
-    Blaettern wirft sheet.Unprotect() eine Exception – die wird gefangen
-    und False zurueckgegeben. Blaetter, die OHNE Passwort entsperrt
-    werden konnten, bleiben dauerhaft entsperrt (kein Re-Protect).
+    Versucht, ein Tabellenblatt zu entsperren. Blaetter, die OHNE Passwort
+    entsperrt werden konnten, bleiben dauerhaft entsperrt (kein Re-Protect).
+
+    Unprotect("") statt Unprotect(): ohne Argument oeffnet Excel bei einem
+    passwortgeschuetzten Blatt einen Kennwortdialog - auch mit
+    Visible=False und Interactive=False - und der Aufruf blockiert, bis
+    jemand den (u. U. gar nicht sichtbaren) Dialog schliesst. Gemessen mit
+    Excel 2024: Unprotect() haengt ueber 60 s, Unprotect("") wirft bei
+    Kennwortschutz nach 0,03 s und entsperrt ein Blatt ohne Kennwort.
+    Danach wird ProtectContents nachgelesen: vorher meldete die Funktion
+    "entsperrt", sobald Unprotect() ohne Ausnahme zurueckkam - im Testlauf
+    auch fuer ein Blatt, das hinterher weiterhin geschuetzt war.
     """
     try:
         if not sheet.ProtectContents:
@@ -2240,8 +2248,11 @@ def _unprotect_sheet_if_possible(sheet) -> bool:
         return False
 
     try:
-        sheet.Unprotect()
-        return True
+        sheet.Unprotect("")
+    except Exception:
+        return False
+    try:
+        return not sheet.ProtectContents
     except Exception:
         return False
 

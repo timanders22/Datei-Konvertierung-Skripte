@@ -169,7 +169,7 @@ function Resolve-LogDirectory {
         if ([string]::IsNullOrWhiteSpace($cand)) { continue }
         try {
             if (-not [System.IO.Directory]::Exists($cand)) {
-                New-Item -ItemType Directory -Path $cand -Force -ErrorAction Stop | Out-Null
+                New-Item -ItemType Directory -Path $cand -Force -ErrorAction Stop -WhatIf:$false | Out-Null
             }
             $probe = Join-Path $cand (".writetest_{0}" -f ([Guid]::NewGuid().ToString('N')))
             [System.IO.File]::WriteAllText($probe, 'x')
@@ -531,8 +531,10 @@ trap {
                 } catch {}
             }
     }
-    # .Count statt Auflistungs-Wahrheitswert (siehe oben).
-    if ($script:TrackedPptPids.Count -gt 0) { Clear-TrackedPowerPointInstances }
+    # .Count statt Auflistungs-Wahrheitswert (siehe oben). Der trap gilt fuer
+    # das ganze Skript, die Funktion wird aber erst weiter unten definiert -
+    # ein Fehler davor liefe sonst in CommandNotFound (gemessen unter 5.1).
+    if ($script:TrackedPptPids.Count -gt 0 -and (Get-Command Clear-TrackedPowerPointInstances -ErrorAction SilentlyContinue)) { Clear-TrackedPowerPointInstances }
     if (Test-Path -LiteralPath $script:TempPath) { Remove-Item -LiteralPath $script:TempPath -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
     Close-Loggers
     break
@@ -913,7 +915,7 @@ function Test-IsOwnPptProcess {
 function Clear-TrackedPowerPointInstances {
     foreach ($id in @($script:TrackedPptPids | Select-Object -Unique)) {
         if (Test-IsOwnPptProcess -ProcessId $id) {
-            try { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue } catch {}
+            try { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
         }
     }
     [System.GC]::Collect()
@@ -1204,8 +1206,8 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
     } -ArgumentList $SourcePath, $DestPathBase, $OriginalExt, $script:PptConstants, $pidFile
 
     if (-not (Wait-Job $job -Timeout $script:FileOpenTimeoutSeconds)) {
-        Stop-Job  $job
-        Remove-Job $job
+        Stop-Job  $job -WhatIf:$false
+        Remove-Job $job -WhatIf:$false
         if ([System.IO.File]::Exists($pidFile)) {
             try {
                 $pidContent = [System.IO.File]::ReadAllText($pidFile).Trim()
@@ -1214,7 +1216,7 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
                     if ($savedPid -gt 0) {
                         $p = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
                         if ($p -and $p.ProcessName -eq 'POWERPNT') {
-                            try { Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue } catch {}
+                            try { Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
                             Write-DetailedLog "Timeout: POWERPNT.EXE PID $savedPid sofort beendet" "WARN"
                         }
                     }
@@ -1226,7 +1228,7 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
     }
 
     $result = Receive-Job $job
-    Remove-Job $job
+    Remove-Job $job -WhatIf:$false
     if ([System.IO.File]::Exists($pidFile)) { try { [System.IO.File]::Delete($pidFile) } catch {} }
     if ($result.PptPid) { $script:TrackedPptPids.Add([int]$result.PptPid) }
 
@@ -1251,8 +1253,17 @@ function Remove-PptxProtection {
     $actionsTaken = [System.Collections.ArrayList]::new()
     $zip          = $null
 
-    $lockAttrs = @("noSelect","noMove","noResize","noRot","noGrp",
-                   "noChangeAspect","noChangeArrowheads","noTextEdit",
+    # Nur Sperren, die ein Anwender setzt. 'noGrp' und 'noChangeAspect'
+    # schreibt PowerPoint von sich aus: noGrp an jeden Platzhalter und an
+    # Tabellenrahmen (gemessen: 72x in einer frisch erzeugten Datei mit
+    # Standardvorlage), noChangeAspect an eingefuegte Bilder. Standen sie in
+    # der Liste, schrieb das Skript JEDE .pptx um, auch voellig ungeschuetzte
+    # (Befundbericht Abschnitt 9 a: 14 XML-Teile geaendert, "Entsperrt: 6"
+    # bei einer einzigen wirklich geschuetzten Datei) - mit neuem Zeitstempel
+    # und vollstaendigem Neu-Upload auf Google Drive. Sie verhindern zudem
+    # nur Gruppieren bzw. freies Verzerren und sind kein Bearbeitungsschutz.
+    $lockAttrs = @("noSelect","noMove","noResize","noRot",
+                   "noChangeArrowheads","noTextEdit",
                    "noAdjustHandles","noEditPoints","noUngrp")
 
     try {
@@ -1521,8 +1532,8 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
     $completed = Wait-Job $job -Timeout $TimeoutSec
 
     if (-not $completed) {
-        try { Stop-Job   $job -ErrorAction SilentlyContinue } catch {}
-        try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch {}
+        try { Stop-Job   $job -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
+        try { Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
         if ([System.IO.File]::Exists($pidFile)) {
             try {
                 $pidContent = [System.IO.File]::ReadAllText($pidFile).Trim()
@@ -1542,7 +1553,7 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
                         # Clear-TrackedPowerPointInstances (Z. 442-449).
                         $p = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
                         if ($p -and $p.ProcessName -eq 'POWERPNT') {
-                            try { Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue } catch {}
+                            try { Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
                             Write-DetailedLog "Trust-Center-Timeout: POWERPNT.EXE PID $savedPid sofort beendet" "WARN"
                         }
                     }
@@ -1555,7 +1566,7 @@ public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProce
     }
 
     $result = Receive-Job $job
-    try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
     if ([System.IO.File]::Exists($pidFile)) { try { [System.IO.File]::Delete($pidFile) } catch {} }
     try { [System.IO.File]::Delete($testPath) } catch {}
     if ($result -and $result.PptPid) { $script:TrackedPptPids.Add([int]$result.PptPid) }
@@ -1964,7 +1975,7 @@ Get-PptFilesRobust (Add-LongPathPrefix $TargetPath) $allPptExt |
             if ($streams) { $hadZoneIdentifier = $true }
         } catch {}
         if ($hadZoneIdentifier) {
-            Unblock-File -LiteralPath $tempFile -ErrorAction SilentlyContinue
+            Unblock-File -LiteralPath $tempFile -ErrorAction SilentlyContinue -WhatIf:$false
             Write-DetailedLog "Zone.Identifier entfernt auf Temp-Kopie: $fileName" "DEBUG"
             # Unblock-File kann einen erneuten AV-Scan triggern (sehr klassischer
             # Defender-Trigger nach ADS-Aenderung). Daher Wait-FileStable nochmal

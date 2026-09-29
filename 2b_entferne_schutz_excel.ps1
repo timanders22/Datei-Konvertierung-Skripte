@@ -208,7 +208,7 @@ function Resolve-LogDirectory {
         if ([string]::IsNullOrWhiteSpace($cand)) { continue }
         try {
             if (-not [System.IO.Directory]::Exists($cand)) {
-                New-Item -ItemType Directory -Path $cand -Force -ErrorAction Stop | Out-Null
+                New-Item -ItemType Directory -Path $cand -Force -ErrorAction Stop -WhatIf:$false | Out-Null
             }
             $probe = Join-Path $cand (".writetest_{0}" -f ([Guid]::NewGuid().ToString('N')))
             [System.IO.File]::WriteAllText($probe, 'x')
@@ -859,7 +859,7 @@ function Test-FileIsLocked {
 function Stop-AllTrackedExcel {
     foreach ($id in @($script:TrackedExcelPids | Select-Object -Unique)) {
         if (Test-IsOwnExcelProcess -ProcessId $id) {
-            try { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue } catch {}
+            try { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue -WhatIf:$false } catch {}
         }
     }
     [System.GC]::Collect()
@@ -1293,8 +1293,8 @@ function Test-ExcelTrustCenter {
     $completed = Wait-Job $job -Timeout $TimeoutSec
 
     if (-not $completed) {
-        Stop-Job   $job -ErrorAction SilentlyContinue
-        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        Stop-Job   $job -ErrorAction SilentlyContinue -WhatIf:$false
+        Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false
         if ([System.IO.File]::Exists($pidFile)) {
             try {
                 $savedPid = [int][System.IO.File]::ReadAllText($pidFile).Trim()
@@ -1318,7 +1318,7 @@ function Test-ExcelTrustCenter {
     }
 
     $result = Receive-Job $job
-    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false
     if ([System.IO.File]::Exists($pidFile)) { try { [System.IO.File]::Delete($pidFile) } catch {} }
     try { [System.IO.File]::Delete($testXlsx) } catch {}
     if ($result -and $result.ExcelPid) { $script:TrackedExcelPids.Add([int]$result.ExcelPid) }
@@ -1471,8 +1471,8 @@ function Convert-ExcelViaCom {
     } -ArgumentList $SourcePath, $DestPathBase, $OriginalExtension, $Passwords, $pidFile, $ComInitCode, $ComTeardownCode, $PreferPasswordFirst.IsPresent
 
     if (-not (Wait-Job $job -Timeout $FileOpenTimeoutSeconds)) {
-        Stop-Job  $job -ErrorAction SilentlyContinue
-        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        Stop-Job  $job -ErrorAction SilentlyContinue -WhatIf:$false
+        Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false
         if ([System.IO.File]::Exists($pidFile)) {
             try {
                 $savedPid = [int][System.IO.File]::ReadAllText($pidFile).Trim()
@@ -1489,7 +1489,7 @@ function Convert-ExcelViaCom {
     }
 
     $result = Receive-Job $job
-    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false
 
     if ([System.IO.File]::Exists($pidFile)) { try { [System.IO.File]::Delete($pidFile) } catch {} }
     if ($result -and $result.ExcelPid) { $script:TrackedExcelPids.Add([int]$result.ExcelPid) }
@@ -1569,8 +1569,8 @@ function Remove-OpenPassword {
     } -ArgumentList $FilePath, $Passwords, $pidFile, $ComInitCode, $ComTeardownCode
 
     if (-not (Wait-Job $job -Timeout $FileOpenTimeoutSeconds)) {
-        Stop-Job  $job -ErrorAction SilentlyContinue
-        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        Stop-Job  $job -ErrorAction SilentlyContinue -WhatIf:$false
+        Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false
         if ([System.IO.File]::Exists($pidFile)) {
             try {
                 $savedPid = [int][System.IO.File]::ReadAllText($pidFile).Trim()
@@ -1587,7 +1587,7 @@ function Remove-OpenPassword {
     }
 
     $result = Receive-Job $job
-    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    Remove-Job $job -Force -ErrorAction SilentlyContinue -WhatIf:$false
     if ([System.IO.File]::Exists($pidFile)) { try { [System.IO.File]::Delete($pidFile) } catch {} }
     if ($result -and $result.ExcelPid) { $script:TrackedExcelPids.Add([int]$result.ExcelPid) }
 
@@ -2259,7 +2259,7 @@ Get-ExcelFilesRobust (Add-LongPathPrefix $TargetPath) $allExcelExt |
         Invoke-WithRetry -OperationName "Copy src->temp ($($file.Name))" -ScriptBlock {
             [System.IO.File]::Copy($srcLong, $tempFile, $true)
         }
-        Unblock-File -LiteralPath $tempFile -ErrorAction SilentlyContinue
+        Unblock-File -LiteralPath $tempFile -ErrorAction SilentlyContinue -WhatIf:$false
 
         if (-not (Wait-FileAvailable -Path $tempFile -TimeoutSec $WaitFileReadyTimeoutSec)) {
             Write-DetailedLog "Wait-FileAvailable nach Copy ausgelaufen, fahre fort: $tempFile" "WARN"

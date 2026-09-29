@@ -9,7 +9,27 @@
 # "9_fehlerhafte_Dateien_finden.exe" -iconFile "powershell_icon.ico" -sta
 #
 # Stand: 11.06.2026
+#
+# Unbeaufsichtigt (geplanter Task, Test):
+#   powershell.exe -STA -File 9_fehlerhafte_Dateien_finden.ps1 -TargetPath <Ordner> -NoInteractive
+#   Keine Rueckfragen, kein Tastendruck am Ende, Bericht wird gespeichert
+#   statt in Excel angezeigt. Laufen bereits Office-Sitzungen oder scheitert
+#   der Trust-Center-Test, bricht der Lauf mit Exitcode 1 ab, statt
+#   nachzufragen - blindes Weiterlaufen gefaehrdet dort die Sitzungen des
+#   Anwenders bzw. endet pro Datei im Timeout.
 # =====================================================================
+
+[CmdletBinding()]
+param(
+    # Zu pruefender Ordner. Ohne Angabe erscheint das Auswahlmenue.
+    [string]$TargetPath = "",
+
+    # Unbeaufsichtigter Lauf. Bisher kannte 9 als einziges Skript der
+    # Sammlung keinen: Pfad und Rueckfragen kamen nur ueber Read-Host, und
+    # Confirm-YesNo bricht bei umgeleiteter Eingabe bewusst ab - ein
+    # geplanter Task oder automatischer Test war damit unmoeglich.
+    [switch]$NoInteractive
+)
 
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -56,6 +76,7 @@ function Confirm-YesNo {
     # Weiterlaufen genau das, was der Kommentar oben ausschliesst.
     $interactive = $false
     try { $interactive = -not [Console]::IsInputRedirected } catch { $interactive = $false }
+    if ($NoInteractive) { $interactive = $false }
 
     Write-Host ""
     Write-Host ("=" * 70) -ForegroundColor Yellow
@@ -65,7 +86,11 @@ function Confirm-YesNo {
     Write-Host ("=" * 70) -ForegroundColor Yellow
 
     if (-not $interactive) {
-        Write-Host "  Keine interaktive Konsole - es wird NICHT fortgefahren." -ForegroundColor Red
+        if ($NoInteractive) {
+            Write-Host "  Unbeaufsichtigter Lauf (-NoInteractive) - es wird NICHT fortgefahren." -ForegroundColor Red
+        } else {
+            Write-Host "  Keine interaktive Konsole - es wird NICHT fortgefahren." -ForegroundColor Red
+        }
         return $false
     }
 
@@ -99,6 +124,12 @@ $Config = @{
     WatchdogShutdownMs    = 2000
     TrustCenterTimeoutSec = 25
     DummyPassword         = ([Guid]::NewGuid().ToString() + "!Xq#")
+    # Eigenes, hoechstens 15 Zeichen langes Kennwort fuer Excels
+    # WriteResPassword: Excel verweigert Workbooks.Open bei laengerem Wert
+    # mit 0x800A03EC - auch fuer voellig intakte Mappen (gemessen mit Excel
+    # 2024: 15 Zeichen ok, 16 Fehler). Mit dem 40-stelligen DummyPassword
+    # meldete das Skript deshalb JEDE Excel-Datei als "Office-Fehler".
+    DummyWritePassword    = ([Guid]::NewGuid().ToString("N").Substring(0, 12) + "!Xq")
     WordExtensions        = @(".docx",".doc",".docm",".dotx",".dotm")
     ExcelExtensions       = @(".xlsx",".xls",".xlsm",".xlsb",".xltx",".xltm")
     PptExtensions         = @(".pptx",".ppt",".pptm",".potx",".potm",".ppsx",".pps",".ppsm")
@@ -263,7 +294,7 @@ function Stop-Script {
     param([int]$Code = 0)
     try { Invoke-WindowsTempCleanup } catch { }
     try { if ($script:CtrlCAsInput) { [Console]::TreatControlCAsInput = $false } } catch { }
-    Wait-ForAnyKey
+    if (-not $NoInteractive) { Wait-ForAnyKey }
     exit $Code
 }
 
@@ -752,7 +783,9 @@ Write-Host ""
 
 $tcTitle   = "Konfiguration prüfen"
 $tcMessage = "Haben Sie die Einstellungen im Trust Center (Geschützte Ansicht DEAKTIVIERT, Makros AKTIVIERT) für Word, Excel und PowerPoint vorgenommen?"
-$tcResult = Confirm-YesNo -Title $tcTitle -Message $tcMessage
+# Unbeaufsichtigt entfaellt nur diese Selbstauskunft - ob das Trust Center
+# stimmt, misst der Smoke-Test weiter unten ohnehin, und der bricht dann ab.
+$tcResult = if ($NoInteractive) { $true } else { Confirm-YesNo -Title $tcTitle -Message $tcMessage }
 
 if (-not $tcResult) {
     Write-Host "Bitte konfigurieren Sie zuerst das Trust Center in den Office-Optionen. Abbruch." -ForegroundColor Red
@@ -812,41 +845,50 @@ $pathChoices.Add($desktopDir)
 $pathChoices.Add($downloadsDir)
 $manualIdx = $pathChoices.Count + 1
 
-Write-Host "Zielpfad auswaehlen:" -ForegroundColor Yellow
-for ($i = 0; $i -lt $pathChoices.Count; $i++) {
-    $label = switch ($pathChoices[$i]) {
-        $desktopDir   { "Desktop ($desktopDir)" }
-        $downloadsDir { "Downloads ($downloadsDir)" }
-        default       { $pathChoices[$i] }
-    }
-    Write-Host ("  [{0}] {1}" -f ($i + 1), $label) -ForegroundColor White
+if (-not [string]::IsNullOrWhiteSpace($TargetPath)) {
+    $rootPath = $TargetPath.Trim().Trim([char[]]@('"',"'"))
 }
-Write-Host ("  [{0}] Eigenen Pfad eingeben" -f $manualIdx) -ForegroundColor White
-Write-Host ""
-$choice = (Read-Host ("Auswahl [1-{0}]" -f $manualIdx)).Trim()
-
-$choiceNum = 0
-if (-not [int]::TryParse($choice, [ref]$choiceNum)) { $choiceNum = -1 }
-
-if ($choiceNum -ge 1 -and $choiceNum -le $pathChoices.Count) {
-    $rootPath = $pathChoices[$choiceNum - 1]
-}
-elseif ($choiceNum -eq $manualIdx) {
-    do {
-        $rawInput = Read-Host "Geben Sie den gewünschten Pfad ein"
-        $rootPath = if ($null -ne $rawInput) { $rawInput.Trim().Trim([char[]]@('"',"'")) } else { '' }
-        if ([string]::IsNullOrWhiteSpace($rootPath)) {
-            Write-Host "Pfad darf nicht leer sein." -ForegroundColor Yellow
-        }
-        elseif (-not (Test-Path -LiteralPath $rootPath -PathType Container)) {
-            Write-Host "Pfad '$rootPath' existiert nicht oder ist kein Verzeichnis." -ForegroundColor Yellow
-            $rootPath = ""
-        }
-    } while ([string]::IsNullOrWhiteSpace($rootPath))
+elseif ($NoInteractive) {
+    Write-Host "-NoInteractive braucht -TargetPath <Ordner>." -ForegroundColor Red
+    Stop-Script 1
 }
 else {
-    Write-Host ("Ungueltige Auswahl: '{0}'. Erlaubt: 1-{1}." -f $choice, $manualIdx) -ForegroundColor Red
-    Stop-Script 1
+    Write-Host "Zielpfad auswaehlen:" -ForegroundColor Yellow
+    for ($i = 0; $i -lt $pathChoices.Count; $i++) {
+        $label = switch ($pathChoices[$i]) {
+            $desktopDir   { "Desktop ($desktopDir)" }
+            $downloadsDir { "Downloads ($downloadsDir)" }
+            default       { $pathChoices[$i] }
+        }
+        Write-Host ("  [{0}] {1}" -f ($i + 1), $label) -ForegroundColor White
+    }
+    Write-Host ("  [{0}] Eigenen Pfad eingeben" -f $manualIdx) -ForegroundColor White
+    Write-Host ""
+    $choice = (Read-Host ("Auswahl [1-{0}]" -f $manualIdx)).Trim()
+
+    $choiceNum = 0
+    if (-not [int]::TryParse($choice, [ref]$choiceNum)) { $choiceNum = -1 }
+
+    if ($choiceNum -ge 1 -and $choiceNum -le $pathChoices.Count) {
+        $rootPath = $pathChoices[$choiceNum - 1]
+    }
+    elseif ($choiceNum -eq $manualIdx) {
+        do {
+            $rawInput = Read-Host "Geben Sie den gewünschten Pfad ein"
+            $rootPath = if ($null -ne $rawInput) { $rawInput.Trim().Trim([char[]]@('"',"'")) } else { '' }
+            if ([string]::IsNullOrWhiteSpace($rootPath)) {
+                Write-Host "Pfad darf nicht leer sein." -ForegroundColor Yellow
+            }
+            elseif (-not (Test-Path -LiteralPath $rootPath -PathType Container)) {
+                Write-Host "Pfad '$rootPath' existiert nicht oder ist kein Verzeichnis." -ForegroundColor Yellow
+                $rootPath = ""
+            }
+        } while ([string]::IsNullOrWhiteSpace($rootPath))
+    }
+    else {
+        Write-Host ("Ungueltige Auswahl: '{0}'. Erlaubt: 1-{1}." -f $choice, $manualIdx) -ForegroundColor Red
+        Stop-Script 1
+    }
 }
 
 # Preset-Pfade koennen auf diesem Rechner fehlen (Laufwerk nicht gemappt).
@@ -878,7 +920,7 @@ Write-Host "  kann das 10-30 Minuten dauern, bevor die erste Datei geprueft wird
 Write-Host "  Variante [1] und [3] melden den Zwischenstand schon waehrend" -ForegroundColor DarkGray
 Write-Host "  des Sammelns, [2] bleibt in dieser Phase still." -ForegroundColor DarkGray
 Write-Host ""
-$progressChoice = (Read-Host "Auswahl [1-3]").Trim()
+$progressChoice = if ($NoInteractive) { "1" } else { (Read-Host "Auswahl [1-3]").Trim() }
 switch ($progressChoice) {
     "2"     { $script:UseProgress = $true;  $script:SkipPreScan = $false }
     "3"     { $script:UseProgress = $true;  $script:SkipPreScan = $true  }
@@ -1029,7 +1071,7 @@ if ($openOfficeSessions.Count -gt 0) {
     $sessRes = Confirm-YesNo -Title "Office laeuft bereits" -Message $sessMsg
     if (-not $sessRes) {
         Write-Log -Message "Abbruch durch Benutzer - Office-Sitzungen laufen noch." -Color Yellow
-        Stop-Script
+        Stop-Script 1
     }
     Write-Log -Message "Benutzer setzt trotz laufender Office-Sitzungen fort." -Level WARN -Color Yellow
 }
@@ -1057,7 +1099,9 @@ $zombieProcesses = @(
 if ($zombieProcesses.Count -gt 0) {
     Write-Log -Message "`n$($zombieProcesses.Count) unsichtbare Office-Hintergrundprozesse gefunden (älter als $($Config.ZombieIdleSeconds)s)." -Level WARN -Color Yellow
     Write-Log -Message "ACHTUNG: Dies können auch laufende, aber minimierte oder gerade startende Office-Sitzungen sein." -Level WARN -Color Yellow
-    $killChoice = Read-Host "Sollen diese vor dem Scan beendet werden? (j/n)"
+    # Unbeaufsichtigt nie beenden: es koennten Sitzungen des Anwenders sein.
+    $killChoice = if ($NoInteractive) { "n" } else { Read-Host "Sollen diese vor dem Scan beendet werden? (j/n)" }
+    if ($NoInteractive) { Write-Log -Message "  Unbeaufsichtigter Lauf: Prozesse bleiben bestehen." -Color DarkYellow }
     if ($killChoice -match "^[JjYy]") {
         foreach ($proc in $zombieProcesses) {
             try {
@@ -1466,7 +1510,7 @@ if ($smokeFailures.Count -gt 0) {
 
     if (-not $smokeResult) {
         Write-Log -Message "Abbruch durch Benutzer nach Trust-Center-Warnung." -Color Yellow
-        Stop-Script
+        Stop-Script 1
     }
     Write-Log -Message "Trust-Center-Warnung vom Benutzer ignoriert - Fortsetzung." -Level WARN -Color Yellow
 } else {
@@ -1774,8 +1818,9 @@ try {
                         # Dialog "Schreibgeschuetzt oeffnen?" - beides sind
                         # modale Blocker, die vorher in den Timeout liefen.
                         $collection = $excel.Workbooks
+                        # WriteResPassword hoechstens 15 Zeichen (siehe $Config).
                         $comObj     = $collection.Open($comPath, 0, $true, [System.Type]::Missing,
-                                                       $Config.DummyPassword, $Config.DummyPassword,
+                                                       $Config.DummyPassword, $Config.DummyWritePassword,
                                                        $true)
                         Close-ComObject -ComObj $comObj -AppType "excel"
                     }
@@ -2107,19 +2152,33 @@ try {
 
                 try { $ws.Columns.AutoFit() | Out-Null } catch {}
 
+                $berichtGespeichert = $false
                 try {
                     $wbReport.SaveAs($reportPath, 51)
+                    $berichtGespeichert = $true
                     Write-Log -Message "`nBericht gespeichert: $reportPath" -Color Green
                     if (Test-Path -LiteralPath $checkpointPath) {
                         try { Remove-Item -LiteralPath $checkpointPath -Force -ErrorAction SilentlyContinue } catch {}
                     }
                 } catch {
                     Write-Log -Message "`nWarnung: Bericht konnte nicht gespeichert werden: $($_.Exception.Message)" -Level WARN -Color Yellow
-                    Write-Log -Message "Der Bericht ist weiterhin in Excel geöffnet." -Level WARN -Color Yellow
+                    if (-not $NoInteractive) {
+                        Write-Log -Message "Der Bericht ist weiterhin in Excel geöffnet." -Level WARN -Color Yellow
+                    }
                 }
 
-                $excel.Visible = $true
-                $script:ReportShownInExcel = $true
+                if ($NoInteractive) {
+                    # Niemand sieht hin: Mappe schliessen, Excel beendet der
+                    # finally-Zweig. Ohne gespeicherten Bericht die Daten
+                    # ueber den CSV-Notweg sichern.
+                    if (-not $berichtGespeichert) {
+                        & $writeCsvFallback "Bericht nicht speicherbar (unbeaufsichtigter Lauf)"
+                    }
+                    try { $wbReport.Close($false) } catch {}
+                } else {
+                    $excel.Visible = $true
+                    $script:ReportShownInExcel = $true
+                }
             }
             catch {
                 # Excel-COM ist mitten im Bericht-Aufbau abgestuerzt
